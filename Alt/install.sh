@@ -42,7 +42,7 @@ verbose "  OS:           $os_name $os_version"
 verbose "  Architecture:  $cpu_architecture ($cpu_name, ${os_mode}-bit)"
 verbose "  PHP:           $php_version"
 verbose "  FreeSWITCH:    $switch_branch ($([ "$switch_package" = "true" ] && echo "RPM package" || echo "source build"))"
-verbose "  PostgreSQL:    slot $database_version"
+verbose "  PostgreSQL:    $database_version ($pg_package)"
 verbose "  Web user:      $web_user:$web_group"
 verbose "  FS user:       $fs_user:$fs_group"
 verbose ""
@@ -70,7 +70,7 @@ resources/nginx.sh
 
 # Step 4: PostgreSQL database
 verbose "=== Step 4/10: Installing PostgreSQL ==="
-# resources/postgresql.sh
+resources/postgresql.sh
 
 # Step 5: FusionPBX application
 verbose "=== Step 5/10: Installing FusionPBX ==="
@@ -107,5 +107,5 @@ verbose " Installation steps completed."
 verbose "========================================="
 verbose ""
 warning "Note: Some steps are not yet implemented."
-warning "Completed steps: 1 (pre-install), 2 (PHP), 3 (nginx)"
+warning "Completed steps: 1 (pre-install), 2 (PHP), 3 (nginx), 4 (PostgreSQL)"
 warning "Remaining steps will be activated in subsequent increments."

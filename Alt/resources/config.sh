@@ -16,15 +16,21 @@ database_name=fusionpbx                     # Database name (safe characters A-Z
 database_username=fusionpbx                 # Database username (safe characters A-Z, a-z, 0-9)
 database_password=random                    # random or a custom value (safe characters A-Z, a-z, 0-9)
 database_repo=system                        # system only (no external repos for Alt Linux)
-                                            # postgresql4-server, postgresql5-server, postgresql6-server
-database_version=6                          # Alt Linux package slot number
-                                            # 4 = likely PG 12, 5 = likely PG 14, 6 = likely PG 16
+                                            # postgresql16-server (PostgreSQL 16)
+database_version=16                         # PostgreSQL major version (16 = PostgreSQL 16)
 database_host=127.0.0.1                     # hostname or IP address
 database_port=5432                          # port number
 database_backup=false                       # true or false
 
 # PHP Settings
 php_version=8.2                             # PHP version: 8.1, 8.2, 8.3
+
+# PostgreSQL Settings (Alt Linux specifics)
+pg_package=postgresql${database_version}-server  # e.g. postgresql16-server
+pg_init_script=/etc/rc.d/init.d/postgresql      # initdb via this script, NOT systemctl
+pg_service=postgresql                            # systemd service name
+pg_data_dir=/var/lib/pgsql/${database_version}/data  # default PGDATA
+pg_conf_dir=/var/lib/pgsql/${database_version}/data  # pg_hba.conf, postgresql.conf live here
 
 # General Settings
 letsencrypt_folder=true                     # true or false

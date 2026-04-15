@@ -14,7 +14,7 @@
 | PHP-FPM | `php8.1-fpm-fcgi`, `php8.2-fpm-fcgi`, `php8.3-fpm-fcgi` |
 | PHP-модули | `php8.2-pgsql`, `php8.2-gd` и т.д. по аналогии |
 | nginx | есть в репозитории |
-| PostgreSQL | `postgresql4-server`, `postgresql5-server`, `postgresql6-server` |
+| PostgreSQL | `postgresql16-server` (PostgreSQL 16) |
 | fail2ban | есть |
 | memcached | есть |
 | Пользователь nginx | `_nginx:_nginx` (предположительно) |
@@ -142,11 +142,11 @@ PHP-FPM корректно обрабатывает запросы.
 
 **Файлы**:
 - `Alt/resources/postgresql.sh`:
-  - Установка: `apt-get install -y sudo postgresql6-server` — **уточнить у пользователя**: какая версия PG нужна и точное имя пакета
-  - **Замена `pg_createcluster`**: использовать `postgresql-setup initdb` или `initdb`
-  - **Уточнить у пользователя**: как инициализировать кластер PG в Alt Linux?
-  - Настройка `pg_hba.conf`: замена `scram-sha-256` на `md5`
-  - **Уточнить у пользователя**: путь к `pg_hba.conf` в Alt Linux
+  - Установка: `apt-get install -y sudo postgresql16-server`
+  - **Инициализация кластера**: `/etc/rc.d/init.d/postgresql initdb` (systemctl initdb НЕ работает!)
+  - Сервис: `postgresql.service` (без номера версии, не как в CentOS)
+  - Настройка `pg_hba.conf`: замена `scram-sha-256` на `md5`, замена `ident`/`peer` на `md5` для локальных подключений
+  - Путь к данным: `/var/lib/pgsql/16/data/`
   - `systemctl enable postgresql`, `systemctl restart postgresql`
   - Создание БД и пользователей через `sudo -u postgres psql`
   - Генерация пароля: `dd if=/dev/urandom bs=1 count=20 2>/dev/null | base64`
@@ -338,23 +338,23 @@ FusionPBX работает с указанными учётными данным
 
 ## Открытые вопросы (уточнять у пользователя по мере необходимости)
 
-| # | Вопрос | Когда нужен |
-|---|--------|-------------|
-| 1 | Точные имена базовых пакетов (nano, net-tools, wget, unzip, dialog, gpg, ca-certificates и т.д.) | Инкремент 1 |
-| 2 | Имя systemd-сервиса для PHP-FPM | Инкремент 2 |
-| 3 | Путь к `php.ini` и `conf.d` для PHP-FPM в Alt Linux | Инкремент 2 |
-| 4 | Путь к PHP `extension_dir` в Alt Linux | Инкремент 2 |
-| 5 | Есть ли в Alt пакет `ssl-cert` (snakeoil сертификаты) | Инкремент 3 |
-| 6 | Версия PostgreSQL (4/5/6) и имя пакета для установки | Инкремент 4 |
-| 7 | Как инициализировать кластер PostgreSQL в Alt Linux | Инкремент 4 |
-| 8 | Путь к `pg_hba.conf` и данным PG в Alt Linux | Инкремент 4 |
-| 9 | Имена пакетов `libtiff-tools`, `qrencode`, `dbus`, `ssl-cert` в Alt | Инкремент 5 |
-| 10 | Полный список freeswitch-* пакетов в Alt Linux | Инкремент 6 |
-| 11 | От какого пользователя работает FreeSWITCH в RPM-пакете? | Инкремент 6 |
-| 12 | Имена dev-пакетов для сборки FreeSWITCH из исходников | Инкремент 6 |
-| 13 | Как сохранять правила iptables при перезагрузке в Alt Linux | Инкремент 7 |
-| 14 | Путь к логу SSH в Alt Linux (`/var/log/auth.log` или `/var/log/secure`?) | Инкремент 8 |
-| 15 | Путь к syslog в Alt Linux | Инкремент 8 |
+| # | Вопрос | Статус | Ответ |
+|---|--------|--------|-------|
+| 1 | Точные имена базовых пакетов | **Решён** | Имена совпадают с Debian (wget, nano, git и т.д.), gpg доступен без отдельного пакета |
+| 2 | Имя systemd-сервиса для PHP-FPM | **Решён** | `php8.2-fpm.service` |
+| 3 | Путь к `php.ini` и `conf.d` для PHP-FPM | **Решён** | `/etc/php/8.2/fpm-fcgi/php.ini`, нет `conf.d` (добавляем в php.ini напрямую) |
+| 4 | Путь к PHP `extension_dir` | **Решён** | `/usr/lib64/php/8.x.x/extensions` (определяется динамически через `php -i`) |
+| 5 | Есть ли пакет `ssl-cert` | **Решён** | Нет, генерируем self-signed сертификат через openssl |
+| 6 | Версия PostgreSQL и имя пакета | **Решён** | `postgresql16-server` (PostgreSQL 16) |
+| 7 | Как инициализировать кластер PG | **Решён** | `/etc/rc.d/init.d/postgresql initdb` (systemctl не работает!) |
+| 8 | Путь к `pg_hba.conf` и данным PG | **Решён** | `/var/lib/pgsql/16/data/pg_hba.conf` |
+| 9 | Имена пакетов `libtiff-tools`, `qrencode`, `dbus`, `ssl-cert` в Alt | Открыт | Инкремент 5 |
+| 10 | Полный список freeswitch-* пакетов в Alt Linux | Открыт | Инкремент 6 |
+| 11 | От какого пользователя работает FreeSWITCH в RPM-пакете? | Открыт | Инкремент 6 |
+| 12 | Имена dev-пакетов для сборки FreeSWITCH из исходников | Открыт | Инкремент 6 |
+| 13 | Как сохранять правила iptables при перезагрузке в Alt Linux | Открыт | Инкремент 7 |
+| 14 | Путь к логу SSH в Alt Linux | Открыт | Инкремент 8 |
+| 15 | Путь к syslog в Alt Linux | Открыт | Инкремент 8 |
 
 ---
 
