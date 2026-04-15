@@ -66,7 +66,7 @@ resources/php.sh
 
 # Step 3: NGINX web server
 verbose "=== Step 3/10: Installing NGINX ==="
-# resources/nginx.sh
+resources/nginx.sh
 
 # Step 4: PostgreSQL database
 verbose "=== Step 4/10: Installing PostgreSQL ==="
@@ -107,5 +107,5 @@ verbose " Installation steps completed."
 verbose "========================================="
 verbose ""
 warning "Note: Some steps are not yet implemented."
-warning "Completed steps: 1 (pre-install), 2 (PHP)"
+warning "Completed steps: 1 (pre-install), 2 (PHP), 3 (nginx)"
 warning "Remaining steps will be activated in subsequent increments."
