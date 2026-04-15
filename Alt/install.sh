@@ -7,6 +7,13 @@
 # It is safe to re-run on a partially configured system - already installed
 # packages will be skipped and existing configs will be backed up before
 # modification.
+#
+# Usage:
+#   ./install.sh                              # Default installation
+#   ./install.sh --use-switch-source          # Build FreeSWITCH from source
+#   ./install.sh --use-switch-master          # Use FreeSWITCH master branch
+#   ./install.sh --no-cpu-check               # Skip CPU validation
+#   ./install.sh -h                           # Show help
 
 # Determine the script directory (robust against symlinks and unusual paths)
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -39,47 +46,66 @@ verbose "  PostgreSQL:    slot $database_version"
 verbose "  Web user:      $web_user:$web_group"
 verbose "  FS user:       $fs_user:$fs_group"
 verbose ""
+verbose "Starting installation..."
+verbose ""
 
 # =============================================================================
 # Installation Steps
 # Each step is a separate script that can be independently debugged and re-run.
-# Steps will be implemented in subsequent increments.
+# Failed steps will print warnings but the installer will continue to allow
+# manual intervention. Critical failures use die() to abort.
 # =============================================================================
 
-# --- Increment 1: pre-install (system update, base packages) ---
-# resources/pre-install.sh
+# Step 1: System preparation (update, base packages, cdrom cleanup)
+verbose "=== Step 1/10: System preparation ==="
+resources/pre-install.sh
 
-# --- Increment 2: PHP ---
+# Step 2: PHP and PHP-FPM
+verbose "=== Step 2/10: Installing PHP ==="
 # resources/php.sh
 
-# --- Increment 3: nginx ---
+# Step 3: NGINX web server
+verbose "=== Step 3/10: Installing NGINX ==="
 # resources/nginx.sh
 
-# --- Increment 4: PostgreSQL ---
+# Step 4: PostgreSQL database
+verbose "=== Step 4/10: Installing PostgreSQL ==="
 # resources/postgresql.sh
 
-# --- Increment 5: FusionPBX ---
+# Step 5: FusionPBX application
+verbose "=== Step 5/10: Installing FusionPBX ==="
 # resources/fusionpbx.sh
 
-# --- Increment 6: FreeSWITCH ---
+# Step 6: FreeSWITCH
+verbose "=== Step 6/10: Installing FreeSWITCH ==="
 # resources/switch.sh
 
-# --- Increment 7: Firewall ---
+# Step 7: Firewall
+verbose "=== Step 7/10: Configuring firewall ==="
 # resources/iptables.sh
 
-# --- Increment 8: Fail2ban ---
+# Step 8: Fail2ban
+verbose "=== Step 8/10: Configuring Fail2ban ==="
 # resources/fail2ban.sh
 
-# --- Increment 9: Additional services ---
+# Step 9: Additional services (sngrep, monit, snmp)
+verbose "=== Step 9/10: Additional services ==="
 # resources/sngrep.sh
 # resources/monit.sh
 
-# --- Increment 10: Finish (database schema, users, services) ---
+# Step 10: Finish (database schema, admin user, service startup)
+verbose "=== Step 10/10: Finalizing installation ==="
 # resources/finish.sh
 
-# --- Increment 11: LetsEncrypt (optional, run separately) ---
-# resources/letsencrypt.sh
+# =============================================================================
+# Completion
+# =============================================================================
 
 verbose ""
-warning "Installer skeleton is ready."
-warning "Installation steps will be activated in subsequent increments."
+verbose "========================================="
+verbose " Installation steps completed."
+verbose "========================================="
+verbose ""
+warning "Note: Some steps are not yet implemented."
+warning "Completed steps: 1 (pre-install)"
+warning "Remaining steps will be activated in subsequent increments."
