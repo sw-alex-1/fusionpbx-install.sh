@@ -62,7 +62,7 @@ resources/pre-install.sh
 
 # Step 2: PHP and PHP-FPM
 verbose "=== Step 2/10: Installing PHP ==="
-# resources/php.sh
+resources/php.sh
 
 # Step 3: NGINX web server
 verbose "=== Step 3/10: Installing NGINX ==="
@@ -107,5 +107,5 @@ verbose " Installation steps completed."
 verbose "========================================="
 verbose ""
 warning "Note: Some steps are not yet implemented."
-warning "Completed steps: 1 (pre-install)"
+warning "Completed steps: 1 (pre-install), 2 (PHP)"
 warning "Remaining steps will be activated in subsequent increments."
