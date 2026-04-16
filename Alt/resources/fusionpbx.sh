@@ -33,9 +33,9 @@ pkg_install \
     git \
     vim-console \
     ghostscript \
-    ffmpeg \
     sox \
-    haveged
+    haveged \
+    ffmpeg
 
 # Optional packages - may or may not be available in Alt Linux repos
 # We try to install them but do not fail if they're unavailable

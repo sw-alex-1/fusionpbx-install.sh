@@ -6,7 +6,6 @@
 # Alt Linux specifics:
 #   - Web user: _nginx:_nginx (NOT www-data:www-data)
 #   - FreeSWITCH user: _pbx:_pbx
-#   - Cron package: cronie (NOT cron)
 #   - No 'freeswitch' PostgreSQL role — only 'fusionpbx' is created
 #   - .pgpass is already configured by postgresql.sh and fusionpbx.sh
 #   - hostname -I: always take first IP (bug fix from analysis)
@@ -225,16 +224,6 @@ verbose "  Created /etc/tmpfiles.d/fusionpbx.conf"
 verbose "Installing FusionPBX services..."
 
 cd /var/www/fusionpbx && /usr/bin/php /var/www/fusionpbx/core/upgrade/upgrade.php --services
-
-# =============================================================================
-# Install cron
-# =============================================================================
-
-verbose "Installing cron daemon..."
-
-# Alt Linux uses 'cronie' package (not 'cron' like Debian)
-pkg_install cronie
-service_enable_start crond
 
 # =============================================================================
 # File permissions

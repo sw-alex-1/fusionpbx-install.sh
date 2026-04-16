@@ -57,44 +57,54 @@ verbose ""
 # =============================================================================
 
 # Step 1: System preparation (update, base packages, cdrom cleanup)
+verbose ""
 verbose "=== Step 1/10: System preparation ==="
 resources/pre-install.sh
 
 # Step 2: PHP and PHP-FPM
+verbose ""
 verbose "=== Step 2/10: Installing PHP ==="
 resources/php.sh
 
 # Step 3: NGINX web server
+verbose ""
 verbose "=== Step 3/10: Installing NGINX ==="
 resources/nginx.sh
 
 # Step 4: PostgreSQL database
+verbose ""
 verbose "=== Step 4/10: Installing PostgreSQL ==="
 resources/postgresql.sh
 
 # Step 5: FusionPBX application
+verbose ""
 verbose "=== Step 5/10: Installing FusionPBX ==="
 resources/fusionpbx.sh
 
 # Step 6: FreeSWITCH
+verbose ""
 verbose "=== Step 6/10: Installing FreeSWITCH ==="
 resources/switch.sh
 resources/switch/dsn.sh
 
 # Step 7: Firewall
+verbose ""
 verbose "=== Step 7/10: Configuring firewall ==="
 resources/iptables.sh
 
 # Step 8: Fail2ban
+verbose ""
 verbose "=== Step 8/10: Configuring Fail2ban ==="
 resources/fail2ban.sh
 
 # Step 9: Additional services (sngrep, monit)
+verbose ""
 verbose "=== Step 9/10: Additional services ==="
 resources/sngrep.sh
 resources/monit.sh
 
 # Step 10: Finish (database schema, admin user, service startup)
+verbose ""
 verbose "=== Step 10/10: Finalizing installation ==="
 resources/finish.sh
 
