@@ -17,7 +17,7 @@
 | PostgreSQL | `postgresql16-server` (PostgreSQL 16) |
 | fail2ban | есть |
 | memcached | есть |
-| Пользователь nginx | `_nginx:_nginx` (предположительно) |
+| Пользователь nginx | `_nginx:_nginx` |
 | haveged | есть |
 | ffmpeg, ghostscript, sox | есть |
 | init-система | systemd |
@@ -26,6 +26,11 @@
 | sngrep | есть |
 | SELinux | нет |
 | FreeSWITCH | есть RPM-пакеты: `freeswitch`, `freeswitch-daemon`, `freeswitch-lua`, `libfreeswitch` и др. |
+| PG data dir | `/var/lib/pgsql/data/` (БЕЗ номера версии! Не как в CentOS) |
+| initdb | Интерактивный! Нужен `sudo -u postgres initdb --auth-local=trust --auth-host=trust` |
+| Auth log | `/var/log/auth/secure` |
+| Syslog | `/var/log/syslog/messages` |
+| journald | systemd-journald по умолчанию, rsyslog для файловых логов |
 
 ### За основу берётся debian-инсталлятор
 
@@ -143,10 +148,11 @@ PHP-FPM корректно обрабатывает запросы.
 **Файлы**:
 - `Alt/resources/postgresql.sh`:
   - Установка: `apt-get install -y sudo postgresql16-server`
-  - **Инициализация кластера**: `/etc/rc.d/init.d/postgresql initdb` (systemctl initdb НЕ работает!)
+  - **Инициализация кластера**: `sudo -u postgres initdb --auth-local=trust --auth-host=trust -D /var/lib/pgsql/data` (интерактивный initdb через init script запрашивает пароль — используем прямой initdb без пароля!)
   - Сервис: `postgresql.service` (без номера версии, не как в CentOS)
-  - Настройка `pg_hba.conf`: замена `scram-sha-256` на `md5`, замена `ident`/`peer` на `md5` для локальных подключений
-  - Путь к данным: `/var/lib/pgsql/16/data/`
+  - Настройка `pg_hba.conf`: после initdb с trust — переключаем host-подключения на md5, local оставляем trust
+  - Путь к данным: `/var/lib/pgsql/data/` (БЕЗ номера версии! Не `/var/lib/pgsql/16/data/`)
+  - Динамическое определение PGDATA (поиск PG_VERSION в нескольких путях)
   - `systemctl enable postgresql`, `systemctl restart postgresql`
   - Создание БД и пользователей через `sudo -u postgres psql`
   - Генерация пароля: `dd if=/dev/urandom bs=1 count=20 2>/dev/null | base64`

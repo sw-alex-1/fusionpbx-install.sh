@@ -35,8 +35,10 @@ php_session_dir=/var/lib/php/${php_version}/sessions  # PHP sessions directory
 pg_package=postgresql${database_version}-server  # e.g. postgresql16-server
 pg_init_script=/etc/rc.d/init.d/postgresql      # initdb via this script, NOT systemctl
 pg_service=postgresql                            # systemd service name
-pg_data_dir=/var/lib/pgsql/${database_version}/data  # default PGDATA
-pg_conf_dir=/var/lib/pgsql/${database_version}/data  # pg_hba.conf, postgresql.conf live here
+# Alt Linux: initdb creates data in /var/lib/pgsql/data/ (NO version number in path!)
+# This differs from CentOS which uses /var/lib/pgsql/<ver>/data/
+pg_data_dir=/var/lib/pgsql/data                  # default PGDATA (no version subdirectory)
+pg_conf_dir=/var/lib/pgsql/data                  # pg_hba.conf, postgresql.conf live here
 
 # General Settings
 letsencrypt_folder=true                     # true or false
