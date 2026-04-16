@@ -47,6 +47,15 @@ wget -O - https://raw.githubusercontent.com/fusionpbx/fusionpbx-install.sh/maste
 cd /usr/src/fusionpbx-install.sh/centos && ./install.sh
 ```
 
+### Alt Linux
+Alt Linux is a Russian Linux distribution using APT-RPM package management. The installer uses RPM packages from the Alt Linux repository (no source builds). PostgreSQL 16, PHP 8.2, nginx, and FreeSWITCH are all available as native packages. Start with a minimal install of Alt Linux (Server profile recommended).
+
+```sh
+apt-get install -y git
+cd /usr/src && git clone -b alt https://github.com/sw-alex-1/fusionpbx-install.sh.git
+cd /usr/src/fusionpbx-install.sh/Alt && ./install.sh
+```
+
 ### Windows
 *  This powershell install for windows is currently in a "beta stage".
 *  mod_lua is missing from builds after 1.6.14. Script will download it from github.
@@ -62,7 +71,7 @@ Master https://github.com/fusionpbx/fusionpbx-install.sh/archive/master.zip
 ```
 
 ## Security Considerations
-Fail2ban is installed and pre-configured for all operating systems this repository works on besides Windows, but the default settings may not be ideal depending on your needs. Please take a look at the jail file (/etc/fail2ban/jail.local on Debian/Devuan) to configure it to suit your application and security model!
+Fail2ban is installed and pre-configured for all operating systems this repository works on besides Windows, but the default settings may not be ideal depending on your needs. Please take a look at the jail file (/etc/fail2ban/jail.local on Debian/Devuan, /etc/fail2ban/jail.local on Alt Linux) to configure it to suit your application and security model!
 
 ## ISSUES
 If you find a bug sign up for an account on www.fusionpbx.com to report the issue.
