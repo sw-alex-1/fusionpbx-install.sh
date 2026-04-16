@@ -210,16 +210,18 @@ DSN настроен, сервис готов к запуску через finis
 
 **Файлы**:
 - `Alt/resources/iptables.sh`:
-  - Убрать всю логику `ufw` (нет в Alt Linux)
-  - Убрать `update-alternatives` (проверить необходимость)
-  - Убрать `debconf-set-selections` и `iptables-persistent` (Debian-specific)
-  - **Уточнить у пользователя**: как в Alt Linux сохранять правила iptables при перезагрузке?
-    Варианты: `iptables-save > /etc/sysconfig/iptables`, через systemd-unit, через `/etc/rc.d/rc.local`
-  - Оставить правила iptables (SIP, RTP, SSH, HTTP/HTTPS, DSCP)
-  - Добавить сохранение правил через подходящий механизм
+  - Убрана вся логика `ufw` (нет в Alt Linux)
+  - Убран `update-alternatives` (нет iptables-legacy/nftables разделения)
+  - Убраны `debconf-set-selections` и `iptables-persistent` (Debian-specific)
+  - Правила: SSH, HTTP/HTTPS, SIP, RTP, WebSocket, OpenVPN, ICMP
+  - DSCP QoS-маркировка: RTP → EF (46), SIP → AF31 (26)
+  - Анти-сканер: 7 паттернов (friendly-scanner, sipcli, VaxSIPUserAgent и др.)
+  - **Сохранение правил**: `iptables-save > /etc/sysconfig/iptables`
+  - **Сервис**: `systemctl enable --now iptables` — ТОЛЬКО ПОСЛЕ сохранения правил!
+  - Порядок: применить правила → сохранить в файл → включить сервис
 
-**Критерий приёмки**: Правила iptables применены, сохраняются после перезагрузки,
-SIP/RTP/SSH/HTTP/HTTPS трафик разрешён.
+**Критерий приёмки**: Правила iptables применены, сохранены в /etc/sysconfig/iptables,
+сервис iptables включён, правила загружаются после перезагрузки.
 
 ---
 
@@ -344,7 +346,7 @@ FusionPBX работает с указанными учётными данным
 | 10 | Полный список freeswitch-* пакетов в Alt Linux | **Решён** | freeswitch-daemon (ядро+модули), freeswitch-lua, freeswitch-av, freeswitch-imagick, freeswitch-lang-*, freeswitch-sounds-* (en,ru,music), libfreeswitch, freeswitch-webui. Нет отдельных freeswitch-mod-* пакетов! |
 | 11 | От какого пользователя работает FreeSWITCH в RPM-пакете? | **Решён** | `_pbx:_pbx` (Alt Linux default) |
 | 12 | Имена dev-пакетов для сборки FreeSWITCH из исходников | **Решён** | Не требуется — только RPM пакеты |
-| 13 | Как сохранять правила iptables при перезагрузке в Alt Linux | Открыт | Инкремент 7 |
+| 13 | Как сохранять правила iptables при перезагрузке в Alt Linux | **Решён** | `iptables-save > /etc/sysconfig/iptables` (автозагрузка при старте). Сервис `iptables.service` — `systemctl enable --now iptables` ПОСЛЕ сохранения правил (иначе ошибка при пустом файле) |
 | 14 | Путь к логу SSH в Alt Linux | Открыт | Инкремент 8 |
 | 15 | Путь к syslog в Alt Linux | Открыт | Инкремент 8 |
 
