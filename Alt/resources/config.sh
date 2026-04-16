@@ -24,6 +24,12 @@ database_backup=false                       # true or false
 
 # PHP Settings
 php_version=8.2                             # PHP version: 8.1, 8.2, 8.3
+php_package_suffix=-fcgi                     # Alt Linux: -fcgi (NOT -fpm like Debian)
+php_fpm_service=php${php_version}-fpm         # systemd service name
+php_fpm_sock_dir=/var/run/php${php_version}-fpm  # socket directory
+php_fpm_sock=unix:${php_fpm_sock_dir}/php${php_version}-fpm.sock  # full socket path
+php_ini_path=/etc/php/${php_version}/fpm-fcgi/php.ini  # php.ini location
+php_session_dir=/var/lib/php/${php_version}/sessions  # PHP sessions directory
 
 # PostgreSQL Settings (Alt Linux specifics)
 pg_package=postgresql${database_version}-server  # e.g. postgresql16-server
@@ -34,6 +40,10 @@ pg_conf_dir=/var/lib/pgsql/${database_version}/data  # pg_hba.conf, postgresql.c
 
 # General Settings
 letsencrypt_folder=true                     # true or false
+
+# Alt Linux Log Paths (for fail2ban and maintenance scripts)
+auth_log=/var/log/auth/secure               # SSH/auth log (NOT /var/log/auth.log)
+syslog_path=/var/log/syslog/messages         # Syslog (NOT /var/log/syslog)
 
 # Alt Linux User/Group Settings
 # These define the system users used by web and telephony services.
