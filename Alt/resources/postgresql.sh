@@ -6,13 +6,16 @@
 #
 # Alt Linux specifics:
 #   - Package: postgresql16-server (not postgresql-16 as in Debian)
-#   - Init: /etc/rc.d/init.d/postgresql initdb (NOT systemctl initdb)
-#   - Service: postgresql.service (unversioned, unlike CentOS postgresql-14)
 #   - Data dir: /var/lib/pgsql/data (NO version number in path!)
 #   - initdb is INTERACTIVE by default — prompts for superuser password
-#     We must use --auth-local=trust --auth-host=trust to make it non-interactive,
-#     then configure authentication after the cluster is created
-#   - No pg_createcluster (Debian-specific), no postgresql-setup (CentOS-specific)
+#     We must use --auth-local=trust --auth-host=trust to make it non-interactive
+#   - Service: postgresql.service (unversioned)
+#
+# IMPORTANT: The order of operations matters!
+#   1. Ensure pg_hba.conf has trust auth (before starting or right after start)
+#   2. Reload config via pg_ctl (NOT psql — psql can't connect if auth is broken)
+#   3. THEN do ALTER USER, CREATE DATABASE, etc. via sudo -u postgres psql
+#   4. FINALLY switch host connections to md5 and reload again
 
 # Determine script directory
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -26,14 +29,11 @@ cd "$SCRIPT_DIR"
 
 # =============================================================================
 # Generate database password
-# Must be done early so it's available for config files and role creation.
-# If password was set to 'random', generate one. Otherwise use the custom value.
 # =============================================================================
 
 if [ "$database_password" = "random" ]; then
     database_password=$(dd if=/dev/urandom bs=1 count=20 2>/dev/null | base64 | tr -d '=/+' | head -c 20)
     if [ -z "$database_password" ]; then
-        # Fallback if dd/base64 fails (very unlikely)
         database_password=$(cat /proc/sys/kernel/random/uuid 2>/dev/null | tr -d '-' | head -c 20)
     fi
     verbose "Generated random database password"
@@ -43,31 +43,25 @@ fi
 
 # =============================================================================
 # Install PostgreSQL
-# Only install server on local database host. For remote databases,
-# only the client is needed.
 # =============================================================================
 
 verbose "Installing PostgreSQL..."
 
 if [ "$database_host" = "127.0.0.1" ] || [ "$database_host" = "::1" ] || [ "$database_host" = "localhost" ]; then
-    # Local database - install server and client
     pkg_install sudo "$pg_package"
-
-    # Verify the package installed successfully
     if ! pkg_is_installed "$pg_package"; then
         die "Failed to install $pg_package. Check that the package is available in your Alt Linux repository."
     fi
     verbose "PostgreSQL server package installed: $pg_package"
 else
-    # Remote database - only client needed
     pkg_install sudo "postgresql${database_version}"
     verbose "PostgreSQL client installed (remote database at $database_host)"
 fi
 
 # =============================================================================
 # Detect actual PostgreSQL data directory
-# Alt Linux may place data in /var/lib/pgsql/data/ or /var/lib/pgsql/<ver>/data/
-# We detect it dynamically by looking for PG_VERSION or using pg_config.
+# Alt Linux places data in /var/lib/pgsql/data/ (NO version number!)
+# But we check multiple paths just in case.
 # =============================================================================
 
 _pg_actual_data_dir=""
@@ -110,16 +104,10 @@ else
 fi
 
 # =============================================================================
-# Initialize the database cluster
-# Alt Linux uses /etc/rc.d/init.d/postgresql initdb
-# This must be done BEFORE starting the service.
+# Initialize the database cluster (only if not already initialized)
 #
 # CRITICAL: Alt Linux initdb is INTERACTIVE — it prompts for superuser password.
-# We must prevent the interactive prompt. Options:
-#   1. Use initdb directly with --auth-local=trust --auth-host=trust
-#   2. Then configure password and authentication after cluster is created.
-#
-# Idempotent: check if data directory already exists and has content.
+# We bypass this by running initdb directly with --auth-local=trust --auth-host=trust
 # =============================================================================
 
 if [ "$database_host" = "127.0.0.1" ] || [ "$database_host" = "::1" ] || [ "$database_host" = "localhost" ]; then
@@ -128,27 +116,20 @@ if [ "$database_host" = "127.0.0.1" ] || [ "$database_host" = "::1" ] || [ "$dat
     else
         verbose "Initializing PostgreSQL database cluster (non-interactive)..."
 
-        # Ensure the postgres user exists and data directory parent exists
         ensure_dir "/var/lib/pgsql"
 
-        # Method 1: Use initdb directly as postgres user with trust authentication
-        # This avoids the interactive password prompt from the Alt Linux init script.
-        # We'll set the superuser password AFTER the cluster is created.
         verbose "  Running initdb with trust authentication (no password prompt)..."
 
         if sudo -u postgres initdb \
             --auth-local=trust \
             --auth-host=trust \
             --encoding=UTF8 \
-            --locale=ru_RU.UTF-8 \
             -D "$pg_data_dir" 2>&1; then
-            verbose "PostgreSQL database cluster initialized (trust auth, no superuser password yet)"
+            verbose "PostgreSQL database cluster initialized (trust auth)"
         else
-            # Fallback: try the init script, but pipe 'yes' to handle the password prompt
+            # Fallback: try the init script with options
             warn "Direct initdb failed, trying via init script..."
             if [ -x "$pg_init_script" ]; then
-                # Try running the init script non-interactively
-                # Some Alt Linux versions accept environment variables
                 if PGSETUP_INITDB_OPTIONS="--auth-local=trust --auth-host=trust" \
                     "$pg_init_script" initdb 2>&1; then
                     verbose "PostgreSQL database cluster initialized via init script"
@@ -174,96 +155,83 @@ if [ "$database_host" = "127.0.0.1" ] || [ "$database_host" = "::1" ] || [ "$dat
 fi
 
 # =============================================================================
-# Start PostgreSQL (with trust auth — anyone can connect without password)
-# We need it running to set the superuser password and configure pg_hba.conf.
-# =============================================================================
-
-if [ "$database_host" = "127.0.0.1" ] || [ "$database_host" = "::1" ] || [ "$database_host" = "localhost" ]; then
-    systemctl daemon-reload
-    service_enable_start "$pg_service"
-
-    # Wait for PostgreSQL to become ready
-    if ! wait_for_service "$pg_service" 30; then
-        die "PostgreSQL service failed to start within 30 seconds. Check: journalctl -u $pg_service -n 50"
-    fi
-    verbose "PostgreSQL service is running"
-fi
-
-# =============================================================================
-# Set superuser password (was skipped during initdb with --auth-local=trust)
-# Now that PostgreSQL is running with trust auth, we can set the password.
-# =============================================================================
-
-if [ "$database_host" = "127.0.0.1" ] || [ "$database_host" = "::1" ] || [ "$database_host" = "localhost" ]; then
-    verbose "Setting postgres superuser password..."
-    sudo -u postgres psql -c "ALTER USER postgres WITH PASSWORD '$database_password';" 2>/dev/null \
-        || warn "Failed to set postgres superuser password (may already be set)"
-fi
-
-# =============================================================================
-# Configure pg_hba.conf - switch from trust to md5 authentication
-# Now that we've set the superuser password, we can enforce md5 auth.
+# STEP 1: Force pg_hba.conf to trust BEFORE starting PostgreSQL
+# This is critical for re-runs where the previous initdb may have set
+# scram-sha-256 or password authentication, which would prevent
+# sudo -u postgres psql from connecting.
 #
-# The approach:
-#   1. Replace trust with md5 for host connections (TCP/IP)
-#   2. Keep local (Unix socket) connections as trust for sudo -u postgres psql
-#      or change to md5 for better security
-#   3. Also replace scram-sha-256 with md5 if present
-#   4. Replace ident/peer with md5 for local TCP connections
+# We set ALL connections (local + host) to trust temporarily.
+# We'll switch host connections to md5 AFTER setting the password.
 # =============================================================================
 
 _pg_hba="$pg_conf_dir/pg_hba.conf"
 
 if [ "$database_host" = "127.0.0.1" ] || [ "$database_host" = "::1" ] || [ "$database_host" = "localhost" ]; then
     if [ -f "$_pg_hba" ]; then
-        verbose "Configuring pg_hba.conf for md5 authentication..."
+        verbose "Ensuring pg_hba.conf has trust authentication (temporary)..."
 
         backup_file "$_pg_hba"
 
-        # Replace scram-sha-256 with md5
-        sed -i '/^#/!s/scram-sha-256/md5/g' "$_pg_hba" 2>/dev/null
+        # Replace ALL auth methods with trust for now
+        # This includes: scram-sha-256, md5, password, ident, peer, gss, sspi
+        # Only modify non-comment lines
+        sed -i '/^#/!s/\bscram-sha-256\b/trust/g' "$_pg_hba" 2>/dev/null
+        sed -i '/^#/!s/\bmd5\b/trust/g' "$_pg_hba" 2>/dev/null
+        sed -i '/^#/!s/\bpassword\b/trust/g' "$_pg_hba" 2>/dev/null
+        sed -i '/^#/!s/\bident\b/trust/g' "$_pg_hba" 2>/dev/null
+        sed -i '/^#/!s/\bpeer\b/trust/g' "$_pg_hba" 2>/dev/null
 
-        # Replace ident with md5 for TCP connections
-        sed -i '/^#/!s/\bident\b/md5/g' "$_pg_hba" 2>/dev/null
-
-        # Replace peer with md5 for TCP connections
-        sed -i '/^#/!s/\bpeer\b/md5/g' "$_pg_hba" 2>/dev/null
-
-        # Replace trust with md5 for host (TCP) connections ONLY
-        # Keep "local" lines as trust so sudo -u postgres psql still works
-        # without password prompts for local administration
-        sed -i '/^host/s/\btrust\b/md5/g' "$_pg_hba" 2>/dev/null
-
-        verbose "  pg_hba.conf configured: local=trust, host=md5"
-
-        # Reload PostgreSQL to apply pg_hba.conf changes
-        sudo -u postgres psql -c "SELECT pg_reload_conf();" 2>/dev/null \
-            || warn "pg_reload_conf() failed (may be ok if config unchanged)"
-        sleep 1
+        verbose "  pg_hba.conf: all connections set to trust (temporary)"
     else
-        die "pg_hba.conf not found at $_pg_hba after initialization!"
+        die "pg_hba.conf not found at $_pg_hba!"
     fi
 fi
 
 # =============================================================================
-# Create database and users
-# All operations are idempotent:
-#   - Database creation checks if DB already exists
-#   - Role creation checks if role already exists
+# STEP 2: Start PostgreSQL with trust auth
 # =============================================================================
 
 if [ "$database_host" = "127.0.0.1" ] || [ "$database_host" = "::1" ] || [ "$database_host" = "localhost" ]; then
-    # Move to /tmp to prevent "could not change directory" warning from sudo+psql
+    systemctl daemon-reload
+    service_enable_start "$pg_service"
+
+    if ! wait_for_service "$pg_service" 30; then
+        die "PostgreSQL service failed to start within 30 seconds. Check: journalctl -u $pg_service -n 50"
+    fi
+    verbose "PostgreSQL service is running"
+
+    # Reload config in case PostgreSQL was already running with old pg_hba.conf
+    # Use pg_ctl reload (NOT psql — psql might not work if auth was broken)
+    sudo -u postgres pg_ctl reload -D "$pg_data_dir" 2>/dev/null \
+        || systemctl reload "$pg_service" 2>/dev/null \
+        || warn "Could not reload PostgreSQL config (may need manual reload)"
+    sleep 1
+fi
+
+# =============================================================================
+# STEP 3: Set superuser password and create database/users
+# Now that trust auth is active, sudo -u postgres psql will work.
+# =============================================================================
+
+if [ "$database_host" = "127.0.0.1" ] || [ "$database_host" = "::1" ] || [ "$database_host" = "localhost" ]; then
     _cwd=$(pwd)
     cd /tmp
+
+    # Set postgres superuser password
+    verbose "Setting postgres superuser password..."
+    if sudo -u postgres psql -c "ALTER USER postgres WITH PASSWORD '$database_password';" 2>/dev/null; then
+        verbose "  Postgres superuser password set"
+    else
+        warn "  Failed to set postgres superuser password"
+    fi
 
     # Create database (idempotent: skip if exists)
     if pg_db_exists "$database_name"; then
         verbose "Database '$database_name' already exists (keeping)"
     else
-        sudo -u postgres psql -c "CREATE DATABASE $database_name;" 2>/dev/null
-        if pg_db_exists "$database_name"; then
-            verbose "Database '$database_name' created"
+        verbose "Creating database '$database_name'..."
+        if sudo -u postgres psql -c "CREATE DATABASE $database_name;" 2>/dev/null; then
+            verbose "  Database '$database_name' created"
         else
             die "Failed to create database '$database_name'"
         fi
@@ -273,17 +241,18 @@ if [ "$database_host" = "127.0.0.1" ] || [ "$database_host" = "::1" ] || [ "$dat
     if pg_role_exists "$database_username"; then
         verbose "Role '$database_username' already exists (keeping, password unchanged)"
     else
+        verbose "Creating role '$database_username'..."
         sudo -u postgres psql \
             -c "CREATE ROLE $database_username WITH SUPERUSER LOGIN PASSWORD '$database_password';" 2>/dev/null
 
         if pg_role_exists "$database_username"; then
-            verbose "Role '$database_username' created with SUPERUSER privileges"
+            verbose "  Role '$database_username' created with SUPERUSER privileges"
         else
             die "Failed to create role '$database_username'"
         fi
     fi
 
-    # Grant privileges (idempotent: GRANT ALL on already-granted DB is safe)
+    # Grant privileges (idempotent)
     sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE $database_name TO $database_username;" 2>/dev/null
     verbose "Privileges granted on '$database_name' to '$database_username'"
 
@@ -291,15 +260,36 @@ if [ "$database_host" = "127.0.0.1" ] || [ "$database_host" = "::1" ] || [ "$dat
 fi
 
 # =============================================================================
+# STEP 4: Switch host connections to md5 authentication
+# Now that the password is set, we can enforce md5 auth for TCP connections.
+# Keep local (Unix socket) connections as trust for sudo -u postgres psql.
+# =============================================================================
+
+if [ "$database_host" = "127.0.0.1" ] || [ "$database_host" = "::1" ] || [ "$database_host" = "localhost" ]; then
+    if [ -f "$_pg_hba" ]; then
+        verbose "Switching host connections to md5 authentication..."
+
+        # Replace trust with md5 for host (TCP) connections ONLY
+        # Keep "local" lines as trust so sudo -u postgres psql works without password
+        sed -i '/^host/s/\btrust\b/md5/g' "$_pg_hba" 2>/dev/null
+
+        verbose "  pg_hba.conf: local=trust, host=md5"
+
+        # Reload config via pg_ctl (NOT psql — psql might not connect with new md5 rules)
+        sudo -u postgres pg_ctl reload -D "$pg_data_dir" 2>/dev/null \
+            || systemctl reload "$pg_service" 2>/dev/null \
+            || warn "Could not reload PostgreSQL config after md5 switch"
+        sleep 1
+    fi
+fi
+
+# =============================================================================
 # Save database credentials for other scripts
-# Write a .pgpass file for the web user so FusionPBX scripts can connect
-# without exposing the password on the command line.
 # =============================================================================
 
 if [ "$database_host" = "127.0.0.1" ] || [ "$database_host" = "::1" ] || [ "$database_host" = "localhost" ]; then
     _pgpass_file="/var/www/fusionpbx/.pgpass"
 
-    # Only create .pgpass if FusionPBX directory exists (it may not yet at this stage)
     if [ -d "/var/www/fusionpbx" ]; then
         verbose "Creating .pgpass for FusionPBX..."
         echo "${database_host}:${database_port}:${database_name}:${database_username}:${database_password}" > "$_pgpass_file"
@@ -309,12 +299,7 @@ if [ "$database_host" = "127.0.0.1" ] || [ "$database_host" = "::1" ] || [ "$dat
     fi
 fi
 
-# =============================================================================
-# Store password in a secure temporary file for the finish.sh script
-# The finish.sh script will need the password to configure FusionPBX.
-# We use a root-only readable file to pass it between installer stages.
-# =============================================================================
-
+# Store password for finish.sh
 _pg_cred_file="/tmp/fusionpbx_db_credentials"
 cat > "$_pg_cred_file" <<EOF
 database_host=$database_host
