@@ -51,7 +51,7 @@ verbose "Updating package index..."
 apt-get update || warn "apt-get update encountered warnings (may be normal for some repos)"
 
 verbose "Upgrading installed packages..."
-apt-get upgrade -y || warn "apt-get upgrade encountered warnings"
+apt-get dist-upgrade -y || warn "apt-get dist-upgrade encountered warnings"
 
 # =============================================================================
 # Install base utilities
