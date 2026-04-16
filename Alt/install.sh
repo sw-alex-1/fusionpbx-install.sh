@@ -87,7 +87,7 @@ resources/iptables.sh
 
 # Step 8: Fail2ban
 verbose "=== Step 8/10: Configuring Fail2ban ==="
-# resources/fail2ban.sh
+resources/fail2ban.sh
 
 # Step 9: Additional services (sngrep, monit, snmp)
 verbose "=== Step 9/10: Additional services ==="
@@ -108,5 +108,5 @@ verbose " Installation steps completed."
 verbose "========================================="
 verbose ""
 warning "Note: Some steps are not yet implemented."
-warning "Completed steps: 1 (pre-install), 2 (PHP), 3 (nginx), 4 (PostgreSQL), 5 (FusionPBX), 6 (FreeSWITCH), 7 (iptables)"
+warning "Completed steps: 1 (pre-install), 2 (PHP), 3 (nginx), 4 (PostgreSQL), 5 (FusionPBX), 6 (FreeSWITCH), 7 (iptables), 8 (fail2ban)"
 warning "Remaining steps will be activated in subsequent increments."

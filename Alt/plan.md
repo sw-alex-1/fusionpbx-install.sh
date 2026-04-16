@@ -347,8 +347,8 @@ FusionPBX работает с указанными учётными данным
 | 11 | От какого пользователя работает FreeSWITCH в RPM-пакете? | **Решён** | `_pbx:_pbx` (Alt Linux default) |
 | 12 | Имена dev-пакетов для сборки FreeSWITCH из исходников | **Решён** | Не требуется — только RPM пакеты |
 | 13 | Как сохранять правила iptables при перезагрузке в Alt Linux | **Решён** | `iptables-save > /etc/sysconfig/iptables` (автозагрузка при старте). Сервис `iptables.service` — `systemctl enable --now iptables` ПОСЛЕ сохранения правил (иначе ошибка при пустом файле) |
-| 14 | Путь к логу SSH в Alt Linux | Открыт | Инкремент 8 |
-| 15 | Путь к syslog в Alt Linux | Открыт | Инкремент 8 |
+| 14 | Путь к логу SSH в Alt Linux | **Решён** | `/var/log/auth/secure` (аналог `/var/log/auth.log` в Debian) |
+| 15 | Путь к syslog в Alt Linux | **Решён** | `/var/log/syslog/messages` (аналог `/var/log/syslog` в Debian). Также Alt Linux использует systemd-journald по умолчанию — rsyslog нужен для файловых логов |
 
 ---
 
