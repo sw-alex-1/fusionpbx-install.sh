@@ -1,0 +1,288 @@
+#!/bin/sh
+
+# FusionPBX Alt Linux Installer - Finish
+# Final step: database schema, admin user, service configuration, and startup.
+#
+# Alt Linux specifics:
+#   - Web user: _nginx:_nginx (NOT www-data:www-data)
+#   - FreeSWITCH user: _pbx:_pbx
+#   - Cron package: cronie (NOT cron)
+#   - No 'freeswitch' PostgreSQL role — only 'fusionpbx' is created
+#   - .pgpass is already configured by postgresql.sh and fusionpbx.sh
+#   - hostname -I: always take first IP (bug fix from analysis)
+#   - tmpfiles.d for /var/run/fusionpbx persistence across reboots
+
+# Determine script directory
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
+
+# Includes
+. ./config.sh
+. ./colors.sh
+. ./util.sh
+. ./environment.sh
+
+# =============================================================================
+# Database password
+# =============================================================================
+
+# Generate a random database password if not specified
+if [ ."${database_password}" = ."random" ] || [ -z "$database_password" ]; then
+    database_password=$(dd if=/dev/urandom bs=1 count=20 2>/dev/null | base64 | sed 's/[=\+//]//g')
+    verbose "Generated random database password"
+fi
+
+# Set PGPASSWORD for psql commands in this script
+# (We use .pgpass for automated scripts, but PGPASSWORD is simpler for
+#  the one-time setup operations in this script.)
+export PGPASSWORD=$database_password
+
+# =============================================================================
+# Update the database password
+# =============================================================================
+
+verbose "Setting database passwords..."
+
+# Update fusionpbx user password
+sudo -u postgres psql -c "ALTER USER fusionpbx WITH PASSWORD '$database_password';"
+
+# Note: Alt Linux does NOT create a 'freeswitch' PostgreSQL role by default.
+# FreeSWITCH connects as 'fusionpbx' via the DSN configured in dsn.sh.
+# If a separate freeswitch role is needed, uncomment the following:
+# sudo -u postgres psql -c "ALTER USER freeswitch WITH PASSWORD '$database_password';"
+
+# =============================================================================
+# Install backup/maintenance cron scripts
+# =============================================================================
+
+verbose "Installing backup and maintenance scripts..."
+
+# Copy backup scripts to cron.daily
+cp backup/fusionpbx-backup /etc/cron.daily/fusionpbx-backup
+cp backup/fusionpbx-maintenance /etc/cron.daily/fusionpbx-maintenance
+chmod 755 /etc/cron.daily/fusionpbx-backup
+chmod 755 /etc/cron.daily/fusionpbx-maintenance
+
+# Replace the password placeholder in backup scripts
+sed -i "s/zzz/$database_password/g" /etc/cron.daily/fusionpbx-backup
+sed -i "s/zzz/$database_password/g" /etc/cron.daily/fusionpbx-maintenance
+
+# =============================================================================
+# FusionPBX configuration
+# =============================================================================
+
+verbose "Configuring FusionPBX..."
+
+# Install config.conf
+ensure_dir "/etc/fusionpbx"
+cp fusionpbx/config.conf /etc/fusionpbx/config.conf
+
+# Replace placeholders with actual values
+sed -i /etc/fusionpbx/config.conf -e s:"{database_host}:$database_host:"
+sed -i /etc/fusionpbx/config.conf -e s:"{database_name}:$database_name:"
+sed -i /etc/fusionpbx/config.conf -e s:"{database_username}:$database_username:"
+sed -i /etc/fusionpbx/config.conf -e s:"{database_password}:$database_password:"
+
+# =============================================================================
+# Database schema
+# =============================================================================
+
+verbose "Installing database schema..."
+
+cd /var/www/fusionpbx && /usr/bin/php /var/www/fusionpbx/core/upgrade/upgrade.php --schema
+
+# =============================================================================
+# Domain configuration
+# =============================================================================
+
+#get the server hostname
+if [ ."${domain_name}" = ."hostname" ]; then
+    domain_name=$(hostname -f)
+fi
+
+#get the ip address — always take the first IP (bug fix from analysis)
+if [ ."${domain_name}" = ."ip_address" ]; then
+    domain_name=$(hostname -I | cut -d ' ' -f1)
+fi
+
+verbose "Domain: $domain_name"
+
+#get the domain_uuid
+domain_uuid=$(/usr/bin/php /var/www/fusionpbx/resources/uuid.php)
+
+#add the domain name
+psql --host=$database_host --port=$database_port --username=$database_username -c \
+    "insert into v_domains (domain_uuid, domain_name, domain_enabled) values('$domain_uuid', '$domain_name', 'true');"
+
+# =============================================================================
+# App defaults
+# =============================================================================
+
+verbose "Running app defaults..."
+
+cd /var/www/fusionpbx && /usr/bin/php /var/www/fusionpbx/core/upgrade/upgrade.php --defaults
+
+# =============================================================================
+# Admin user
+# =============================================================================
+
+verbose "Creating admin user..."
+
+user_uuid=$(/usr/bin/php /var/www/fusionpbx/resources/uuid.php)
+user_salt=$(/usr/bin/php /var/www/fusionpbx/resources/uuid.php)
+user_name=$system_username
+
+if [ ."${system_password}" = ."random" ]; then
+    user_password=$(dd if=/dev/urandom bs=1 count=20 2>/dev/null | base64 | sed 's/[=\+//]//g')
+else
+    user_password=$system_password
+fi
+
+password_hash=$(/usr/bin/php -r "echo md5('$user_salt$user_password');")
+
+psql --host=$database_host --port=$database_port --username=$database_username -t -c \
+    "insert into v_users (user_uuid, domain_uuid, username, password, salt, user_enabled) \
+     values('$user_uuid', '$domain_uuid', '$user_name', '$password_hash', '$user_salt', 'true');"
+
+#get the superadmin group_uuid
+group_uuid=$(psql --host=$database_host --port=$database_port --username=$database_username -qtAX -c \
+    "select group_uuid from v_groups where group_name = 'superadmin';")
+
+#add the user to the group
+user_group_uuid=$(/usr/bin/php /var/www/fusionpbx/resources/uuid.php)
+group_name=superadmin
+
+psql --host=$database_host --port=$database_port --username=$database_username -c \
+    "insert into v_user_groups (user_group_uuid, domain_uuid, group_name, group_uuid, user_uuid) \
+     values('$user_group_uuid', '$domain_uuid', '$group_name', '$group_uuid', '$user_uuid');"
+
+# =============================================================================
+# XML CDR configuration
+# =============================================================================
+
+verbose "Configuring XML CDR..."
+
+xml_cdr_username=$(dd if=/dev/urandom bs=1 count=20 2>/dev/null | base64 | sed 's/[=\+//]//g')
+xml_cdr_password=$(dd if=/dev/urandom bs=1 count=20 2>/dev/null | base64 | sed 's/[=\+//]//g')
+
+sed -i /etc/freeswitch/autoload_configs/xml_cdr.conf.xml -e s:"{v_http_protocol}:http:"
+sed -i /etc/freeswitch/autoload_configs/xml_cdr.conf.xml -e s:"{domain_name}:$database_host:"
+sed -i /etc/freeswitch/autoload_configs/xml_cdr.conf.xml -e s:"{v_project_path}::"
+sed -i /etc/freeswitch/autoload_configs/xml_cdr.conf.xml -e s:"{v_user}:$xml_cdr_username:"
+sed -i /etc/freeswitch/autoload_configs/xml_cdr.conf.xml -e s:"{v_pass}:$xml_cdr_password:"
+
+# =============================================================================
+# Update app defaults and permissions
+# =============================================================================
+
+verbose "Updating app defaults..."
+
+cd /var/www/fusionpbx && /usr/bin/php /var/www/fusionpbx/core/upgrade/upgrade.php --defaults
+
+verbose "Updating permissions..."
+
+cd /var/www/fusionpbx && /usr/bin/php /var/www/fusionpbx/core/upgrade/upgrade.php --permissions
+
+# =============================================================================
+# FreeSWITCH startup
+# =============================================================================
+
+verbose "Starting FreeSWITCH..."
+
+/bin/systemctl daemon-reload
+/bin/systemctl restart freeswitch
+
+# =============================================================================
+# /var/run/fusionpbx persistence (bug fix #5 from analysis)
+# Create tmpfiles.d entry so /var/run/fusionpbx survives reboots
+# =============================================================================
+
+verbose "Configuring /var/run/fusionpbx persistence..."
+
+mkdir -p /var/run/fusionpbx
+chown -R ${web_user}:${web_group} /var/run/fusionpbx
+
+# Create tmpfiles.d configuration so systemd-tmpfiles recreates this on boot
+cat > /etc/tmpfiles.d/fusionpbx.conf << EOF
+# FusionPBX runtime directory — recreated on boot by systemd-tmpfiles
+d /var/run/fusionpbx 0775 ${web_user} ${web_group} -
+EOF
+
+verbose "  Created /etc/tmpfiles.d/fusionpbx.conf"
+
+# =============================================================================
+# Install services
+# =============================================================================
+
+verbose "Installing FusionPBX services..."
+
+cd /var/www/fusionpbx && /usr/bin/php /var/www/fusionpbx/core/upgrade/upgrade.php --services
+
+# =============================================================================
+# Install cron
+# =============================================================================
+
+verbose "Installing cron daemon..."
+
+# Alt Linux uses 'cronie' package (not 'cron' like Debian)
+pkg_install cronie
+service_enable_start crond
+
+# =============================================================================
+# File permissions
+# =============================================================================
+
+verbose "Setting file permissions..."
+
+chmod 664 /etc/fusionpbx/config.conf
+
+# =============================================================================
+# Restart services
+# =============================================================================
+
+verbose "Restarting nginx and FreeSWITCH..."
+
+systemctl restart nginx freeswitch
+
+# =============================================================================
+# Welcome message
+# =============================================================================
+
+echo ""
+echo ""
+verbose "Installation Complete!"
+echo ""
+echo "   Please save this information and reboot this system to complete the install."
+echo ""
+echo "   Use a web browser to login."
+echo "      domain name: https://$domain_name"
+echo "      username:    $user_name"
+echo "      password:    $user_password"
+echo ""
+echo "   The domain name in the browser is used by default as part of the authentication."
+echo "   If you need to login to a different domain then use username@domain."
+echo "      username: $user_name@$domain_name"
+echo ""
+echo "   Official FusionPBX Training"
+echo "      Fastest way to learn FusionPBX. For more information https://www.fusionpbx.com."
+echo "      Available online and in person. Includes documentation and recording."
+echo ""
+echo "      Location:               Online"
+echo "      Admin Training:          TBA"
+echo "      Advanced Training:       TBA"
+echo "      Continuing Education:   https://www.fusionpbx.com/training"
+echo "      Timezone:               https://www.timeanddate.com/weather/usa/idaho"
+echo ""
+echo "   Additional information."
+echo "      https://fusionpbx.com/members.php"
+echo "      https://fusionpbx.com/training.php"
+echo "      https://fusionpbx.com/support.php"
+echo "      https://www.fusionpbx.com"
+echo "      http://docs.fusionpbx.com"
+echo ""
+
+# =============================================================================
+# Cleanup — unset PGPASSWORD for security
+# =============================================================================
+
+unset PGPASSWORD

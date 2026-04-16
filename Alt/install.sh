@@ -96,7 +96,7 @@ resources/monit.sh
 
 # Step 10: Finish (database schema, admin user, service startup)
 verbose "=== Step 10/10: Finalizing installation ==="
-# resources/finish.sh
+resources/finish.sh
 
 # =============================================================================
 # Completion
@@ -107,6 +107,4 @@ verbose "========================================="
 verbose " Installation steps completed."
 verbose "========================================="
 verbose ""
-warning "Note: Some steps are not yet implemented."
-warning "Completed steps: 1 (pre-install), 2 (PHP), 3 (nginx), 4 (PostgreSQL), 5 (FusionPBX), 6 (FreeSWITCH), 7 (iptables), 8 (fail2ban), 9 (sngrep+monit)"
-warning "Remaining steps will be activated in subsequent increments."
+verbose "All installation steps completed successfully!"
