@@ -342,7 +342,7 @@ FusionPBX работает с указанными учётными данным
 | 6 | Версия PostgreSQL и имя пакета | **Решён** | `postgresql16-server` (PostgreSQL 16) |
 | 7 | Как инициализировать кластер PG | **Решён** | `/etc/rc.d/init.d/postgresql initdb` (systemctl не работает!) |
 | 8 | Путь к `pg_hba.conf` и данным PG | **Решён** | `/var/lib/pgsql/16/data/pg_hba.conf` |
-| 9 | Имена пакетов `libtiff-tools`, `qrencode`, `dbus`, `ssl-cert` в Alt | Открыт | Инкремент 5 |
+| 9 | Имена пакетов `libtiff-tools`, `qrencode`, `dbus`, `ssl-cert` в Alt | **Решён** | Не все доступны — скрипты используют fallback с предупреждением при отсутствии |
 | 10 | Полный список freeswitch-* пакетов в Alt Linux | **Решён** | freeswitch-daemon (ядро+модули), freeswitch-lua, freeswitch-av, freeswitch-imagick, freeswitch-lang-*, freeswitch-sounds-* (en,ru,music), libfreeswitch, freeswitch-webui. Нет отдельных freeswitch-mod-* пакетов! |
 | 11 | От какого пользователя работает FreeSWITCH в RPM-пакете? | **Решён** | `_pbx:_pbx` (Alt Linux default) |
 | 12 | Имена dev-пакетов для сборки FreeSWITCH из исходников | **Решён** | Не требуется — только RPM пакеты |
