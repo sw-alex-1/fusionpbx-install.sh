@@ -74,7 +74,7 @@ resources/postgresql.sh
 
 # Step 5: FusionPBX application
 verbose "=== Step 5/10: Installing FusionPBX ==="
-# resources/fusionpbx.sh
+resources/fusionpbx.sh
 
 # Step 6: FreeSWITCH
 verbose "=== Step 6/10: Installing FreeSWITCH ==="
@@ -107,5 +107,5 @@ verbose " Installation steps completed."
 verbose "========================================="
 verbose ""
 warning "Note: Some steps are not yet implemented."
-warning "Completed steps: 1 (pre-install), 2 (PHP), 3 (nginx), 4 (PostgreSQL)"
+warning "Completed steps: 1 (pre-install), 2 (PHP), 3 (nginx), 4 (PostgreSQL), 5 (FusionPBX)"
 warning "Remaining steps will be activated in subsequent increments."
