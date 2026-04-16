@@ -76,12 +76,12 @@ pkg_install \
 # SNMP (optional but useful for monitoring)
 # =============================================================================
 
-if pkg_is_installed snmpd; then
+if pkg_is_installed net-snmp-snmpd; then
     verbose "snmpd is already installed"
 else
     verbose "Installing and configuring SNMP..."
-    pkg_install snmpd
-    if pkg_is_installed snmpd; then
+    pkg_install net-snmp-snmpd
+    if pkg_is_installed net-snmp-snmpd; then
         echo "rocommunity public" > /etc/snmp/snmpd.conf
         service_enable_start snmpd
     fi

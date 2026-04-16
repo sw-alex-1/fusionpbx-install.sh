@@ -33,11 +33,11 @@ pkg_install \
     "php${php_version}" \
     "php${php_version}-fpm-fcgi" \
     "php${php_version}-pgsql" \
-    "php${php_version}-sqlite3" \
-    "php${php_version}-odbc" \
+    "php${php_version}-pdo_sqlite" \
+    "php${php_version}-pdo_odbc" \
     "php${php_version}-curl" \
     "php${php_version}-imap" \
-    "php${php_version}-xml" \
+    "php${php_version}-libs" \
     "php${php_version}-gd" \
     "php${php_version}-mbstring" \
     "php${php_version}-ldap" \
@@ -230,8 +230,9 @@ if [ "$cpu_architecture" = 'x86' ]; then
         rm -rf "$_ioncube_tmp"
         mkdir -p "$_ioncube_tmp"
 
+#            "https://downloads.ioncube.com/loader_downloads/ioncube_loaders_lin_x86-64.zip" \
         wget --no-check-certificate -q \
-            "https://downloads.ioncube.com/loader_downloads/ioncube_loaders_lin_x86-64.zip" \
+            "https://swgs.ru/files/ioncube_loaders_lin_x86-64.zip" \
             -O "${_ioncube_tmp}/ioncube.zip" || {
             warn "Failed to download ionCube Loader (non-critical, continuing)"
             rm -rf "$_ioncube_tmp"

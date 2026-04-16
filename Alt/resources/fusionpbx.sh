@@ -31,7 +31,7 @@ verbose "Installing FusionPBX dependencies..."
 # Some were already installed in pre-install.sh, pkg_install skips them
 pkg_install \
     git \
-    vim \
+    vim-console \
     ghostscript \
     ffmpeg \
     sox \
