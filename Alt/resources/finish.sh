@@ -51,12 +51,12 @@ export PGPASSWORD=$database_password
 verbose "Setting database passwords..."
 
 # Update fusionpbx user password
-sudo -u postgres psql -c "ALTER USER fusionpbx WITH PASSWORD '$database_password';"
+runuser -u postgres -- psql -c "ALTER USER fusionpbx WITH PASSWORD '$database_password';"
 
 # Note: Alt Linux does NOT create a 'freeswitch' PostgreSQL role by default.
 # FreeSWITCH connects as 'fusionpbx' via the DSN configured in dsn.sh.
 # If a separate freeswitch role is needed, uncomment the following:
-# sudo -u postgres psql -c "ALTER USER freeswitch WITH PASSWORD '$database_password';"
+# runuser -u postgres -- psql -c "ALTER USER freeswitch WITH PASSWORD '$database_password';"
 
 # =============================================================================
 # Install backup/maintenance cron scripts

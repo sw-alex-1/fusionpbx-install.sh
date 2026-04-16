@@ -202,7 +202,9 @@ wait_for_service() {
 # Returns: 0 if exists, 1 if not
 pg_db_exists() {
     _pde_db="$1"
-    sudo -u postgres psql -lqt 2>/dev/null | cut -d \| -f 1 | grep -qw "$_pde_db"
+    # NOTE: On Alt Linux, 'sudo -u postgres' does NOT work from root.
+    # Use 'runuser' instead — the standard way for root to switch users.
+    runuser -u postgres -- psql -lqt 2>/dev/null | cut -d \| -f 1 | grep -qw "$_pde_db"
 }
 
 # Check if a PostgreSQL role exists
@@ -210,5 +212,5 @@ pg_db_exists() {
 # Returns: 0 if exists, 1 if not
 pg_role_exists() {
     _pre_role="$1"
-    sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='$_pre_role'" 2>/dev/null | grep -q 1
+    runuser -u postgres -- psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='$_pre_role'" 2>/dev/null | grep -q 1
 }
