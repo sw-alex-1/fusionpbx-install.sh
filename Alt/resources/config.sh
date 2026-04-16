@@ -7,8 +7,8 @@ system_branch=5.5                           # master, 5.5
 
 # FreeSWITCH Settings
 switch_branch=stable                        # master, stable
-switch_source=false                         # true (source compile) or false (binary package)
-switch_package=true                         # true (binary package) or false (source compile)
+switch_source=false                         # Always false — Alt Linux has RPM packages, no source build needed
+switch_package=true                         # Always true — use RPM packages from Alt Linux repository
 switch_tls=true                             # true or false
 
 # Database Settings
@@ -40,8 +40,8 @@ letsencrypt_folder=true                     # true or false
 # Adjust if your Alt Linux installation uses different user names.
 web_user=_nginx                             # nginx and php-fpm user
 web_group=_nginx                            # nginx and php-fpm group
-fs_user=freeswitch                          # FreeSWITCH runtime user
-fs_group=daemon                             # FreeSWITCH runtime group
+fs_user=_pbx                                # FreeSWITCH runtime user (Alt Linux default)
+fs_group=_pbx                               # FreeSWITCH runtime group (Alt Linux default)
 
 # Optional Applications
 application_transcribe=true                # Speech to Text

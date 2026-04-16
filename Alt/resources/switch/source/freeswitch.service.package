@@ -1,0 +1,45 @@
+;;;;; FreeSWITCH systemd service unit for Alt Linux
+;;;;; Adapted from the Debian package by Travis Cross <tc@traviscross.com>
+;;;;; Changes for Alt Linux:
+;;;;;   - USER=_pbx, GROUP=_pbx (Alt Linux default)
+;;;;;   - After=postgresql.service (ensure DB is ready)
+;;;;;   - ExecStart path may differ (check with `which freeswitch`)
+
+[Unit]
+Description=FreeSWITCH open source softswitch
+Wants=network-online.target
+Requires=network.target local-fs.target
+After=network.target network-online.target local-fs.target postgresql.service
+
+[Service]
+; service
+Type=forking
+PIDFile=/run/freeswitch/freeswitch.pid
+Environment="DAEMON_OPTS=-nonat"
+Environment="USER=_pbx"
+Environment="GROUP=_pbx"
+EnvironmentFile=-/etc/default/freeswitch
+ExecStartPre=/bin/mkdir -p /var/run/freeswitch
+ExecStartPre=/bin/chown -R ${USER}:${GROUP} /var/lib/freeswitch /var/log/freeswitch /etc/freeswitch /usr/share/freeswitch /var/run/freeswitch
+ExecStartPre=/bin/sleep 10
+ExecStart=/usr/bin/freeswitch -u ${USER} -g ${GROUP} -ncwait ${DAEMON_OPTS}
+TimeoutSec=45s
+Restart=always
+; exec
+;User=${USER}
+;Group=${GROUP}
+LimitCORE=infinity
+LimitNOFILE=100000
+LimitNPROC=60000
+LimitSTACK=250000
+LimitRTPRIO=infinity
+LimitRTTIME=infinity
+IOSchedulingClass=realtime
+IOSchedulingPriority=2
+CPUSchedulingPolicy=rr
+CPUSchedulingPriority=89
+UMask=0007
+NoNewPrivileges=false
+
+[Install]
+WantedBy=multi-user.target

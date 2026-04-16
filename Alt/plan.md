@@ -181,34 +181,26 @@ PHP-FPM корректно обрабатывает запросы.
 **Цель**: Установка FreeSWITCH из RPM-пакетов.
 
 **Файлы**:
-- `Alt/resources/switch.sh` — диспетчер установки (source/package)
+- `Alt/resources/switch.sh` — диспетчер установки (только RPM, нет source build)
 - `Alt/resources/switch/package-release.sh`:
-  - Установка FreeSWITCH из RPM: `apt-get install -y freeswitch freeswitch-daemon freeswitch-lua libfreeswitch`
-  - **Уточнить у пользователя**: полный список доступных freeswitch-пакетов и их имена
-    (модули: sofia, commands, console, logfile, enum, cdr-csv, event-socket,
-    loopback, conference, db, dptools, expr, fifo, httapi, hash, esl, esf,
-    fsv, valet-parking, sndfile, native-file, local-stream, tone-stream,
-    xml-cdr, callcenter, sms, cidlookup, memcache, pgsql, shout, av, flite,
-    distributor, codecs, sounds, music)
-  - Настройка зависимостей systemd: `After=postgresql.service`
-  - Защита музыки on hold от обновлений пакетов
-- `Alt/resources/switch/source-release.sh`:
-  - Сборка из исходников как fallback-опция
-  - Адаптация имён dev-пакетов под Alt Linux
-  - **Уточнить у пользователя**: имена dev-пакетов (libtiff-dev, libpq-dev и т.д.)
-- `Alt/resources/switch/conf-copy.sh` — перенос из debian без изменений
+  - Установка FreeSWITCH из RPM: `apt-get install -y freeswitch-daemon libfreeswitch freeswitch-lua`
+  - Дополнительные пакеты: `freeswitch-av`, `freeswitch-imagick`
+  - Языки: `freeswitch-lang-en`, `freeswitch-lang-ru`
+  - Звуки: `freeswitch-sounds-en-us-callie-{8000,16000,32000}`, `freeswitch-sounds-ru-ru-elena-{8000,16000,32000}`, `freeswitch-sounds-music-{8000,16000,32000}`
+  - Защита музыки on hold: удалить пакеты звуков музыки, файлы сохранены
+  - Установка memcached
+- `Alt/resources/switch/conf-copy.sh` — копирование FusionPBX-конфигов FreeSWITCH
 - `Alt/resources/switch/package-permissions.sh`:
-  - `chown -R _nginx:_nginx` вместо `www-data:www-data`
+  - `chown -R _pbx:_pbx` для всех директорий FreeSWITCH
 - `Alt/resources/switch/package-systemd.sh`:
-  - Адаптация systemd-unit для Alt Linux
-  - `systemctl enable freeswitch`
-- `Alt/resources/switch/source/freeswitch.service.package` — адаптация:
-  - `USER=_nginx`, `GROUP=_nginx` или `USER=freeswitch`, `GROUP=daemon`
-  - **Уточнить у пользователя**: от какого пользователя должен работать FreeSWITCH?
-- `Alt/resources/switch/dsn.sh` — перенос без изменений
+  - Деплой кастомного systemd unit с `USER=_pbx`, `GROUP=_pbx`, `After=postgresql.service`
+  - Сервис не запускается до finish.sh
+- `Alt/resources/switch/dsn.sh` — настройка DSN для подключения к PostgreSQL
+- `Alt/resources/switch/source/freeswitch.service.package` — systemd unit file
+- `Alt/resources/switch/source/etc.default.freeswitch.package` — /etc/default/freeswitch
 
-**Критерий приёмки**: FreeSWITCH установлен, запускается через systemd,
-отвечает на ESL-соединения.
+**Критерий приёмки**: FreeSWITCH установлен, systemd unit сконфигурирован,
+DSN настроен, сервис готов к запуску через finish.sh.
 
 ---
 
@@ -349,9 +341,9 @@ FusionPBX работает с указанными учётными данным
 | 7 | Как инициализировать кластер PG | **Решён** | `/etc/rc.d/init.d/postgresql initdb` (systemctl не работает!) |
 | 8 | Путь к `pg_hba.conf` и данным PG | **Решён** | `/var/lib/pgsql/16/data/pg_hba.conf` |
 | 9 | Имена пакетов `libtiff-tools`, `qrencode`, `dbus`, `ssl-cert` в Alt | Открыт | Инкремент 5 |
-| 10 | Полный список freeswitch-* пакетов в Alt Linux | Открыт | Инкремент 6 |
-| 11 | От какого пользователя работает FreeSWITCH в RPM-пакете? | Открыт | Инкремент 6 |
-| 12 | Имена dev-пакетов для сборки FreeSWITCH из исходников | Открыт | Инкремент 6 |
+| 10 | Полный список freeswitch-* пакетов в Alt Linux | **Решён** | freeswitch-daemon (ядро+модули), freeswitch-lua, freeswitch-av, freeswitch-imagick, freeswitch-lang-*, freeswitch-sounds-* (en,ru,music), libfreeswitch, freeswitch-webui. Нет отдельных freeswitch-mod-* пакетов! |
+| 11 | От какого пользователя работает FreeSWITCH в RPM-пакете? | **Решён** | `_pbx:_pbx` (Alt Linux default) |
+| 12 | Имена dev-пакетов для сборки FreeSWITCH из исходников | **Решён** | Не требуется — только RPM пакеты |
 | 13 | Как сохранять правила iptables при перезагрузке в Alt Linux | Открыт | Инкремент 7 |
 | 14 | Путь к логу SSH в Alt Linux | Открыт | Инкремент 8 |
 | 15 | Путь к syslog в Alt Linux | Открыт | Инкремент 8 |

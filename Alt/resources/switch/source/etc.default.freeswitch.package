@@ -1,0 +1,3 @@
+# /etc/default/freeswitch
+# FreeSWITCH daemon options for Alt Linux
+DAEMON_OPTS="-nonat"
