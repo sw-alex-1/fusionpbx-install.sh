@@ -48,8 +48,11 @@ pkg_install \
     "php${php_version}-xmlrpc"
 
 # Optional PHP packages (install if available, warn if not)
+# pdo_pgsql may be a separate package on Alt Linux (provides PDO PostgreSQL driver)
 # inotify may not be packaged for all PHP versions
 verbose "Installing optional PHP modules..."
+pkg_install "php${php_version}-pdo_pgsql" 2>/dev/null || \
+    verbose "php${php_version}-pdo_pgsql not a separate package (likely bundled with php${php_version}-pgsql)"
 pkg_install "php${php_version}-inotify" 2>/dev/null || \
     warn "php${php_version}-inotify not available (optional, not critical)"
 
@@ -307,6 +310,30 @@ if [ "$cpu_architecture" = 'x86' ]; then
 else
     verbose "ionCube not available for $cpu_architecture architecture (skipping)"
 fi
+
+# =============================================================================
+# Verify critical PHP extensions are loaded
+# FusionPBX REQUIRES: pdo_pgsql, openssl, pgsql
+# If these are missing, the entire installation will fail.
+# =============================================================================
+
+verbose "Verifying critical PHP extensions..."
+
+_php_bin="php${php_version}"
+if ! command -v "$_php_bin" >/dev/null 2>&1; then
+    _php_bin="php"
+fi
+
+for _ext in pdo_pgsql openssl pgsql; do
+    if "$_php_bin" -m 2>/dev/null | grep -qi "$_ext"; then
+        verbose "  $_ext: loaded"
+    else
+        error "CRITICAL: PHP extension '$_ext' is NOT loaded!"
+        error "  FusionPBX cannot work without it."
+        error "  Available PDO drivers: $("$_php_bin" -r \"echo implode(',', PDO::getAvailableDrivers());\" 2>/dev/null)"
+        error "  Try: apt-get install php${php_version}-${_ext}"
+    fi
+done
 
 # =============================================================================
 # Restart PHP-FPM

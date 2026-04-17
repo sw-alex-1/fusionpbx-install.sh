@@ -6,10 +6,10 @@
 # Alt Linux specifics:
 #   - Web user: _nginx:_nginx (NOT www-data:www-data)
 #   - FreeSWITCH user: _pbx:_pbx
-#   - No 'freeswitch' PostgreSQL role — only 'fusionpbx' is created
-#   - .pgpass is already configured by postgresql.sh and fusionpbx.sh
-#   - hostname -I: always take first IP (bug fix from analysis)
+#   - hostname -I not supported — use 'ip addr' instead
 #   - tmpfiles.d for /var/run/fusionpbx persistence across reboots
+#   - upgrade.php --permissions uses 'www-data' — must do manual chown instead
+#   - PHP CLI must have pdo_pgsql loaded for FusionPBX DB access
 
 # Determine script directory
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -40,8 +40,6 @@ elif [ ."${database_password}" = ."random" ] || [ -z "$database_password" ]; the
 fi
 
 # Set PGPASSWORD for psql commands in this script
-# (We use .pgpass for automated scripts, but PGPASSWORD is simpler for
-#  the one-time setup operations in this script.)
 export PGPASSWORD=$database_password
 
 # =============================================================================
@@ -53,10 +51,14 @@ verbose "Setting database passwords..."
 # Update fusionpbx user password
 runuser -u postgres -- psql -c "ALTER USER fusionpbx WITH PASSWORD '$database_password';"
 
-# Note: Alt Linux does NOT create a 'freeswitch' PostgreSQL role by default.
-# FreeSWITCH connects as 'fusionpbx' via the DSN configured in dsn.sh.
-# If a separate freeswitch role is needed, uncomment the following:
-# runuser -u postgres -- psql -c "ALTER USER freeswitch WITH PASSWORD '$database_password';"
+# Also create/update freeswitch role (required by FusionPBX internals)
+if runuser -u postgres -- psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='freeswitch'" 2>/dev/null | grep -q 1; then
+    runuser -u postgres -- psql -c "ALTER USER freeswitch WITH PASSWORD '$database_password';" 2>/dev/null
+    verbose "  freeswitch role password updated"
+else
+    runuser -u postgres -- psql -c "CREATE ROLE freeswitch WITH SUPERUSER LOGIN PASSWORD '$database_password';" 2>/dev/null
+    verbose "  freeswitch role created"
+fi
 
 # =============================================================================
 # Install backup/maintenance cron scripts
@@ -76,11 +78,13 @@ sed -i "s/zzz/$database_password/g" /etc/cron.daily/fusionpbx-maintenance
 
 # =============================================================================
 # FusionPBX configuration
+# Deploy config.conf to BOTH /etc/fusionpbx/ AND /var/www/fusionpbx/resources/
+# to ensure FusionPBX can always find it regardless of which path it checks.
 # =============================================================================
 
 verbose "Configuring FusionPBX..."
 
-# Install config.conf
+# Deploy to /etc/fusionpbx/config.conf (primary location)
 ensure_dir "/etc/fusionpbx"
 cp fusionpbx/config.conf /etc/fusionpbx/config.conf
 
@@ -89,6 +93,65 @@ sed -i /etc/fusionpbx/config.conf -e s:"{database_host}:$database_host:"
 sed -i /etc/fusionpbx/config.conf -e s:"{database_name}:$database_name:"
 sed -i /etc/fusionpbx/config.conf -e s:"{database_username}:$database_username:"
 sed -i /etc/fusionpbx/config.conf -e s:"{database_password}:$database_password:"
+
+# Also update the resources/ fallback config with real values
+# (dsn.sh may have modified this file, so update it in-place)
+_fpbx_res_config="/var/www/fusionpbx/resources/config.conf"
+if [ -f "$_fpbx_res_config" ]; then
+    # Replace placeholders if they still exist
+    sed -i "$_fpbx_res_config" -e s:"{database_host}:$database_host:"
+    sed -i "$_fpbx_res_config" -e s:"{database_name}:$database_name:"
+    sed -i "$_fpbx_res_config" -e s:"{database_username}:$database_username:"
+    sed -i "$_fpbx_res_config" -e s:"{database_password}:$database_password:"
+    verbose "  resources/config.conf also updated with database credentials"
+fi
+
+# =============================================================================
+# Verify PHP can connect to PostgreSQL via PDO
+# This is critical — if PDO connection fails, ALL FusionPBX PHP scripts will fail.
+# =============================================================================
+
+verbose "Verifying PHP PDO connection to PostgreSQL..."
+
+_php_cmd="php${php_version}"
+if ! command -v "$_php_cmd" >/dev/null 2>&1; then
+    _php_cmd="php"
+fi
+
+# Check if pdo_pgsql extension is loaded
+_pdo_pgsql_status=$("$_php_cmd" -m 2>/dev/null | grep -i 'pdo_pgsql')
+if [ -z "$_pdo_pgsql_status" ]; then
+    error "CRITICAL: PHP pdo_pgsql extension is NOT loaded!"
+    error "Installed PHP modules:"
+    "$_php_cmd" -m 2>/dev/null | grep -iE 'pdo|pgsql' || error "  (none found)"
+    error "Attempting to install missing PDO PostgreSQL extension..."
+    pkg_install "php${php_version}-pdo_pgsql" 2>/dev/null || \
+        warn "php${php_version}-pdo_pgsql package not found"
+    # Reload after install
+    _pdo_pgsql_status=$("$_php_cmd" -m 2>/dev/null | grep -i 'pdo_pgsql')
+    if [ -z "$_pdo_pgsql_status" ]; then
+        die "Cannot proceed without pdo_pgsql. Install it manually: apt-get install php${php_version}-pdo_pgsql"
+    fi
+fi
+verbose "  pdo_pgsql extension: loaded"
+
+# Test actual PDO connection
+_pdo_test=$("$_php_cmd" -r "
+try {
+    \$pdo = new PDO('pgsql:host=$database_host;port=$database_port;dbname=$database_name', '$database_username', '$database_password');
+    echo 'OK';
+} catch (Exception \$e) {
+    echo 'FAILED: ' . \$e->getMessage();
+}
+" 2>&1)
+
+if echo "$_pdo_test" | grep -q "^OK"; then
+    verbose "  PDO connection to PostgreSQL: successful"
+else
+    error "PDO connection test FAILED: $_pdo_test"
+    error "Available PDO drivers: $("$_php_cmd" -r \"print_r(PDO::getAvailableDrivers());\" 2>/dev/null)"
+    die "Cannot proceed — PHP cannot connect to PostgreSQL via PDO. Check the error above."
+fi
 
 # =============================================================================
 # Database schema
@@ -188,29 +251,46 @@ sed -i /etc/freeswitch/autoload_configs/xml_cdr.conf.xml -e s:"{v_user}:$xml_cdr
 sed -i /etc/freeswitch/autoload_configs/xml_cdr.conf.xml -e s:"{v_pass}:$xml_cdr_password:"
 
 # =============================================================================
-# Update app defaults and permissions
+# Update app defaults
 # =============================================================================
 
 verbose "Updating app defaults..."
 
 cd /var/www/fusionpbx && /usr/bin/php /var/www/fusionpbx/core/upgrade/upgrade.php --defaults
 
-verbose "Updating permissions..."
+# =============================================================================
+# Set file permissions manually
+# FusionPBX's upgrade.php --permissions uses 'www-data' which doesn't exist
+# on Alt Linux. We do manual chown with the correct web user instead.
+# =============================================================================
 
-cd /var/www/fusionpbx && /usr/bin/php /var/www/fusionpbx/core/upgrade/upgrade.php --permissions
+verbose "Setting file permissions..."
+
+# Set ownership for FusionPBX web files
+chown -R ${web_user}:${web_group} /var/www/fusionpbx
+
+# Set ownership for FreeSWITCH scripts dir (if it exists and FusionPBX needs write access)
+if [ -d /usr/share/freeswitch/scripts ]; then
+    chown -R ${web_user}:${fs_group} /usr/share/freeswitch/scripts
+fi
+
+# Config file permissions
+chmod 664 /etc/fusionpbx/config.conf
+chown ${web_user}:${web_group} /etc/fusionpbx/config.conf
+
+verbose "  File permissions set (owner: ${web_user}:${web_group})"
 
 # =============================================================================
-# FreeSWITCH startup
+# FreeSWITCH startup (non-fatal)
 # =============================================================================
 
 verbose "Starting FreeSWITCH..."
 
 /bin/systemctl daemon-reload
-/bin/systemctl restart freeswitch
+/bin/systemctl restart freeswitch 2>/dev/null || warn "FreeSWITCH failed to start (can be fixed after installation)"
 
 # =============================================================================
-# /var/run/fusionpbx persistence (bug fix #5 from analysis)
-# Create tmpfiles.d entry so /var/run/fusionpbx survives reboots
+# /var/run/fusionpbx persistence
 # =============================================================================
 
 verbose "Configuring /var/run/fusionpbx persistence..."
@@ -227,20 +307,13 @@ EOF
 verbose "  Created /etc/tmpfiles.d/fusionpbx.conf"
 
 # =============================================================================
-# Install services
+# Install services (non-fatal)
 # =============================================================================
 
 verbose "Installing FusionPBX services..."
 
-cd /var/www/fusionpbx && /usr/bin/php /var/www/fusionpbx/core/upgrade/upgrade.php --services
-
-# =============================================================================
-# File permissions
-# =============================================================================
-
-verbose "Setting file permissions..."
-
-chmod 664 /etc/fusionpbx/config.conf
+cd /var/www/fusionpbx && /usr/bin/php /var/www/fusionpbx/core/upgrade/upgrade.php --services 2>/dev/null || \
+    warn "FusionPBX services installation had errors (non-critical)"
 
 # =============================================================================
 # Restart services
@@ -248,7 +321,8 @@ chmod 664 /etc/fusionpbx/config.conf
 
 verbose "Restarting nginx and FreeSWITCH..."
 
-systemctl restart nginx freeswitch
+systemctl restart nginx 2>/dev/null || warn "nginx restart failed"
+systemctl restart freeswitch 2>/dev/null || warn "FreeSWITCH restart failed (can be fixed later)"
 
 # =============================================================================
 # Welcome message
