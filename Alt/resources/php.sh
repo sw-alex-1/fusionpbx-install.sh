@@ -341,6 +341,11 @@ done
 # =============================================================================
 
 verbose "Restarting PHP-FPM service..."
+
+# Enable PHP-FPM for auto-start on boot
+systemctl enable "$_php_fpm_service" 2>/dev/null || warn "Failed to enable $_php_fpm_service for auto-start"
+verbose "PHP-FPM enabled for auto-start on boot"
+
 systemctl daemon-reload
 service_restart "$_php_fpm_service"
 

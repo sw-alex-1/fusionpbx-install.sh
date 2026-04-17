@@ -214,6 +214,10 @@ else
     error "Attempting to start nginx anyway - it may fail"
 fi
 
+# Enable nginx for auto-start on boot
+systemctl enable nginx 2>/dev/null || warn "Failed to enable nginx for auto-start"
+verbose "nginx enabled for auto-start on boot"
+
 # Flush systemd cache and restart
 systemctl daemon-reload
 service_restart nginx

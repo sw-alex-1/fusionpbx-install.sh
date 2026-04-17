@@ -80,6 +80,7 @@ resources/postgresql.sh
 verbose ""
 verbose "=== Step 5/10: Installing FusionPBX ==="
 resources/fusionpbx.sh
+resources/applications.sh
 
 # Step 6: FreeSWITCH
 verbose ""

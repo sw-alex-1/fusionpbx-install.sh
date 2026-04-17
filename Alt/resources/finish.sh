@@ -106,6 +106,14 @@ if [ -f "$_fpbx_res_config" ]; then
     verbose "  resources/config.conf also updated with database credentials"
 fi
 
+# IMPORTANT: dsn.sh changes the switch DB directory from /var/lib/freeswitch/db
+# to /dev/shm (shared memory for better performance). We must apply the same
+# change to /etc/fusionpbx/config.conf (the primary config location).
+# dsn.sh already updated /var/www/fusionpbx/resources/config.conf, but
+# finish.sh just copied the original template to /etc/fusionpbx/config.conf.
+sed -i /etc/fusionpbx/config.conf -e 's:/var/lib/freeswitch/db:/dev/shm:'
+verbose "  /etc/fusionpbx/config.conf: switch DB directory set to /dev/shm"
+
 # =============================================================================
 # Verify PHP can connect to PostgreSQL via PDO
 # This is critical — if PDO connection fails, ALL FusionPBX PHP scripts will fail.
@@ -282,15 +290,6 @@ chown ${web_user}:${web_group} /etc/fusionpbx/config.conf
 verbose "  File permissions set (owner: ${web_user}:${web_group})"
 
 # =============================================================================
-# FreeSWITCH startup (non-fatal)
-# =============================================================================
-
-verbose "Starting FreeSWITCH..."
-
-/bin/systemctl daemon-reload
-/bin/systemctl restart freeswitch 2>/dev/null || warn "FreeSWITCH failed to start (can be fixed after installation)"
-
-# =============================================================================
 # /var/run/fusionpbx persistence
 # =============================================================================
 
@@ -308,22 +307,93 @@ EOF
 verbose "  Created /etc/tmpfiles.d/fusionpbx.conf"
 
 # =============================================================================
-# Install services (non-fatal)
+# Install cron (required for FusionPBX scheduled tasks and cron.daily scripts)
+# =============================================================================
+
+verbose "Installing cron daemon..."
+pkg_install cron
+systemctl enable crond 2>/dev/null || systemctl enable cron 2>/dev/null || warn "Failed to enable cron service"
+systemctl start crond 2>/dev/null || systemctl start cron 2>/dev/null || warn "Failed to start cron service"
+verbose "  Cron daemon installed and started"
+
+# =============================================================================
+# Install FusionPBX services
+# upgrade.php --services creates systemd service files or cron entries
+# for FusionPBX background services (xml_cdr, email_queue, fax_queue, etc.)
+# IMPORTANT: The generated files may reference 'www-data' which doesn't exist
+# on Alt Linux. We patch them after creation.
 # =============================================================================
 
 verbose "Installing FusionPBX services..."
 
-cd /var/www/fusionpbx && /usr/bin/php /var/www/fusionpbx/core/upgrade/upgrade.php --services 2>/dev/null || \
-    warn "FusionPBX services installation had errors (non-critical)"
+cd /var/www/fusionpbx && /usr/bin/php /var/www/fusionpbx/core/upgrade/upgrade.php --services || \
+    warn "FusionPBX services installation had errors (some services may need manual setup)"
+
+# Patch any generated service files that reference www-data (doesn't exist on Alt Linux)
+# FusionPBX --services may create systemd service files or cron files with www-data
+verbose "Patching FusionPBX service files for Alt Linux user (${web_user})..."
+for _svc_file in /etc/systemd/system/fusionpbx*.service /lib/systemd/system/fusionpbx*.service; do
+    if [ -f "$_svc_file" ]; then
+        sed -i "s/www-data/${web_user}/g" "$_svc_file"
+        sed -i "s/User=www-data/User=${web_user}/g" "$_svc_file"
+        sed -i "s/Group=www-data/Group=${web_group}/g" "$_svc_file"
+        verbose "  Patched: $_svc_file"
+    fi
+done
+# Also patch any cron files that may reference www-data
+for _cron_file in /etc/cron.d/fusionpbx*; do
+    if [ -f "$_cron_file" ]; then
+        sed -i "s/www-data/${web_user}/g" "$_cron_file"
+        verbose "  Patched: $_cron_file"
+    fi
+done
+systemctl daemon-reload
 
 # =============================================================================
-# Restart services
+# Enable all services for auto-start on boot
 # =============================================================================
 
-verbose "Restarting nginx and FreeSWITCH..."
+verbose "Enabling services for auto-start on boot..."
 
-systemctl restart nginx 2>/dev/null || warn "nginx restart failed"
-systemctl restart freeswitch 2>/dev/null || warn "FreeSWITCH restart failed (can be fixed later)"
+for _svc in nginx "php${php_version}-fpm" postgresql freeswitch memcached; do
+    if systemctl is-enabled "$_svc" 2>/dev/null; then
+        verbose "  $_svc: already enabled"
+    else
+        systemctl enable "$_svc" 2>/dev/null && verbose "  $_svc: enabled" || warn "  $_svc: failed to enable"
+    fi
+done
+
+# =============================================================================
+# Restart ALL services (ensure correct order and fresh state)
+# Order: PostgreSQL first, then PHP-FPM, then nginx, then FreeSWITCH
+# =============================================================================
+
+verbose "Restarting all services (correct order)..."
+
+# PostgreSQL must be running first
+verbose "  Restarting PostgreSQL..."
+systemctl restart postgresql || warn "PostgreSQL restart failed"
+
+# Wait for PostgreSQL to be ready
+wait_for_service postgresql 15 || warn "PostgreSQL not ready after 15s"
+
+# PHP-FPM must be running before nginx tries to connect
+verbose "  Restarting PHP-FPM..."
+systemctl restart "php${php_version}-fpm" || warn "PHP-FPM restart failed"
+
+# nginx connects to PHP-FPM via socket
+verbose "  Restarting nginx..."
+systemctl restart nginx || warn "nginx restart failed"
+
+# FreeSWITCH depends on PostgreSQL being ready
+verbose "  Restarting FreeSWITCH..."
+systemctl restart freeswitch || warn "FreeSWITCH restart failed (can be fixed later)"
+
+# Wait for FreeSWITCH to be ready (takes time to load modules)
+verbose "  Waiting for FreeSWITCH to initialize..."
+wait_for_service freeswitch 60 || warn "FreeSWITCH not ready after 60s (may still be starting)"
+
+verbose "  All services restarted"
 
 # =============================================================================
 # Welcome message
