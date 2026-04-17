@@ -35,9 +35,9 @@ verbose "Installing FreeSWITCH core packages..."
 # Core daemon and library,
 # Lua scripting (required for FusionPBX integration)
 pkg_install \
-    freeswitch-daemon \
-    libfreeswitch \ 
-    freeswitch-lua
+    "freeswitch-daemon" \
+    "libfreeswitch" \
+    "freeswitch-lua"
 
 # =============================================================================
 # Install FreeSWITCH optional packages
@@ -48,9 +48,9 @@ verbose "Installing FreeSWITCH optional packages..."
 
 # FFMpeg support (video, transcoding)
 # Image processing (fax thumbnails, etc.)
-pkg_install \ 
-    freeswitch-av \
-    freeswitch-imagick
+pkg_install \
+    "freeswitch-av" \
+    "freeswitch-imagick"
 
 # =============================================================================
 # Install FreeSWITCH language packs
@@ -63,8 +63,8 @@ verbose "Installing FreeSWITCH language packs..."
 
 # Languages
 pkg_install \
-    freeswitch-lang-en \
-    freeswitch-lang-ru
+    "freeswitch-lang-en" \
+    "freeswitch-lang-ru"
 
 # =============================================================================
 # Install FreeSWITCH sound files
@@ -77,15 +77,15 @@ verbose "Installing FreeSWITCH sound files..."
 # Russian sounds (Elena) - common for Alt Linux deployments,
 # Music on hold - multiple sample rates
 pkg_install \
-    freeswitch-sounds-en-us-callie-8000 \
-    freeswitch-sounds-en-us-callie-16000 \
-    freeswitch-sounds-en-us-callie-32000 \
-    freeswitch-sounds-ru-ru-elena-8000 \
-    freeswitch-sounds-ru-ru-elena-16000 \
-    freeswitch-sounds-ru-ru-elena-32000 \
-    freeswitch-sounds-music-8000 \
-    freeswitch-sounds-music-16000 \
-    freeswitch-sounds-music-32000
+    "freeswitch-sounds-en-us-callie-8000" \
+    "freeswitch-sounds-en-us-callie-16000" \
+    "freeswitch-sounds-en-us-callie-32000" \
+    "freeswitch-sounds-ru-ru-elena-8000" \
+    "freeswitch-sounds-ru-ru-elena-16000" \
+    "freeswitch-sounds-ru-ru-elena-32000" \
+    "freeswitch-sounds-music-8000" \
+    "freeswitch-sounds-music-16000" \
+    "freeswitch-sounds-music-32000"
 
 # =============================================================================
 # Install additional dependencies
@@ -127,12 +127,14 @@ if [ -d "$_music_dir" ] && [ "$(ls -A "$_music_dir" 2>/dev/null)" ]; then
     fi
 
     # Remove the music packages (files are now safe in temp)
-    for _mpkg in freeswitch-sounds-music-8000 freeswitch-sounds-music-16000 freeswitch-sounds-music-32000; do
-        if pkg_is_installed "$_mpkg"; then
-            verbose "Removing package $_mpkg (music files preserved)"
-            apt-get remove -y "$_mpkg" 2>/dev/null || warn "Failed to remove $_mpkg (may be dependency)"
-        fi
-    done
+    verbose "Removing music packages (music files preserved)"
+    apt-get remove -y freeswitch-sounds-music-8000 freeswitch-sounds-music-16000 freeswitch-sounds-music-32000
+#    for _mpkg in freeswitch-sounds-music-8000 freeswitch-sounds-music-16000 freeswitch-sounds-music-32000; do
+#        if pkg_is_installed "$_mpkg"; then
+#            verbose "Removing package $_mpkg (music files preserved)"
+#            apt-get remove -y "$_mpkg" 2>/dev/null || warn "Failed to remove $_mpkg (may be dependency)"
+#        fi
+#    done
 
     # Restore music files
     mkdir -p "$_music_dir/default"
