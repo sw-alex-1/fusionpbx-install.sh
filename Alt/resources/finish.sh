@@ -148,8 +148,9 @@ try {
 if echo "$_pdo_test" | grep -q "^OK"; then
     verbose "  PDO connection to PostgreSQL: successful"
 else
+    pdo_drivers=$(\$_php_cmd -r 'print_r(PDO::getAvailableDrivers());' 2>/dev/null)
     error "PDO connection test FAILED: $_pdo_test"
-    error "Available PDO drivers: $("$_php_cmd" -r \"print_r(PDO::getAvailableDrivers());\" 2>/dev/null)"
+    error "Available PDO drivers: $pdo_drivers"
     die "Cannot proceed — PHP cannot connect to PostgreSQL via PDO. Check the error above."
 fi
 

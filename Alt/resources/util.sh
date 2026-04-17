@@ -41,18 +41,41 @@ pkg_is_installed() {
 # Usage: pkg_install package1 package2 ...
 # Returns: 0 on success, 1 if any package failed to install
 pkg_install() {
-    _pi_failed=0
+    local _pi_failed=0
+    local _pi_to_install=()
+    local _pi_pkg
+
+    # Проверяем, какие пакеты нужно установить
     for _pi_pkg in "$@"; do
         if pkg_is_installed "$_pi_pkg"; then
             verbose "Package already installed: $_pi_pkg"
         else
-            verbose "Installing package: $_pi_pkg"
-            if ! apt-get install -y "$_pi_pkg"; then
-                error "Failed to install package: $_pi_pkg"
-                _pi_failed=1
-            fi
+            verbose "Will install package: $_pi_pkg"
+            _pi_to_install+=("$_pi_pkg")
         fi
     done
+
+    # Если нет пакетов для установки, выходим успешно
+    if [ ${#_pi_to_install[@]} -eq 0 ]; then
+        verbose "All packages are already installed"
+        return 0
+    fi
+
+    # Обновляем кэш перед установкой (рекомендуется для ALT Linux)
+    verbose "Updating package index..."
+    if ! apt-get update; then
+        error "Failed to update package index"
+        _pi_failed=1
+        return $_pi_failed
+    fi
+
+    # Устанавливаем все пакеты одной командой
+    verbose "Installing packages: ${_pi_to_install[*]}"
+    if ! apt-get install -y "${_pi_to_install[@]}"; then
+        error "Failed to install some packages: ${_pi_to_install[*]}"
+        _pi_failed=1
+    fi
+
     return $_pi_failed
 }
 
