@@ -2,11 +2,20 @@
 
 # FusionPBX Alt Linux Installer - FreeSWITCH DSN Configuration
 # Configures FreeSWITCH to use PostgreSQL for its internal databases
-# instead of SQLite. This is the same logic as the Debian installer
-# but with Alt Linux paths and credentials handling.
+# instead of SQLite. Mirrors the Debian installer's dsn.sh logic.
 #
-# IMPORTANT: This script must be run BEFORE starting FreeSWITCH.
-# It modifies FreeSWITCH XML configs and creates DSN variables.
+# CRITICAL: This script does TWO things that the previous version missed:
+#   1. Adds DSN variables to vars.xml (FreeSWITCH reads these on startup)
+#   2. Inserts DSN variables into the v_vars database table (FusionPBX reads
+#      these to generate XML configs for FreeSWITCH via the XML handler)
+#   3. Enables odbc-dsn in SIP profiles via SQL UPDATE
+#
+# Without step 2, FreeSWITCH cannot build the correct DSN connection strings
+# from the database, and FusionPBX cannot configure FreeSWITCH's database
+# connections dynamically. This was the ROOT CAUSE of:
+#   - "Failure to connect to CORE_DB pgsql://..." errors
+#   - Modules count = 0 in FusionPBX dashboard
+#   - "uncontrollable" system behavior
 
 # Determine script directory
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -103,6 +112,8 @@ fi
 # =============================================================================
 # Add DSN variables to vars.xml
 # These variables are referenced by the odbc-dsn parameters above.
+# FreeSWITCH reads vars.xml on startup and uses X-PRE-PROCESS to set
+# internal variables that are then referenced in other config files.
 # =============================================================================
 
 _vars_xml="$_fs_conf/vars.xml"
@@ -128,6 +139,81 @@ if [ -f "$_vars_xml" ]; then
 else
     warn "vars.xml not found at $_vars_xml"
 fi
+
+# =============================================================================
+# CRITICAL: Insert DSN variables into the database (v_vars table)
+#
+# This is what the Debian installer does but was MISSING from the Alt installer.
+# FusionPBX uses these database records to generate FreeSWITCH XML configuration
+# dynamically via the XML handler. Without them, FreeSWITCH cannot connect to
+# PostgreSQL and the system is "uncontrollable" from the FusionPBX web interface.
+#
+# These UUIDs are the SAME as in the Debian installer to ensure consistency.
+# =============================================================================
+
+verbose "Inserting DSN variables into database (v_vars table)..."
+
+# Build the DSN connection strings (same as what goes into vars.xml)
+_dsn_system="pgsql://hostaddr=$database_host port=$database_port dbname=$database_name user=$database_username password=$database_password options="
+_dsn="sqlite:///dev/shm/core.db"
+_dsn_callcenter="sqlite:///dev/shm/callcenter.db"
+
+# Set PGPASSWORD for psql commands
+export PGPASSWORD=$database_password
+
+# Insert dsn_system variable
+# Use ON CONFLICT DO NOTHING for idempotency (PostgreSQL 9.5+)
+runuser -u postgres -- psql -d "$database_name" -c \
+    "INSERT INTO v_vars (var_uuid, var_name, var_value, var_category, var_enabled, var_order, var_description, var_hostname)
+     VALUES ('785d7013-1152-4a44-aa15-28336d9b36f9', 'dsn_system', '$_dsn_system', 'DSN', 'true', '0', null, null)
+     ON CONFLICT (var_uuid) DO NOTHING;" 2>/dev/null \
+    || verbose "  dsn_system: insert skipped (may already exist or v_vars table not yet created)"
+
+# Insert dsn variable
+runuser -u postgres -- psql -d "$database_name" -c \
+    "INSERT INTO v_vars (var_uuid, var_name, var_value, var_category, var_enabled, var_order, var_description, var_hostname)
+     VALUES ('0170e737-b453-40ea-99f2-f1375474e5ce', 'dsn', '$_dsn', 'DSN', 'true', '0', null, null)
+     ON CONFLICT (var_uuid) DO NOTHING;" 2>/dev/null \
+    || verbose "  dsn: insert skipped (may already exist or v_vars table not yet created)"
+
+# Insert dsn_callcenter variable
+runuser -u postgres -- psql -d "$database_name" -c \
+    "INSERT INTO v_vars (var_uuid, var_name, var_value, var_category, var_enabled, var_order, var_description, var_hostname)
+     VALUES ('32e3e364-a8ef-4fe0-9d02-c652d5122bbf', 'dsn_callcenter', '$_dsn_callcenter', 'DSN', 'true', '0', null, null)
+     ON CONFLICT (var_uuid) DO NOTHING;" 2>/dev/null \
+    || verbose "  dsn_callcenter: insert skipped (may already exist or v_vars table not yet created)"
+
+verbose "  DSN variables inserted into v_vars table"
+
+# =============================================================================
+# Enable odbc-dsn in SIP profiles (database UPDATE)
+# The Debian installer does this via SQL UPDATE on v_sip_profile_settings.
+# This tells FreeSWITCH's Sofia SIP profiles to use the ODBC DSN for
+# their registration databases instead of SQLite.
+# =============================================================================
+
+verbose "Enabling odbc-dsn in SIP profiles..."
+
+runuser -u postgres -- psql -d "$database_name" -c \
+    "UPDATE v_sip_profile_settings SET sip_profile_setting_enabled = 'true'
+     WHERE sip_profile_setting_name = 'odbc-dsn';" 2>/dev/null \
+    || verbose "  SIP profile odbc-dsn update skipped (table may not exist yet)"
+
+# =============================================================================
+# Update the switch DB directory in default settings
+# The Debian installer updates v_default_settings to set the switch DB
+# directory to /dev/shm instead of /var/lib/freeswitch/db
+# =============================================================================
+
+verbose "Updating switch DB directory in default settings..."
+
+runuser -u postgres -- psql -d "$database_name" -c \
+    "UPDATE v_default_settings SET default_setting_value = '/dev/shm'
+     WHERE default_setting_category = 'switch' AND default_setting_subcategory = 'db';" 2>/dev/null \
+    || verbose "  Default settings update skipped (table may not exist yet)"
+
+# Unset PGPASSWORD for security
+unset PGPASSWORD
 
 # =============================================================================
 # Remove SQLite database files
@@ -163,6 +249,9 @@ verbose ""
 verbose "FreeSWITCH DSN configuration summary:"
 verbose "  auto-create-schemas: enabled"
 verbose "  odbc-dsn:           enabled (db, fifo, switch)"
+verbose "  DSN in vars.xml:    yes"
+verbose "  DSN in v_vars DB:   yes (dsn_system, dsn, dsn_callcenter)"
+verbose "  SIP odbc-dsn:       enabled"
 verbose "  DSN system:         pgsql://$database_host:$database_port/$database_name"
 verbose "  DSN core:           sqlite:///dev/shm/core.db"
 verbose "  DSN callcenter:     sqlite:///dev/shm/callcenter.db"

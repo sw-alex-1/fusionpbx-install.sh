@@ -6,10 +6,15 @@
 # proper dependency on PostgreSQL.
 #
 # Alt Linux specifics:
-#   - FreeSWITCH user: _pbx:_pbx (not www-data or freeswitch)
+#   - FreeSWITCH user: _nginx:_nginx (same as web server, like Debian's www-data)
 #   - Service must start after postgresql.service
 #   - The freeswitch-systemd package (if it exists) should be removed
 #     to avoid conflicts with our custom unit file.
+#
+# DESIGN: In Debian, FreeSWITCH runs as www-data (the web server user) so
+# that FusionPBX (also running as www-data via PHP-FPM) can read and write
+# FreeSWITCH configuration files. We replicate this on Alt Linux by running
+# FreeSWITCH as _nginx.
 
 # Determine script directory
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -95,13 +100,17 @@ fi
 
 # =============================================================================
 # Ensure FreeSWITCH user exists
-# The RPM package should create the _pbx user, but verify just in case.
+# The _nginx user should already exist (created by nginx package), but verify.
+# FreeSWITCH runs as _nginx (same as web server) so FusionPBX can access
+# FreeSWITCH configuration files.
 # =============================================================================
 
 if ! id "$fs_user" >/dev/null 2>&1; then
-    verbose "Creating FreeSWITCH user: $fs_user"
+    verbose "FreeSWITCH user ($fs_user) does not exist - creating..."
     useradd -r -s /sbin/nologin -d /var/lib/freeswitch -g "$fs_group" "$fs_user" 2>/dev/null || \
         warn "Failed to create user $fs_user (may already exist as system user)"
+else
+    verbose "FreeSWITCH user ($fs_user) exists"
 fi
 
 # =============================================================================

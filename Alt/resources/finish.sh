@@ -5,11 +5,15 @@
 #
 # Alt Linux specifics:
 #   - Web user: _nginx:_nginx (NOT www-data:www-data)
-#   - FreeSWITCH user: _pbx:_pbx
+#   - FreeSWITCH user: _nginx:_nginx (same as web user, like Debian's www-data)
 #   - hostname -I not supported — use 'ip addr' instead
 #   - tmpfiles.d for /var/run/fusionpbx persistence across reboots
 #   - upgrade.php --permissions uses 'www-data' — must do manual chown instead
 #   - PHP CLI must have pdo_pgsql loaded for FusionPBX DB access
+#
+# IMPORTANT: FreeSWITCH is NOT restarted in this script.
+# It will be restarted in install.sh AFTER dsn.sh runs (which requires
+# the v_vars table created by upgrade.php --schema in this script).
 
 # Determine script directory
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -278,9 +282,10 @@ verbose "Setting file permissions..."
 # Set ownership for FusionPBX web files
 chown -R ${web_user}:${web_group} /var/www/fusionpbx
 
-# Set ownership for FreeSWITCH scripts dir (if it exists and FusionPBX needs write access)
+# Set ownership for FreeSWITCH scripts dir
+# Both web user and FreeSWITCH need access (they're the same user now)
 if [ -d /usr/share/freeswitch/scripts ]; then
-    chown -R ${web_user}:${fs_group} /usr/share/freeswitch/scripts
+    chown -R ${web_user}:${web_group} /usr/share/freeswitch/scripts
 fi
 
 # Config file permissions
@@ -385,15 +390,12 @@ systemctl restart "php${php_version}-fpm" || warn "PHP-FPM restart failed"
 verbose "  Restarting nginx..."
 systemctl restart nginx || warn "nginx restart failed"
 
-# FreeSWITCH depends on PostgreSQL being ready
-verbose "  Restarting FreeSWITCH..."
-systemctl restart freeswitch || warn "FreeSWITCH restart failed (can be fixed later)"
+# FreeSWITCH is NOT restarted here — it will be restarted in install.sh
+# AFTER dsn.sh configures the PostgreSQL DSN. Starting FreeSWITCH now
+# without DSN configuration would cause database connection failures.
+verbose "  FreeSWITCH: will be started after DSN configuration (step 11)"
 
-# Wait for FreeSWITCH to be ready (takes time to load modules)
-verbose "  Waiting for FreeSWITCH to initialize..."
-wait_for_service freeswitch 60 || warn "FreeSWITCH not ready after 60s (may still be starting)"
-
-verbose "  All services restarted"
+verbose "  PostgreSQL, PHP-FPM, and nginx restarted"
 
 # =============================================================================
 # Welcome message

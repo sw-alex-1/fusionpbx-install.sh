@@ -49,11 +49,17 @@ syslog_path=/var/log/syslog/messages         # Syslog (NOT /var/log/syslog)
 
 # Alt Linux User/Group Settings
 # These define the system users used by web and telephony services.
-# Adjust if your Alt Linux installation uses different user names.
-web_user=_nginx                             # nginx and php-fpm user
-web_group=_nginx                            # nginx and php-fpm group
-fs_user=_pbx                                # FreeSWITCH runtime user (Alt Linux default)
-fs_group=_pbx                               # FreeSWITCH runtime group (Alt Linux default)
+#
+# CRITICAL: In the Debian installer, FreeSWITCH runs as www-data (same as the
+# web server user) so that FusionPBX (PHP-FPM, also www-data) can read and
+# write FreeSWITCH configuration files. We replicate this on Alt Linux by
+# running FreeSWITCH as _nginx (same as the web server user). Using a separate
+# _pbx user caused permission conflicts that made the system uncontrollable
+# from the FusionPBX web interface.
+web_user=_nginx                             # nginx, php-fpm, AND FreeSWITCH user
+web_group=_nginx                            # nginx, php-fpm, AND FreeSWITCH group
+fs_user=_nginx                              # FreeSWITCH runtime user (= web_user, like Debian's www-data)
+fs_group=_nginx                             # FreeSWITCH runtime group (= web_group, like Debian's www-data)
 
 # Optional Applications
 application_transcribe=true                # Speech to Text

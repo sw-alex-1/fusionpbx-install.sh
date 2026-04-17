@@ -27,6 +27,9 @@ if [ "$switch_package" = "true" ]; then
     # Copy the FusionPBX-provided FreeSWITCH configuration
     switch/conf-copy.sh
 
+    # Disable modules that don't exist in Alt Linux RPM packages
+    switch/disable-missing-modules.sh
+
     # Set file permissions for FreeSWITCH directories
     switch/package-permissions.sh
 
@@ -38,6 +41,7 @@ else
     switch_package=true
     switch/package-release.sh
     switch/conf-copy.sh
+    switch/disable-missing-modules.sh
     switch/package-permissions.sh
     switch/package-systemd.sh
 fi

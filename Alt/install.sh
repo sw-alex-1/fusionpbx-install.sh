@@ -8,6 +8,12 @@
 # packages will be skipped and existing configs will be backed up before
 # modification.
 #
+# IMPORTANT: The order of steps matters!
+#   - dsn.sh MUST run AFTER finish.sh because it inserts data into the
+#     v_vars database table which is created by upgrade.php --schema in finish.sh
+#   - In the Debian installer, dsn.sh is also called after the database schema
+#     is set up (it's run manually or as a separate step)
+#
 # Usage:
 #   ./install.sh                              # Default installation
 #   ./install.sh --use-switch-source          # Build FreeSWITCH from source
@@ -58,56 +64,72 @@ verbose ""
 
 # Step 1: System preparation (update, base packages, cdrom cleanup)
 verbose ""
-verbose "=== Step 1/10: System preparation ==="
+verbose "=== Step 1/11: System preparation ==="
 resources/pre-install.sh
 
 # Step 2: PHP and PHP-FPM
 verbose ""
-verbose "=== Step 2/10: Installing PHP ==="
+verbose "=== Step 2/11: Installing PHP ==="
 resources/php.sh
 
 # Step 3: NGINX web server
 verbose ""
-verbose "=== Step 3/10: Installing NGINX ==="
+verbose "=== Step 3/11: Installing NGINX ==="
 resources/nginx.sh
 
 # Step 4: PostgreSQL database
 verbose ""
-verbose "=== Step 4/10: Installing PostgreSQL ==="
+verbose "=== Step 4/11: Installing PostgreSQL ==="
 resources/postgresql.sh
 
 # Step 5: FusionPBX application
 verbose ""
-verbose "=== Step 5/10: Installing FusionPBX ==="
+verbose "=== Step 5/11: Installing FusionPBX ==="
 resources/fusionpbx.sh
 resources/applications.sh
 
 # Step 6: FreeSWITCH
 verbose ""
-verbose "=== Step 6/10: Installing FreeSWITCH ==="
+verbose "=== Step 6/11: Installing FreeSWITCH ==="
 resources/switch.sh
-resources/switch/dsn.sh
 
 # Step 7: Firewall
 verbose ""
-verbose "=== Step 7/10: Configuring firewall ==="
+verbose "=== Step 7/11: Configuring firewall ==="
 resources/iptables.sh
 
 # Step 8: Fail2ban
 verbose ""
-verbose "=== Step 8/10: Configuring Fail2ban ==="
+verbose "=== Step 8/11: Configuring Fail2ban ==="
 resources/fail2ban.sh
 
 # Step 9: Additional services (sngrep, monit)
 verbose ""
-verbose "=== Step 9/10: Additional services ==="
+verbose "=== Step 9/11: Additional services ==="
 resources/sngrep.sh
 resources/monit.sh
 
 # Step 10: Finish (database schema, admin user, service startup)
+# This step creates the database tables (v_vars, v_domains, etc.)
 verbose ""
-verbose "=== Step 10/10: Finalizing installation ==="
+verbose "=== Step 10/11: Finalizing installation ==="
 resources/finish.sh
+
+# Step 11: FreeSWITCH DSN Configuration
+# MUST run AFTER finish.sh because it inserts data into v_vars table
+# which is created by upgrade.php --schema in finish.sh.
+# This configures FreeSWITCH to use PostgreSQL instead of SQLite.
+verbose ""
+verbose "=== Step 11/11: Configuring FreeSWITCH database ==="
+resources/switch/dsn.sh
+
+# =============================================================================
+# Final restart of FreeSWITCH with DSN configured
+# =============================================================================
+
+verbose "Restarting FreeSWITCH with DSN configuration..."
+systemctl restart freeswitch || warn "FreeSWITCH restart failed"
+verbose "FreeSWITCH restarted with PostgreSQL DSN"
 
 # =============================================================================
 # Completion
