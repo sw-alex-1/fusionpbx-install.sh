@@ -32,11 +32,12 @@ cd "$SCRIPT_DIR"
 
 verbose "Installing FreeSWITCH core packages..."
 
-# Core daemon and library
-pkg_install freeswitch-daemon libfreeswitch
-
+# Core daemon and library,
 # Lua scripting (required for FusionPBX integration)
-pkg_install freeswitch-lua
+pkg_install \
+    freeswitch-daemon \
+    libfreeswitch \ 
+    freeswitch-lua
 
 # =============================================================================
 # Install FreeSWITCH optional packages
@@ -46,10 +47,10 @@ pkg_install freeswitch-lua
 verbose "Installing FreeSWITCH optional packages..."
 
 # FFMpeg support (video, transcoding)
-pkg_install freeswitch-av
-
 # Image processing (fax thumbnails, etc.)
-pkg_install freeswitch-imagick
+pkg_install \ 
+    freeswitch-av \
+    freeswitch-imagick
 
 # =============================================================================
 # Install FreeSWITCH language packs
@@ -60,10 +61,10 @@ pkg_install freeswitch-imagick
 
 verbose "Installing FreeSWITCH language packs..."
 
-pkg_install freeswitch-lang-en
-
-# Russian language - optional but common for Alt Linux deployments
-pkg_install freeswitch-lang-ru
+# Languages
+pkg_install \
+    freeswitch-lang-en \
+    freeswitch-lang-ru
 
 # =============================================================================
 # Install FreeSWITCH sound files
@@ -72,20 +73,19 @@ pkg_install freeswitch-lang-ru
 
 verbose "Installing FreeSWITCH sound files..."
 
-# English sounds (Callie) - required for default operation
-pkg_install freeswitch-sounds-en-us-callie-8000
-pkg_install freeswitch-sounds-en-us-callie-16000
-pkg_install freeswitch-sounds-en-us-callie-32000
-
-# Russian sounds (Elena) - common for Alt Linux deployments
-pkg_install freeswitch-sounds-ru-ru-elena-8000
-pkg_install freeswitch-sounds-ru-ru-elena-16000
-pkg_install freeswitch-sounds-ru-ru-elena-32000
-
+# English sounds (Callie) - required for default operation,
+# Russian sounds (Elena) - common for Alt Linux deployments,
 # Music on hold - multiple sample rates
-pkg_install freeswitch-sounds-music-8000
-pkg_install freeswitch-sounds-music-16000
-pkg_install freeswitch-sounds-music-32000
+pkg_install \
+    freeswitch-sounds-en-us-callie-8000 \
+    freeswitch-sounds-en-us-callie-16000 \
+    freeswitch-sounds-en-us-callie-32000 \
+    freeswitch-sounds-ru-ru-elena-8000 \
+    freeswitch-sounds-ru-ru-elena-16000 \
+    freeswitch-sounds-ru-ru-elena-32000 \
+    freeswitch-sounds-music-8000 \
+    freeswitch-sounds-music-16000 \
+    freeswitch-sounds-music-32000
 
 # =============================================================================
 # Install additional dependencies

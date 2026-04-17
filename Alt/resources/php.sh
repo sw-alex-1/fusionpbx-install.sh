@@ -328,9 +328,10 @@ for _ext in pdo_pgsql openssl pgsql; do
     if "$_php_bin" -m 2>/dev/null | grep -qi "$_ext"; then
         verbose "  $_ext: loaded"
     else
+        pdo_drivers=$($_php_bin -r 'echo implode(",", PDO::getAvailableDrivers());' 2>/dev/null)
         error "CRITICAL: PHP extension '$_ext' is NOT loaded!"
         error "  FusionPBX cannot work without it."
-        error "  Available PDO drivers: $("$_php_bin" -r \"echo implode(',', PDO::getAvailableDrivers());\" 2>/dev/null)"
+        error "  Available PDO drivers: $pdo_drivers"
         error "  Try: apt-get install php${php_version}-${_ext}"
     fi
 done
