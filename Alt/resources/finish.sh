@@ -107,9 +107,18 @@ if [ ."${domain_name}" = ."hostname" ]; then
     domain_name=$(hostname -f)
 fi
 
-#get the ip address — always take the first IP (bug fix from analysis)
+#get the ip address — Alt Linux hostname does NOT support -I flag
+# Use 'ip addr' instead, which is universally available
 if [ ."${domain_name}" = ."ip_address" ]; then
-    domain_name=$(hostname -I | cut -d ' ' -f1)
+    domain_name=$(ip -4 addr show scope global | grep inet | head -1 | awk '{print $2}' | cut -d'/' -f1)
+    # Fallback: try hostname -i (works on some systems)
+    if [ -z "$domain_name" ]; then
+        domain_name=$(hostname -i 2>/dev/null | cut -d' ' -f1)
+    fi
+    # Last fallback: try /sbin/ifconfig
+    if [ -z "$domain_name" ]; then
+        domain_name=$(/sbin/ifconfig 2>/dev/null | grep 'inet ' | grep -v '127.0.0.1' | head -1 | awk '{print $2}' | sed 's/addr://')
+    fi
 fi
 
 verbose "Domain: $domain_name"

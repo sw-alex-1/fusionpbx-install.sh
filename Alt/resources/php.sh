@@ -41,7 +41,11 @@ pkg_install \
     "php${php_version}-gd" \
     "php${php_version}-mbstring" \
     "php${php_version}-ldap" \
-    "php${php_version}-snmp"
+    "php${php_version}-snmp" \
+    "php${php_version}-openssl" \
+    "php${php_version}-sockets" \
+    "php${php_version}-xml" \
+    "php${php_version}-xmlrpc"
 
 # Optional PHP packages (install if available, warn if not)
 # inotify may not be packaged for all PHP versions

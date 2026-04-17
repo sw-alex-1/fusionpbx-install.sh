@@ -33,7 +33,15 @@ verbose "Installing Fail2ban..."
 # (Alt Linux uses systemd-journald by default, but fail2ban needs file-based
 #  logs for most filters — rsyslog creates /var/log/auth/secure etc.)
 pkg_install fail2ban
-pkg_install rsyslog
+
+# rsyslog is optional on Alt Linux — systemd-journald is the default logger.
+# Install rsyslog if available, but don't fail if it won't start.
+if pkg_install rsyslog 2>/dev/null; then
+    verbose "rsyslog installed"
+else
+    warn "rsyslog not available — fail2ban will use systemd journal backend"
+    warn "Log files may need to be created manually for file-based jails"
+fi
 
 # =============================================================================
 # Ensure log files exist (rsyslog may not have created them yet)
@@ -54,12 +62,16 @@ for _logfile in /var/log/auth/secure /var/log/syslog/messages; do
 done
 
 # =============================================================================
-# Enable and start rsyslog
+# Enable and start rsyslog (if installed)
 # This ensures traditional log files are populated, which fail2ban relies on.
-# =============================================================================
-
+# On Alt Linux, rsyslog may fail to start if systemd-journald is active — that's OK.
 verbose "Enabling rsyslog service..."
-service_enable_start rsyslog
+if pkg_is_installed rsyslog; then
+    systemctl enable rsyslog 2>/dev/null || true
+    systemctl start rsyslog 2>/dev/null || warn "rsyslog failed to start (OK if using systemd-journald)"
+else
+    verbose "rsyslog not installed, skipping (systemd-journald will be used)"
+fi
 
 # =============================================================================
 # Install fail2ban filters
