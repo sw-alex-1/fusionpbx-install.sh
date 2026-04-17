@@ -69,6 +69,9 @@ _php_fpm_conf_dir="${_php_conf_base}/fpm-fcgi"
 # CLI config directory
 _php_cli_conf_dir="${_php_conf_base}/cli"
 
+# PHP-FPM pool config directory
+_php_fpm_pool_dir="/etc/fpm${php_version}/php-fpm.d"
+
 # PHP-FPM ini file
 _php_fpm_ini="${_php_fpm_conf_dir}/php.ini"
 
@@ -96,6 +99,7 @@ fi
 
 verbose "PHP paths detected:"
 verbose "  FPM config:    $_php_fpm_conf_dir"
+verbose "  FPM pool dir:  $_php_fpm_pool_dir"
 verbose "  FPM ini:       $_php_fpm_ini"
 verbose "  CLI ini:       $_php_cli_ini"
 verbose "  Extension dir: $_php_extension_dir"
@@ -170,6 +174,7 @@ for _candidate in \
     "${_php_fpm_conf_dir}/php-fpm.d/www.conf" \
     "${_php_fpm_conf_dir}/php-fpm.conf" \
     "${_php_fpm_conf_dir}/www.conf" \
+    "${_php_fpm_pool_dir}/www.conf" \
     "${_php_fpm_conf_dir}/pool.d/www.conf"; do
     if [ -f "$_candidate" ]; then
         _fpm_pool_conf="$_candidate"
