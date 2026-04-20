@@ -2,8 +2,12 @@
 
 # FusionPBX Alt Linux Installer - Disable Missing FreeSWITCH Modules
 # The FusionPBX-provided FreeSWITCH configuration enables many modules
-# in modules.conf.xml that don't exist in the Alt Linux RPM packages.
-# This script comments out those modules to prevent CRIT errors on startup.
+# that don't exist in the Alt Linux RPM packages. This script comments
+# out those modules to prevent CRIT errors on startup.
+#
+# It checks TWO configuration files:
+#   - pre_load_modules.conf.xml (loaded first — contains mod_pgsql)
+#   - modules.conf.xml (loaded second — contains all other modules)
 #
 # Modules not available in Alt Linux freeswitch-daemon package:
 #   - mod_say_* (all language-specific say modules except en/ru if bundled)
@@ -27,59 +31,78 @@ cd "$SCRIPT_DIR"
 # Includes
 . ../config.sh
 . ../colors.sh
-. ../util.sh
+. ./util.sh
 
 _fs_conf="/etc/freeswitch"
-_modules_conf="$_fs_conf/autoload_configs/modules.conf.xml"
+_modules_dir="/usr/lib64/freeswitch"
 
-if [ ! -f "$_modules_conf" ]; then
-    warn "modules.conf.xml not found at $_modules_conf (skipping module disable)"
-    exit 0
-fi
+# =============================================================================
+# Function: check_and_disable_missing_modules
+# Reads a modules config file and comments out modules whose .so files
+# don't exist in _modules_dir.
+# =============================================================================
+check_and_disable_missing_modules() {
+    _conf_file="$1"
+    _label="$2"
+
+    if [ ! -f "$_conf_file" ]; then
+        verbose "  $_label not found at $_conf_file (skipping)"
+        return
+    fi
+
+    verbose "  Checking $_label..."
+
+    _file_missing=0
+    _file_disabled=0
+
+    while IFS= read -r _line; do
+        # Extract module name from <load module="mod_xxx"/> lines
+        _mod_name=$(echo "$_line" | sed -n 's/.*<load module="\([^"]*\)".*/\1/p')
+        if [ -z "$_mod_name" ]; then
+            continue
+        fi
+
+        # Check if the .so file exists
+        _so_path="$_modules_dir/$_mod_name.so"
+        if [ ! -f "$_so_path" ]; then
+            # Module not found - comment it out
+            _file_missing=$((_file_missing + 1))
+
+            # Check if it's already commented out
+            if echo "$_line" | grep -q '<!--.*<load'; then
+                verbose "    $_mod_name: missing (already commented out)"
+            else
+                # Comment out the line
+                sed -i "$_conf_file" -e "s|<load module=\"$_mod_name\"/>|<!-- <load module=\"$_mod_name\"/> -->|g"
+                sed -i "$_conf_file" -e "s|<load module=\"$_mod_name\" />|<!-- <load module=\"$_mod_name\" /> -->|g"
+                verbose "    $_mod_name: DISABLED (.so not found at $_so_path)"
+                _file_disabled=$((_file_disabled + 1))
+            fi
+        fi
+    done < "$_conf_file"
+
+    if [ "$_file_disabled" -gt 0 ]; then
+        verbose "    $_label: disabled $_file_disabled missing modules"
+    elif [ "$_file_missing" -eq 0 ]; then
+        verbose "    $_label: all configured modules are available"
+    fi
+}
+
+# =============================================================================
+# Main: check both module configuration files
+# =============================================================================
 
 verbose "Checking for missing FreeSWITCH modules..."
 
-# List of modules that are commonly NOT available in Alt Linux RPM packages.
-# We check each one: if the .so file doesn't exist, comment it out.
-_modules_dir="/usr/lib64/freeswitch"
+# Check pre_load_modules.conf.xml first (contains mod_pgsql and other
+# pre-load modules — these must be loaded before modules.conf.xml)
+check_and_disable_missing_modules \
+    "$_fs_conf/autoload_configs/pre_load_modules.conf.xml" \
+    "pre_load_modules.conf.xml"
 
-_missing_count=0
-_disabled_count=0
-
-# Read all load module lines from modules.conf.xml
-while IFS= read -r _line; do
-    # Extract module name from <load module="mod_xxx"/> lines
-    _mod_name=$(echo "$_line" | sed -n 's/.*<load module="\([^"]*\)".*/\1/p')
-    if [ -z "$_mod_name" ]; then
-        continue
-    fi
-
-    # Check if the .so file exists
-    _so_path="$_modules_dir/$_mod_name.so"
-    if [ ! -f "$_so_path" ]; then
-        # Module not found - comment it out
-        _missing_count=$((_missing_count + 1))
-
-        # Check if it's already commented out
-        if echo "$_line" | grep -q '<!--.*<load'; then
-            verbose "  $_mod_name: missing (already commented out)"
-        else
-            # Comment out the line
-            sed -i "$_modules_conf" -e "s|<load module=\"$_mod_name\"/>|<!-- <load module=\"$_mod_name\"/> -->|g"
-            sed -i "$_modules_conf" -e "s|<load module=\"$_mod_name\" />|<!-- <load module=\"$_mod_name\" /> -->|g"
-            verbose "  $_mod_name: DISABLED (.so not found at $_so_path)"
-            _disabled_count=$((_disabled_count + 1))
-        fi
-    fi
-done < "$_modules_conf"
-
-if [ "$_missing_count" -gt 0 ]; then
-    verbose ""
-    verbose "  Missing modules: $_missing_count (disabled: $_disabled_count)"
-    verbose "  These modules are not available in the Alt Linux FreeSWITCH RPM packages."
-    verbose "  The system will work without them, but some features may be unavailable."
-else
-    verbose "  All configured modules are available"
-fi
+# Check modules.conf.xml (the main module list)
+check_and_disable_missing_modules \
+    "$_fs_conf/autoload_configs/modules.conf.xml" \
+    "modules.conf.xml"
 
 verbose ""

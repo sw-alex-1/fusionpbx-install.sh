@@ -27,7 +27,7 @@
 # 7. Configure with --enable-core-pgsql-support
 # 8. Build only mod_pgsql (make mod_pgsql)
 # 9. Install mod_pgsql.so to /usr/lib64/freeswitch/
-# 10. Enable mod_pgsql in modules.conf.xml
+# 10. Enable mod_pgsql in pre_load_modules.conf.xml
 # 11. Clean up the build directory
 #
 # PREREQUISITES:
@@ -344,30 +344,63 @@ chown "$fs_user:$fs_group" "$FS_MODULES_DIR/mod_pgsql.so"
 verbose "  Installed to $FS_MODULES_DIR/mod_pgsql.so"
 
 # =============================================================================
-# Enable mod_pgsql in modules.conf.xml
+# Enable mod_pgsql in pre_load_modules.conf.xml
 #
-# FreeSWITCH loads modules listed in modules.conf.xml at startup.
-# Without this entry, mod_pgsql.so will exist but won't be loaded.
+# In FreeSWITCH 1.10.12, mod_pgsql is loaded via pre_load_modules.conf.xml
+# (NOT modules.conf.xml). This file is processed BEFORE modules.conf.xml,
+# ensuring that the database module is available when other modules need it
+# during their initialization. This is critical for FusionPBX because
+# FreeSWITCH's core requires a working DB connection early in startup.
+#
+# The file format is:
+#   <configuration name="pre_load_modules.conf" description="Modules">
+#     <modules>
+#       <load module="mod_pgsql"/>
+#     </modules>
+#   </configuration>
 # =============================================================================
 
-verbose "Enabling mod_pgsql in modules.conf.xml..."
+PRE_LOAD_CONF="$FS_CONF_DIR/autoload_configs/pre_load_modules.conf.xml"
 
-if [ -f "$MODULES_CONF_XML" ]; then
-    # Check if mod_pgsql is already in the config
-    if grep -q 'mod_pgsql' "$MODULES_CONF_XML" 2>/dev/null; then
+verbose "Enabling mod_pgsql in pre_load_modules.conf.xml..."
+
+if [ -f "$PRE_LOAD_CONF" ]; then
+    # Check if mod_pgsql is already present in pre_load_modules.conf.xml
+    if grep -q 'mod_pgsql' "$PRE_LOAD_CONF" 2>/dev/null; then
         # It might be commented out — uncomment it
-        sed -i "$MODULES_CONF_XML" -e 's:<!--.*<load module="mod_pgsql".*/>.*-->:<load module="mod_pgsql"/>:'
-        # Also handle slight format variations
-        sed -i "$MODULES_CONF_XML" -e 's:<!--.*<load module="mod_pgsql" .*/>.*-->:<load module="mod_pgsql"/>:'
-        verbose "  mod_pgsql enabled in modules.conf.xml (was commented out)"
+        sed -i "$PRE_LOAD_CONF" -e 's:<!--.*<load module="mod_pgsql".*/>.*-->:<load module="mod_pgsql"/>:'
+        sed -i "$PRE_LOAD_CONF" -e 's:<!--.*<load module="mod_pgsql" .*/>.*-->:<load module="mod_pgsql"/>:'
+        verbose "  mod_pgsql enabled in pre_load_modules.conf.xml (was commented out)"
     else
         # Add it before the closing </modules> tag
-        sed -i "$MODULES_CONF_XML" -e "s:</modules>:  <load module=\"mod_pgsql\"/>\n</modules>:"
-        verbose "  mod_pgsql added to modules.conf.xml"
+        sed -i "$PRE_LOAD_CONF" -e "s:</modules>:  <load module=\"mod_pgsql\"/>\n</modules>:"
+        verbose "  mod_pgsql added to pre_load_modules.conf.xml"
     fi
 else
-    warn "  modules.conf.xml not found at $MODULES_CONF_XML"
-    warn "  You will need to manually add: <load module=\"mod_pgsql\"/>"
+    # File doesn't exist — create it with the correct structure
+    verbose "  pre_load_modules.conf.xml not found, creating it..."
+    mkdir -p "$(dirname "$PRE_LOAD_CONF")"
+    cat > "$PRE_LOAD_CONF" << 'PRELOAD'
+<configuration name="pre_load_modules.conf" description="Modules">
+        <modules>
+                <!-- Databases -->
+                <load module="mod_pgsql"/>
+        </modules>
+</configuration>
+PRELOAD
+    chown "$fs_user:$fs_group" "$PRE_LOAD_CONF"
+    verbose "  Created pre_load_modules.conf.xml with mod_pgsql enabled"
+fi
+
+# Also ensure mod_pgsql is NOT listed in modules.conf.xml to avoid
+# loading it twice (which would cause an error). If it's there, remove it.
+if [ -f "$MODULES_CONF_XML" ] && grep -q 'mod_pgsql' "$MODULES_CONF_XML" 2>/dev/null; then
+    # Comment out any mod_pgsql line in modules.conf.xml (it belongs in pre_load)
+    if ! echo "$(grep 'mod_pgsql' "$MODULES_CONF_XML")" | grep -q '<!--'; then
+        sed -i "$MODULES_CONF_XML" -e 's:<load module="mod_pgsql"/>:<!-- <load module="mod_pgsql"/> loaded in pre_load_modules.conf.xml -->:'
+        sed -i "$MODULES_CONF_XML" -e 's:<load module="mod_pgsql" />:<!-- <load module="mod_pgsql"/> loaded in pre_load_modules.conf.xml -->:'
+        verbose "  Removed mod_pgsql from modules.conf.xml (already in pre_load_modules.conf.xml)"
+    fi
 fi
 
 # =============================================================================
