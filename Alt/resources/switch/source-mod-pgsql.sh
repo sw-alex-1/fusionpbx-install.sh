@@ -136,118 +136,34 @@ done
 verbose "  Build dependencies installed"
 
 # =============================================================================
-# Install FreeSWITCH core build dependencies
+# Install FreeSWITCH core build dependencies from Alt Linux packages
 #
 # The FreeSWITCH core library (libfreeswitch) requires several dependencies
-# that configure checks for. We try to install them from Alt Linux packages
-# first (faster, more reliable). If packages are not available, we fall back
-# to building from source.
+# that configure checks for. All of these are available as Alt Linux packages:
 #
-# Strategy: packages first, source build as fallback.
+#   spandsp >= 3.0 : libspandsp3, libspandsp3-devel
+#   sofia-sip      : libsofia-sip, libsofia-sip-devel
+#   libks          : libks2, libks-devel
 # =============================================================================
 
-verbose "Installing FreeSWITCH core build dependencies..."
+verbose "Installing FreeSWITCH core build dependencies from packages..."
 
-# --- spandsp >= 3.0 (required by FreeSWITCH core) ---
-# Alt Linux has libspandsp3 and libspandsp3-devel packages.
-# This is MUCH faster than building from source.
-verbose "  Checking spandsp..."
-_SPANDSP_FROM_PKG=false
-if pkg_install libspandsp3 libspandsp3-devel 2>/dev/null; then
-    _SPANDSP_FROM_PKG=true
-    verbose "  spandsp installed from Alt Linux packages"
-else
-    warn "  libspandsp3 packages not available, building from source..."
-    if [ ! -f /usr/local/lib/libspandsp.so ]; then
-        cd /usr/src
-        rm -rf spandsp
-        git clone https://github.com/freeswitch/spandsp.git spandsp
-        cd spandsp
-        sh autogen.sh
-        ./configure --enable-debug
-        make -j "$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
-        make install
-        ldconfig
-        verbose "  spandsp built and installed from source"
-    else
-        verbose "  spandsp already installed (from source, skipping)"
-    fi
-fi
+# spandsp >= 3.0 (required by FreeSWITCH core — configure checks for it)
+pkg_install libspandsp3 libspandsp3-devel
+verbose "  spandsp: libspandsp3 + libspandsp3-devel"
 
-# --- sofia-sip (required by FreeSWITCH core) ---
-# Check if Alt Linux has packages first, otherwise build from source.
-verbose "  Checking sofia-sip..."
-_SOFIA_FROM_PKG=false
-for _spkg in libsofia-sip-ua libsofia-sip-ua-devel sofia-sip sofia-sip-devel; do
-    if apt-cache show "$_spkg" >/dev/null 2>&1; then
-        _SOFIA_FROM_PKG=true
-        break
-    fi
-done
-if [ "$_SOFIA_FROM_PKG" = "true" ]; then
-    # Try to install the -devel package pair
-    for _spkg in "libsofia-sip-ua libsofia-sip-ua-devel" "sofia-sip sofia-sip-devel"; do
-        if pkg_install $_spkg 2>/dev/null; then
-            verbose "  sofia-sip installed from Alt Linux packages"
-            break
-        fi
-    done
-else
-    verbose "  sofia-sip packages not found, building from source..."
-    if [ ! -f /usr/local/lib/libsofia-sip-ua.so ]; then
-        cd /usr/src
-        rm -rf sofia-sip
-        git clone https://github.com/freeswitch/sofia-sip.git sofia-sip
-        cd sofia-sip
-        sh autogen.sh
-        ./configure --enable-debug
-        make -j "$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
-        make install
-        ldconfig
-        verbose "  sofia-sip built and installed from source"
-    else
-        verbose "  sofia-sip already installed (from source, skipping)"
-    fi
-fi
+# sofia-sip (required by FreeSWITCH core)
+pkg_install libsofia-sip libsofia-sip-devel
+verbose "  sofia-sip: libsofia-sip + libsofia-sip-devel"
 
-# --- libks (required by sofia-sip and FreeSWITCH core) ---
-# Check if Alt Linux has packages first, otherwise build from source.
-verbose "  Checking libks..."
-_LIBKS_FROM_PKG=false
-for _kpkg in libks libks-devel; do
-    if apt-cache show "$_kpkg" >/dev/null 2>&1; then
-        _LIBKS_FROM_PKG=true
-        break
-    fi
-done
-if [ "$_LIBKS_FROM_PKG" = "true" ]; then
-    if pkg_install libks libks-devel 2>/dev/null; then
-        verbose "  libks installed from Alt Linux packages"
-    fi
-else
-    verbose "  libks packages not found, building from source..."
-    pkg_install cmake libuuid-devel
-    if [ ! -f /usr/local/lib/libks.so ] && [ ! -f /usr/local/lib64/libks.so ]; then
-        cd /usr/src
-        rm -rf libks
-        git clone https://github.com/signalwire/libks.git libks
-        cd libks
-        cmake .
-        make -j "$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
-        make install
-        ldconfig
-        verbose "  libks built and installed from source"
-    else
-        verbose "  libks already installed (from source, skipping)"
-    fi
-    # Export libks C includes (needed by sofia-sip when built from source)
-    export C_INCLUDE_PATH=/usr/include/libks${C_INCLUDE_PATH:+:$C_INCLUDE_PATH}
-fi
+# libks (required by sofia-sip and FreeSWITCH core)
+pkg_install libks2 libks-devel
+verbose "  libks: libks2 + libks-devel"
 
-# Update library cache to ensure all are found by configure
+# Update library cache
 ldconfig
 
-verbose "  Core build dependencies ready"
+verbose "  Core build dependencies installed from packages"
 
 # =============================================================================
 # Get FreeSWITCH source code
@@ -586,17 +502,14 @@ if cmd_exists fs_cli; then
 fi
 
 # =============================================================================
-# Clean up build directories (saves disk space)
-# We keep the installed libraries but remove the build sources.
-# Only source-built directories exist if we fell back from packages.
+# Clean up build directory (saves ~500MB of disk space)
 # =============================================================================
 
-verbose "Cleaning up build directories..."
+verbose "Cleaning up build directory..."
 
 rm -rf "$BUILD_DIR"
-rm -rf /usr/src/libks /usr/src/sofia-sip /usr/src/spandsp
 
-verbose "  Build directories removed (saved disk space)"
+verbose "  Build directory removed (saved disk space)"
 
 # =============================================================================
 # Summary
@@ -608,7 +521,7 @@ verbose "  FreeSWITCH version:      $FS_INSTALLED_VERSION"
 verbose "  Module installed:        $FS_MODULES_DIR/mod_pgsql.so"
 verbose "  PostgreSQL 14+ patch:    applied"
 verbose "  pre_load_modules.conf:   mod_pgsql enabled"
-verbose "  Core deps built:         libks, sofia-sip, spandsp (installed to /usr/local)"
+verbose "  Core deps (packages):   libspandsp3, libsofia-sip, libks2"
 verbose "  Build directories:       cleaned up"
 verbose ""
 verbose "IMPORTANT: Restart FreeSWITCH to load the new module:"
