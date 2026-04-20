@@ -150,26 +150,18 @@ verbose "  Build dependencies installed"
 
 verbose "Installing FreeSWITCH core build dependencies from packages..."
 
-# spandsp >= 3.0 (required by FreeSWITCH core — configure checks for it)
-pkg_install libspandsp3 libspandsp3-devel
-verbose "  spandsp: libspandsp3 + libspandsp3-devel"
-
-# sofia-sip (required by FreeSWITCH core)
-pkg_install libsofia-sip libsofia-sip-devel
-verbose "  sofia-sip: libsofia-sip + libsofia-sip-devel"
-
-# ks (required by sofia-sip and FreeSWITCH core)
-pkg_install libks2 libks-devel
-verbose "  libks: libks2 + libks-devel"
-
-# zlib (required by sofia-sip and FreeSWITCH core)
-pkg_install zlib zlib-devel
-verbose "  zlib: zlib + zlib-devel"
-
-# speexdsp (required by sofia-sip and FreeSWITCH core)
-pkg_install libspeex libspeex-devel libspeexdsp libspeexdsp-devel
-verbose "  speex: libspeex[-devel] + libspeexdsp[-devel]"
-
+# Installing:
+#  spandsp >= 3.0 (required by FreeSWITCH core — configure checks for it),
+#  sofia-sip (required by FreeSWITCH core),
+#  ks (required by sofia-sip and FreeSWITCH core),
+#  zlib (required by sofia-sip and FreeSWITCH core),
+#  speexdsp (required by sofia-sip and FreeSWITCH core)
+pkg_install \ 
+ libspandsp3 libspandsp3-devel \
+ libsofia-sip libsofia-sip-devel \
+ libks2 libks-devel \
+ zlib zlib-devel \
+ libspeex libspeex-devel libspeexdsp libspeexdsp-devel
 
 # Update library cache
 ldconfig
