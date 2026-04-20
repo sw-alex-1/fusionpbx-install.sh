@@ -164,8 +164,8 @@ pkg_install zlib zlib-devel
 verbose "  zlib: zlib + zlib-devel"
 
 # speexdsp (required by sofia-sip and FreeSWITCH core)
-pkg_install libspeexdsp libspeexdsp-devel
-verbose "  speexdsp: libspeexdsp + libspeexdsp-devel"
+pkg_install libspeex libspeex-devel libspeexdsp libspeexdsp-devel
+verbose "  speex: libspeex[-devel] + libspeexdsp[-devel]"
 
 
 # Update library cache
