@@ -136,6 +136,86 @@ done
 verbose "  Build dependencies installed"
 
 # =============================================================================
+# Build FreeSWITCH core dependencies from source
+#
+# The FreeSWITCH core library (libfreeswitch) requires spandsp >= 3.0,
+# sofia-sip, and libks. These are NOT available as Alt Linux packages,
+# so we must compile them from source — exactly like the Debian installer
+# does in debian/resources/switch/source-release.sh.
+#
+# These libraries are installed to /usr/local/lib and /usr/local/include,
+# which is the standard prefix for hand-built software. We run ldconfig
+# after each install so that the system library cache is updated.
+# =============================================================================
+
+verbose "Building FreeSWITCH core dependencies from source..."
+
+# --- libks (required by sofia-sip and FreeSWITCH core) ---
+verbose "  Building libks..."
+
+pkg_install cmake libuuid-devel
+
+if [ ! -f /usr/local/lib/libks.so ] && [ ! -f /usr/local/lib64/libks.so ]; then
+    cd /usr/src
+    rm -rf libks
+    git clone https://github.com/signalwire/libks.git libks
+    cd libks
+    cmake .
+    make -j "$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
+    make install
+    ldconfig
+    verbose "  libks built and installed"
+else
+    verbose "  libks already installed (skipping)"
+fi
+
+# Export libks C includes (needed by sofia-sip)
+export C_INCLUDE_PATH=/usr/include/libks${C_INCLUDE_PATH:+:$C_INCLUDE_PATH}
+
+# --- sofia-sip (required by FreeSWITCH core) ---
+verbose "  Building sofia-sip..."
+
+if [ ! -f /usr/local/lib/libsofia-sip-ua.so ]; then
+    cd /usr/src
+    rm -rf sofia-sip
+    git clone https://github.com/freeswitch/sofia-sip.git sofia-sip
+    cd sofia-sip
+    sh autogen.sh
+    ./configure --enable-debug
+    make -j "$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
+    make install
+    ldconfig
+    verbose "  sofia-sip built and installed"
+else
+    verbose "  sofia-sip already installed (skipping)"
+fi
+
+# --- spandsp >= 3.0 (required by FreeSWITCH core — configure checks for it) ---
+verbose "  Building spandsp..."
+
+if [ ! -f /usr/local/lib/libspandsp.so ]; then
+    cd /usr/src
+    rm -rf spandsp
+    git clone https://github.com/freeswitch/spandsp.git spandsp
+    cd spandsp
+    # Use a known-good commit for stability (same as Debian installer)
+    # git reset --hard 0d2e6ac65e0e8f53d652665a743015a88bf048d4 2>/dev/null || true
+    sh autogen.sh
+    ./configure --enable-debug
+    make -j "$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
+    make install
+    ldconfig
+    verbose "  spandsp built and installed"
+else
+    verbose "  spandsp already installed (skipping)"
+fi
+
+# Update library cache one final time to ensure all are found
+ldconfig
+
+verbose "  Core dependencies built and installed"
+
+# =============================================================================
 # Get FreeSWITCH source code
 # =============================================================================
 
@@ -472,14 +552,18 @@ if cmd_exists fs_cli; then
 fi
 
 # =============================================================================
-# Clean up build directory (saves ~500MB of disk space)
+# Clean up build directories (saves ~1GB of disk space)
+# We keep the installed libraries in /usr/local/ but remove the sources.
 # =============================================================================
 
-verbose "Cleaning up build directory..."
+verbose "Cleaning up build directories..."
 
 rm -rf "$BUILD_DIR"
+rm -rf /usr/src/libks
+rm -rf /usr/src/sofia-sip
+rm -rf /usr/src/spandsp
 
-verbose "  Build directory removed (saved disk space)"
+verbose "  Build directories removed (saved disk space)"
 
 # =============================================================================
 # Summary
@@ -487,11 +571,12 @@ verbose "  Build directory removed (saved disk space)"
 
 verbose ""
 verbose "mod_pgsql build and installation summary:"
-verbose "  FreeSWITCH version:   $FS_INSTALLED_VERSION"
-verbose "  Module installed:     $FS_MODULES_DIR/mod_pgsql.so"
-verbose "  PostgreSQL 14+ patch: applied"
-verbose "  modules.conf.xml:     mod_pgsql enabled"
-verbose "  Build directory:      cleaned up"
+verbose "  FreeSWITCH version:      $FS_INSTALLED_VERSION"
+verbose "  Module installed:        $FS_MODULES_DIR/mod_pgsql.so"
+verbose "  PostgreSQL 14+ patch:    applied"
+verbose "  pre_load_modules.conf:   mod_pgsql enabled"
+verbose "  Core deps built:         libks, sofia-sip, spandsp (installed to /usr/local)"
+verbose "  Build directories:       cleaned up"
 verbose ""
 verbose "IMPORTANT: Restart FreeSWITCH to load the new module:"
 verbose "  systemctl restart freeswitch"
