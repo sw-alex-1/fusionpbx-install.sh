@@ -7,7 +7,7 @@ system_branch=5.5                           # master, 5.5
 
 # FreeSWITCH Settings
 switch_branch=stable                        # master, stable
-switch_source=false                         # Always false — Alt Linux has RPM packages, no source build needed
+switch_source=false                         # false — main FreeSWITCH from RPM; mod_pgsql built from source separately
 switch_package=true                         # Always true — use RPM packages from Alt Linux repository
 switch_tls=true                             # true or false
 

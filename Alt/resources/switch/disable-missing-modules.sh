@@ -14,6 +14,10 @@
 #   - mod_verto (WebRTC, may not be in RPM)
 #   - mod_sms (may not be in RPM)
 #
+# NOTE: mod_pgsql is built from source by source-mod-pgsql.sh (which runs
+# BEFORE this script), so it should NOT be disabled. If mod_pgsql.so is
+# missing, the build script failed and should be investigated.
+#
 # This script is idempotent: commenting out already-commented lines is safe.
 
 # Determine script directory
