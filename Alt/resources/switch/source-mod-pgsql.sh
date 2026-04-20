@@ -126,8 +126,7 @@ pkg_install libpq-devel
 
 # Additional dependencies that may be needed by the core build
 # These are soft dependencies - install if available, don't fail if not
-for _pkg in speex-devel libogg-devel libvorbis-devel libtiff-devel \
-    flac-devel libsndfile-devel libuuid-devel; do
+for _pkg in libogg-devel libvorbis-devel libtiff-devel flac-devel libsndfile-devel libuuid-devel; do
     if apt-cache search "^$_pkg$" 2>/dev/null | grep -q "$_pkg"; then
         pkg_install "$_pkg" 2>/dev/null || true
     fi
@@ -156,9 +155,18 @@ verbose "  spandsp: libspandsp3 + libspandsp3-devel"
 pkg_install libsofia-sip libsofia-sip-devel
 verbose "  sofia-sip: libsofia-sip + libsofia-sip-devel"
 
-# libks (required by sofia-sip and FreeSWITCH core)
+# ks (required by sofia-sip and FreeSWITCH core)
 pkg_install libks2 libks-devel
 verbose "  libks: libks2 + libks-devel"
+
+# zlib (required by sofia-sip and FreeSWITCH core)
+pkg_install zlib zlib-devel
+verbose "  zlib: zlib + zlib-devel"
+
+# speexdsp (required by sofia-sip and FreeSWITCH core)
+pkg_install libspeexdsp libspeexdsp-devel
+verbose "  speexdsp: libspeexdsp + libspeexdsp-devel"
+
 
 # Update library cache
 ldconfig
@@ -521,7 +529,7 @@ verbose "  FreeSWITCH version:      $FS_INSTALLED_VERSION"
 verbose "  Module installed:        $FS_MODULES_DIR/mod_pgsql.so"
 verbose "  PostgreSQL 14+ patch:    applied"
 verbose "  pre_load_modules.conf:   mod_pgsql enabled"
-verbose "  Core deps (packages):   libspandsp3, libsofia-sip, libks2"
+verbose "  Core deps (packages):   libspandsp3, libsofia-sip, libks2, zlib"
 verbose "  Build directories:       cleaned up"
 verbose ""
 verbose "IMPORTANT: Restart FreeSWITCH to load the new module:"
