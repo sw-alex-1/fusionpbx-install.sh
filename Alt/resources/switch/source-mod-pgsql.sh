@@ -115,7 +115,10 @@ verbose "  Installed FreeSWITCH version: $FS_INSTALLED_VERSION"
 verbose "Installing build dependencies..."
 
 # Core build tools
-pkg_install gcc gcc-c++ make autoconf automake libtool pkg-config wget
+# nasm: required by bundled libvpx (VP8/VP9 codec) which is built as part
+# of the FreeSWITCH core library. Without nasm, libvpx configure fails with:
+#   "Neither yasm nor nasm have been found"
+pkg_install gcc gcc-c++ make autoconf automake libtool pkg-config wget nasm
 
 # FreeSWITCH core dependencies (required by configure even for minimal build)
 pkg_install libssl-devel libsqlite3-devel libpcre-devel libncurses-devel
