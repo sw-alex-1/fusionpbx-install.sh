@@ -245,7 +245,7 @@ cd "$BUILD_DIR"
 verbose "Creating minimal modules.conf (only mod_pgsql)..."
 
 cat > modules.conf << 'EOF'
-formats/mod_pgsql
+databases/mod_pgsql
 EOF
 
 verbose "  modules.conf: only mod_pgsql enabled"
