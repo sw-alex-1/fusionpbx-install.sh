@@ -210,6 +210,52 @@ EOF
 verbose "  modules.conf: only mod_pgsql enabled"
 
 # =============================================================================
+# Fix Alt Linux libtool m4 paths
+#
+# On Alt Linux, libtool m4 macros are installed to /usr/share/libtool-<ver>/aclocal/
+# instead of the standard /usr/share/aclocal/ that FreeSWITCH's bootstrap.sh expects.
+# Without these symlinks, bootstrap.sh fails with:
+#   /usr/share/aclocal/libtool.m4 not found
+#
+# We create symlinks from /usr/share/aclocal/ to the actual files so that
+# aclocal and bootstrap.sh can find them. This is the same approach used by
+# many other software packages building on Alt Linux.
+# =============================================================================
+
+verbose "Fixing Alt Linux libtool m4 paths..."
+
+_ACLOCAL_DIR="/usr/share/aclocal"
+_LT_ACLOCAL_DIR=""
+
+# Find the libtool aclocal directory (e.g. /usr/share/libtool-2.4/aclocal/)
+for _d in /usr/share/libtool-*/aclocal; do
+    if [ -d "$_d" ]; then
+        _LT_ACLOCAL_DIR="$_d"
+        break
+    fi
+done
+
+if [ -n "$_LT_ACLOCAL_DIR" ]; then
+    mkdir -p "$_ACLOCAL_DIR"
+    for _m4 in "$_LT_ACLOCAL_DIR"/*.m4; do
+        _m4_base=$(basename "$_m4")
+        if [ ! -e "$_ACLOCAL_DIR/$_m4_base" ]; then
+            ln -sf "$_m4" "$_ACLOCAL_DIR/$_m4_base"
+            verbose "  Linked: $_ACLOCAL_DIR/$_m4_base -> $_m4"
+        fi
+    done
+    verbose "  libtool m4 symlinks created"
+else
+    # If no versioned directory found, the files might already be in /usr/share/aclocal/
+    if [ -f "$_ACLOCAL_DIR/libtool.m4" ]; then
+        verbose "  libtool.m4 already in $_ACLOCAL_DIR (no fix needed)"
+    else
+        warn "  Could not find libtool m4 directory (looked in /usr/share/libtool-*/aclocal)"
+        warn "  bootstrap.sh may fail — if it does, install libtool-devel manually"
+    fi
+fi
+
+# =============================================================================
 # Bootstrap the build system
 # This generates the configure script from configure.ac
 # =============================================================================

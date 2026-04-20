@@ -31,7 +31,7 @@ cd "$SCRIPT_DIR"
 # Includes
 . ../config.sh
 . ../colors.sh
-. ./util.sh
+. ../util.sh
 
 _fs_conf="/etc/freeswitch"
 _modules_dir="/usr/lib64/freeswitch"
