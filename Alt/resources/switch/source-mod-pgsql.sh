@@ -156,7 +156,7 @@ verbose "Installing FreeSWITCH core build dependencies from packages..."
 #  ks (required by sofia-sip and FreeSWITCH core),
 #  zlib (required by sofia-sip and FreeSWITCH core),
 #  speexdsp (required by sofia-sip and FreeSWITCH core)
-pkg_install \ 
+pkg_install \
  libspandsp3 libspandsp3-devel \
  libsofia-sip libsofia-sip-devel \
  libks2 libks-devel \
