@@ -132,6 +132,27 @@ systemctl restart freeswitch || warn "FreeSWITCH restart failed"
 verbose "FreeSWITCH restarted with PostgreSQL DSN"
 
 # =============================================================================
+# Sync modules after FreeSWITCH is running
+#
+# When finish.sh runs upgrade.php --defaults, FreeSWITCH is NOT running yet.
+# This means switch_settings::settings() can't connect to the event socket
+# to get mod_dir, and modules::synch() can't scan the modules directory.
+# As a result, the v_modules table stays empty (no modules in the web UI).
+#
+# Now that FreeSWITCH IS running, re-run upgrade.php --defaults to:
+# 1. Get mod_dir from the event socket (or use config.conf fallback)
+# 2. Sync modules: scan /usr/lib64/freeswitch for .so files → v_modules table
+# 3. Populate v_default_settings with correct switch paths
+#
+# The --defaults flag is idempotent: it only adds missing settings/modules,
+# it doesn't overwrite existing ones.
+# =============================================================================
+
+verbose "Syncing modules (FreeSWITCH is now running)..."
+cd /var/www/fusionpbx && /usr/bin/php /var/www/fusionpbx/core/upgrade/upgrade.php --defaults
+verbose "Module sync completed"
+
+# =============================================================================
 # Completion
 # =============================================================================
 
