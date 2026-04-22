@@ -132,25 +132,104 @@ systemctl restart freeswitch || warn "FreeSWITCH restart failed"
 verbose "FreeSWITCH restarted with PostgreSQL DSN"
 
 # =============================================================================
-# Sync modules after FreeSWITCH is running
-#
-# When finish.sh runs upgrade.php --defaults, FreeSWITCH is NOT running yet.
-# This means switch_settings::settings() can't connect to the event socket
-# to get mod_dir, and modules::synch() can't scan the modules directory.
-# As a result, the v_modules table stays empty (no modules in the web UI).
-#
-# Now that FreeSWITCH IS running, re-run upgrade.php --defaults to:
-# 1. Get mod_dir from the event socket (or use config.conf fallback)
-# 2. Sync modules: scan /usr/lib64/freeswitch for .so files → v_modules table
-# 3. Populate v_default_settings with correct switch paths
-#
-# The --defaults flag is idempotent: it only adds missing settings/modules,
-# it doesn't overwrite existing ones.
+# Wait for FreeSWITCH to fully start
+# FreeSWITCH needs time to initialize and listen on the event socket.
+# Without this wait, upgrade.php --defaults might not be able to connect.
 # =============================================================================
 
-verbose "Syncing modules (FreeSWITCH is now running)..."
+verbose "Waiting for FreeSWITCH to fully initialize..."
+_sleep_count=0
+while [ $_sleep_count -lt 30 ]; do
+    if /usr/bin/php -r "
+        \$sock = @stream_socket_client('tcp://127.0.0.1:8021', \$errno, \$errstr, 2);
+        if (\$sock) { fclose(\$sock); echo 'OK'; }
+    " 2>/dev/null | grep -q "OK"; then
+        verbose "  FreeSWITCH event socket is ready"
+        break
+    fi
+    sleep 1
+    _sleep_count=$((_sleep_count + 1))
+done
+if [ $_sleep_count -ge 30 ]; then
+    warn "FreeSWITCH event socket not ready after 30s (may cause issues with switch settings)"
+fi
+
+# =============================================================================
+# Sync modules and fix switch default settings after FreeSWITCH is running
+#
+# CRITICAL PROBLEM: When finish.sh runs upgrade.php --defaults the FIRST time,
+# FreeSWITCH is NOT running. The switch_settings::settings() method connects
+# to the event socket to get switch paths (mod_dir, db_dir, sounds_dir, etc.).
+# When the event socket is unavailable, ALL path values are EMPTY STRINGS.
+# These empty values get INSERTED into v_default_settings.
+#
+# On the SECOND run (now, with FreeSWITCH running), upgrade.php --defaults
+# only ADDS MISSING settings — it does NOT update existing ones. So the empty
+# values from the first run PERSIST in the database!
+#
+# This was identified as the root cause of:
+#   - Empty module list in the web UI
+#   - mod_local_stream failing to load ("Module load routine returned an error")
+#   - Wrong/empty paths in Advanced → Default Settings → Switch
+#
+# Reference: https://www.pbxforums.com/threads/error-loading-mod_local_stream-so.5251/
+#
+# FIX: Delete all switch default settings before the second run of
+# upgrade.php --defaults, so they can be recreated with CORRECT values
+# from the event socket.
+#
+# Additionally, we now use PostgreSQL for ALL FreeSWITCH databases (core,
+# fifo, callcenter) instead of SQLite, because SQLite's file locking does
+# not work correctly with FreeSWITCH on Alt Linux, causing "attempt to write
+# a readonly database" errors.
+# =============================================================================
+
+# Delete switch default settings that were created with empty values
+# dsn.sh already does this, but we do it again here as a safety measure
+# (in case dsn.sh was skipped or run at a different time)
+verbose "Deleting stale switch default settings..."
+. ./resources/config.sh
+if [ -f "/tmp/fusionpbx_db_credentials" ]; then
+    . /tmp/fusionpbx_db_credentials
+fi
+export PGPASSWORD=$database_password
+runuser -u postgres -- psql -d "$database_name" -c \
+    "DELETE FROM v_default_settings WHERE default_setting_category = 'switch';" 2>/dev/null \
+    || verbose "  switch default settings deletion skipped"
+unset PGPASSWORD
+verbose "  Switch default settings cleared (will be recreated with correct values)"
+
+# Re-run upgrade.php --defaults with FreeSWITCH running
+# This will:
+# 1. Get correct switch paths from the event socket (mod_dir, db_dir, etc.)
+# 2. Insert them into v_default_settings (since we just deleted the old ones)
+# 3. Sync modules: scan /usr/lib64/freeswitch for .so files → v_modules table
+verbose "Syncing modules and switch settings (FreeSWITCH is now running)..."
 cd /var/www/fusionpbx && /usr/bin/php /var/www/fusionpbx/core/upgrade/upgrade.php --defaults
 verbose "Module sync completed"
+
+# =============================================================================
+# Clear FusionPBX cache
+# Stale cache can contain XML generated with wrong switch paths.
+# After fixing v_default_settings, we must clear the cache so that
+# new XML is generated with the correct paths.
+# =============================================================================
+
+verbose "Clearing FusionPBX cache..."
+if [ -d "/var/cache/fusionpbx" ]; then
+    rm -rf /var/cache/fusionpbx/*
+    verbose "  FusionPBX cache cleared"
+fi
+
+# =============================================================================
+# Restart FreeSWITCH one final time
+# This ensures FreeSWITCH picks up the corrected XML configuration from
+# FusionPBX's XML handler (which now uses the correct switch paths).
+# =============================================================================
+
+verbose "Restarting FreeSWITCH with corrected configuration..."
+systemctl restart freeswitch || warn "FreeSWITCH restart failed"
+verbose "FreeSWITCH restarted with corrected switch settings"
 
 # =============================================================================
 # Completion

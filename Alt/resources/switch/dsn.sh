@@ -98,17 +98,25 @@ if [ -f "$_switch_conf" ]; then
 fi
 
 # =============================================================================
-# FusionPBX config already uses /var/lib/freeswitch/db for switch DB
+# Use PostgreSQL for ALL FreeSWITCH databases (core, fifo, callcenter)
 #
-# NOTE: The Debian installer moves FreeSWITCH's SQLite databases to /dev/shm
-# (shared memory) for better performance. However, on Alt Linux, SQLite's
-# file locking mechanism (fcntl F_SETLK) does not work correctly on tmpfs,
-# causing "attempt to write a readonly database" errors. This prevents modules
-# like mod_local_stream from registering their interfaces.
-# Therefore, we keep the default /var/lib/freeswitch/db path on Alt Linux.
+# The Debian installer uses SQLite for FreeSWITCH's core database (core.db)
+# stored in /dev/shm (shared memory) for performance. However, on Alt Linux,
+# SQLite's file locking mechanism (fcntl F_SETLK) does not work correctly
+# with FreeSWITCH, causing "attempt to write a readonly database" errors.
+# This prevents modules like mod_local_stream from registering their interfaces.
+#
+# The workaround is to use PostgreSQL for FreeSWITCH's internal databases
+# instead of SQLite. This is a well-supported production configuration that
+# avoids the SQLite locking issue entirely. FreeSWITCH auto-creates its
+# tables in PostgreSQL when auto-create-schemas is enabled.
+#
+# Using the same PostgreSQL database for both FusionPBX and FreeSWITCH is
+# safe because FusionPBX tables are prefixed with 'v_' while FreeSWITCH uses
+# unprefixed names (interfaces, calls, channels, etc.).
 # =============================================================================
 
-verbose "  Switch DB directory: /var/lib/freeswitch/db (standard path, not /dev/shm)"
+verbose "  Using PostgreSQL for all FreeSWITCH databases (avoids SQLite issues on Alt Linux)"
 
 # =============================================================================
 # Add DSN variables to vars.xml
@@ -125,9 +133,11 @@ if [ -f "$_vars_xml" ]; then
         verbose "  Adding DSN variables to vars.xml"
 
         # Build the DSN connection strings
+        # ALL FreeSWITCH databases use PostgreSQL on Alt Linux (not SQLite)
+        # to avoid the "readonly database" issue with SQLite file locking.
         _dsn_system="pgsql://hostaddr=$database_host port=$database_port dbname=$database_name user=$database_username password=$database_password options="
-        _dsn="sqlite:///var/lib/freeswitch/db/core.db"
-        _dsn_callcenter="sqlite:///var/lib/freeswitch/db/callcenter.db"
+        _dsn="$_dsn_system"
+        _dsn_callcenter="$_dsn_system"
 
         echo "" >> "$_vars_xml"
         echo "<!-- DSN -->" >> "$_vars_xml"
@@ -155,34 +165,36 @@ fi
 verbose "Inserting DSN variables into database (v_vars table)..."
 
 # Build the DSN connection strings (same as what goes into vars.xml)
+# ALL FreeSWITCH databases use PostgreSQL on Alt Linux
 _dsn_system="pgsql://hostaddr=$database_host port=$database_port dbname=$database_name user=$database_username password=$database_password options="
-_dsn="sqlite:///var/lib/freeswitch/db/core.db"
-_dsn_callcenter="sqlite:///var/lib/freeswitch/db/callcenter.db"
+_dsn="$_dsn_system"
+_dsn_callcenter="$_dsn_system"
 
 # Set PGPASSWORD for psql commands
 export PGPASSWORD=$database_password
 
 # Insert dsn_system variable
-# Use ON CONFLICT DO NOTHING for idempotency (PostgreSQL 9.5+)
+# Use ON CONFLICT DO UPDATE to ensure the value is always correct
+# (on reinstall, old SQLite values would persist with DO NOTHING)
 runuser -u postgres -- psql -d "$database_name" -c \
     "INSERT INTO v_vars (var_uuid, var_name, var_value, var_category, var_enabled, var_order, var_description, var_hostname)
      VALUES ('785d7013-1152-4a44-aa15-28336d9b36f9', 'dsn_system', '$_dsn_system', 'DSN', 'true', '0', null, null)
-     ON CONFLICT (var_uuid) DO NOTHING;" 2>/dev/null \
-    || verbose "  dsn_system: insert skipped (may already exist or v_vars table not yet created)"
+     ON CONFLICT (var_uuid) DO UPDATE SET var_value = EXCLUDED.var_value;" 2>/dev/null \
+    || verbose "  dsn_system: insert/update skipped (v_vars table may not exist yet)"
 
 # Insert dsn variable
 runuser -u postgres -- psql -d "$database_name" -c \
     "INSERT INTO v_vars (var_uuid, var_name, var_value, var_category, var_enabled, var_order, var_description, var_hostname)
      VALUES ('0170e737-b453-40ea-99f2-f1375474e5ce', 'dsn', '$_dsn', 'DSN', 'true', '0', null, null)
-     ON CONFLICT (var_uuid) DO NOTHING;" 2>/dev/null \
-    || verbose "  dsn: insert skipped (may already exist or v_vars table not yet created)"
+     ON CONFLICT (var_uuid) DO UPDATE SET var_value = EXCLUDED.var_value;" 2>/dev/null \
+    || verbose "  dsn: insert/update skipped (v_vars table may not exist yet)"
 
 # Insert dsn_callcenter variable
 runuser -u postgres -- psql -d "$database_name" -c \
     "INSERT INTO v_vars (var_uuid, var_name, var_value, var_category, var_enabled, var_order, var_description, var_hostname)
      VALUES ('32e3e364-a8ef-4fe0-9d02-c652d5122bbf', 'dsn_callcenter', '$_dsn_callcenter', 'DSN', 'true', '0', null, null)
-     ON CONFLICT (var_uuid) DO NOTHING;" 2>/dev/null \
-    || verbose "  dsn_callcenter: insert skipped (may already exist or v_vars table not yet created)"
+     ON CONFLICT (var_uuid) DO UPDATE SET var_value = EXCLUDED.var_value;" 2>/dev/null \
+    || verbose "  dsn_callcenter: insert/update skipped (v_vars table may not exist yet)"
 
 verbose "  DSN variables inserted into v_vars table"
 
@@ -201,21 +213,36 @@ runuser -u postgres -- psql -d "$database_name" -c \
     || verbose "  SIP profile odbc-dsn update skipped (table may not exist yet)"
 
 # =============================================================================
-# Switch DB directory stays at /var/lib/freeswitch/db on Alt Linux
+# Update v_default_settings: delete empty switch settings
 #
-# The Debian installer changes this to /dev/shm for performance, but on
-# Alt Linux, SQLite file locking does not work correctly on tmpfs, causing
-# "readonly database" errors. We keep the standard path.
+# When upgrade.php --defaults ran the first time (before FreeSWITCH started),
+# the event socket was not available. The switch_settings::settings() method
+# got empty values for all switch paths (mod_dir, db_dir, sounds_dir, etc.)
+# and inserted them into v_default_settings with empty values.
+#
+# The second run of upgrade.php --defaults (after FreeSWITCH starts) only
+# adds MISSING settings — it does NOT update existing ones. So the empty
+# values persist even after FreeSWITCH is running.
+#
+# The fix: delete all switch default settings so they can be recreated
+# correctly by the second upgrade.php --defaults run.
 # =============================================================================
 
-verbose "  Switch DB directory in default settings: /var/lib/freeswitch/db (unchanged)"
+verbose "Deleting empty switch default settings (will be recreated by upgrade.php --defaults)..."
+
+runuser -u postgres -- psql -d "$database_name" -c \
+    "DELETE FROM v_default_settings WHERE default_setting_category = 'switch';" 2>/dev/null \
+    || verbose "  switch default settings deletion skipped (table may not exist yet)"
+
+verbose "  Switch default settings deleted (will be recreated with correct values)"
 
 # Unset PGPASSWORD for security
 unset PGPASSWORD
 
 # =============================================================================
 # Remove SQLite database files
-# These will be recreated in /var/lib/freeswitch/db on next FreeSWITCH start.
+# Since we use PostgreSQL for all FreeSWITCH databases, SQLite files are
+# no longer needed. Remove them to avoid confusion.
 # =============================================================================
 
 _dbs="/var/lib/freeswitch/db/core.db /var/lib/freeswitch/db/fifo.db /var/lib/freeswitch/db/call_limit.db"
@@ -251,7 +278,7 @@ verbose "  DSN in vars.xml:    yes"
 verbose "  DSN in v_vars DB:   yes (dsn_system, dsn, dsn_callcenter)"
 verbose "  SIP odbc-dsn:       enabled"
 verbose "  DSN system:         pgsql://$database_host:$database_port/$database_name"
-verbose "  DSN core:           sqlite:///var/lib/freeswitch/db/core.db"
-verbose "  DSN callcenter:     sqlite:///var/lib/freeswitch/db/callcenter.db"
-verbose "  Switch DB dir:      /var/lib/freeswitch/db"
+verbose "  DSN core:           pgsql://$database_host:$database_port/$database_name"
+verbose "  DSN callcenter:     pgsql://$database_host:$database_port/$database_name"
+verbose "  Switch settings:    deleted (will be recreated by upgrade.php --defaults)"
 verbose ""
