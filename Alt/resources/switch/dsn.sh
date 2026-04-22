@@ -98,16 +98,17 @@ if [ -f "$_switch_conf" ]; then
 fi
 
 # =============================================================================
-# Update FusionPBX config to use shared memory for switch DB
-# This improves performance by placing FreeSWITCH's SQLite databases
-# in shared memory (/dev/shm) instead of on disk.
+# FusionPBX config already uses /var/lib/freeswitch/db for switch DB
+#
+# NOTE: The Debian installer moves FreeSWITCH's SQLite databases to /dev/shm
+# (shared memory) for better performance. However, on Alt Linux, SQLite's
+# file locking mechanism (fcntl F_SETLK) does not work correctly on tmpfs,
+# causing "attempt to write a readonly database" errors. This prevents modules
+# like mod_local_stream from registering their interfaces.
+# Therefore, we keep the default /var/lib/freeswitch/db path on Alt Linux.
 # =============================================================================
 
-_fpbx_config="/var/www/fusionpbx/resources/config.conf"
-if [ -f "$_fpbx_config" ]; then
-    sed -i "$_fpbx_config" -e 's:/var/lib/freeswitch/db:/dev/shm:'
-    verbose "  FusionPBX switch DB directory set to /dev/shm"
-fi
+verbose "  Switch DB directory: /var/lib/freeswitch/db (standard path, not /dev/shm)"
 
 # =============================================================================
 # Add DSN variables to vars.xml
@@ -125,8 +126,8 @@ if [ -f "$_vars_xml" ]; then
 
         # Build the DSN connection strings
         _dsn_system="pgsql://hostaddr=$database_host port=$database_port dbname=$database_name user=$database_username password=$database_password options="
-        _dsn="sqlite:///dev/shm/core.db"
-        _dsn_callcenter="sqlite:///dev/shm/callcenter.db"
+        _dsn="sqlite:///var/lib/freeswitch/db/core.db"
+        _dsn_callcenter="sqlite:///var/lib/freeswitch/db/callcenter.db"
 
         echo "" >> "$_vars_xml"
         echo "<!-- DSN -->" >> "$_vars_xml"
@@ -155,8 +156,8 @@ verbose "Inserting DSN variables into database (v_vars table)..."
 
 # Build the DSN connection strings (same as what goes into vars.xml)
 _dsn_system="pgsql://hostaddr=$database_host port=$database_port dbname=$database_name user=$database_username password=$database_password options="
-_dsn="sqlite:///dev/shm/core.db"
-_dsn_callcenter="sqlite:///dev/shm/callcenter.db"
+_dsn="sqlite:///var/lib/freeswitch/db/core.db"
+_dsn_callcenter="sqlite:///var/lib/freeswitch/db/callcenter.db"
 
 # Set PGPASSWORD for psql commands
 export PGPASSWORD=$database_password
@@ -200,24 +201,21 @@ runuser -u postgres -- psql -d "$database_name" -c \
     || verbose "  SIP profile odbc-dsn update skipped (table may not exist yet)"
 
 # =============================================================================
-# Update the switch DB directory in default settings
-# The Debian installer updates v_default_settings to set the switch DB
-# directory to /dev/shm instead of /var/lib/freeswitch/db
+# Switch DB directory stays at /var/lib/freeswitch/db on Alt Linux
+#
+# The Debian installer changes this to /dev/shm for performance, but on
+# Alt Linux, SQLite file locking does not work correctly on tmpfs, causing
+# "readonly database" errors. We keep the standard path.
 # =============================================================================
 
-verbose "Updating switch DB directory in default settings..."
-
-runuser -u postgres -- psql -d "$database_name" -c \
-    "UPDATE v_default_settings SET default_setting_value = '/dev/shm'
-     WHERE default_setting_category = 'switch' AND default_setting_subcategory = 'db';" 2>/dev/null \
-    || verbose "  Default settings update skipped (table may not exist yet)"
+verbose "  Switch DB directory in default settings: /var/lib/freeswitch/db (unchanged)"
 
 # Unset PGPASSWORD for security
 unset PGPASSWORD
 
 # =============================================================================
 # Remove SQLite database files
-# These will be recreated in shared memory (/dev/shm) on next FreeSWITCH start.
+# These will be recreated in /var/lib/freeswitch/db on next FreeSWITCH start.
 # =============================================================================
 
 _dbs="/var/lib/freeswitch/db/core.db /var/lib/freeswitch/db/fifo.db /var/lib/freeswitch/db/call_limit.db"
@@ -253,7 +251,7 @@ verbose "  DSN in vars.xml:    yes"
 verbose "  DSN in v_vars DB:   yes (dsn_system, dsn, dsn_callcenter)"
 verbose "  SIP odbc-dsn:       enabled"
 verbose "  DSN system:         pgsql://$database_host:$database_port/$database_name"
-verbose "  DSN core:           sqlite:///dev/shm/core.db"
-verbose "  DSN callcenter:     sqlite:///dev/shm/callcenter.db"
-verbose "  Switch DB dir:      /dev/shm (shared memory)"
+verbose "  DSN core:           sqlite:///var/lib/freeswitch/db/core.db"
+verbose "  DSN callcenter:     sqlite:///var/lib/freeswitch/db/callcenter.db"
+verbose "  Switch DB dir:      /var/lib/freeswitch/db"
 verbose ""

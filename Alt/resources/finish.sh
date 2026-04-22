@@ -110,13 +110,11 @@ if [ -f "$_fpbx_res_config" ]; then
     verbose "  resources/config.conf also updated with database credentials"
 fi
 
-# IMPORTANT: dsn.sh changes the switch DB directory from /var/lib/freeswitch/db
-# to /dev/shm (shared memory for better performance). We must apply the same
-# change to /etc/fusionpbx/config.conf (the primary config location).
-# dsn.sh already updated /var/www/fusionpbx/resources/config.conf, but
-# finish.sh just copied the original template to /etc/fusionpbx/config.conf.
-sed -i /etc/fusionpbx/config.conf -e 's:/var/lib/freeswitch/db:/dev/shm:'
-verbose "  /etc/fusionpbx/config.conf: switch DB directory set to /dev/shm"
+# IMPORTANT: On Alt Linux, we keep the switch DB directory at /var/lib/freeswitch/db
+# instead of moving it to /dev/shm (shared memory). The Debian installer uses /dev/shm
+# for performance, but on Alt Linux, SQLite's file locking (fcntl F_SETLK) does not
+# work correctly on tmpfs, causing "attempt to write a readonly database" errors.
+# The config.conf template already has the correct /var/lib/freeswitch/db path.
 
 # =============================================================================
 # Verify PHP can connect to PostgreSQL via PDO
