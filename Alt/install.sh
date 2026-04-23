@@ -20,6 +20,7 @@
 #   ./install.sh --use-switch-source          # Build FreeSWITCH from source
 #   ./install.sh --use-switch-master          # Use FreeSWITCH master branch
 #   ./install.sh --no-cpu-check               # Skip CPU validation
+#   ./install.sh --proxy 192.168.0.1:8080     # Use HTTP proxy
 #   ./install.sh -h                           # Show help
 
 # Determine the script directory (robust against symlinks and unusual paths)
@@ -40,6 +41,15 @@ if [ "$CPU_CHECK" = "false" ]; then
     verbose "CPU check skipped (--no-cpu-check)"
 fi
 
+# Configure proxy (MUST run before any network operations)
+# Sets environment variables, APT config, git config, wget/curl config.
+# Safe no-op if --proxy was not specified.
+# IMPORTANT: This is SOURCED (not executed) so that exported environment
+# variables (http_proxy, https_proxy, etc.) propagate to install.sh and
+# all subsequent subprocess calls. Running it as a subprocess would lose
+# the env vars when proxy.sh exits.
+. ./resources/proxy.sh
+
 # Banner
 verbose "========================================="
 verbose " FusionPBX Installer for Alt Linux"
@@ -52,6 +62,9 @@ verbose "  FreeSWITCH:    $switch_branch ($([ "$switch_package" = "true" ] && ec
 verbose "  PostgreSQL:    $database_version ($pg_package)"
 verbose "  Web user:      $web_user:$web_group"
 verbose "  FS user:       $fs_user:$fs_group"
+if [ -n "$PROXY_SERVER" ]; then
+    verbose "  Proxy:         $PROXY_SERVER"
+fi
 verbose ""
 verbose "Starting installation..."
 verbose ""
