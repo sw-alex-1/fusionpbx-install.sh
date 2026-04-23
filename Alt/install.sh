@@ -64,55 +64,55 @@ verbose ""
 
 # Step 1: System preparation (update, base packages, cdrom cleanup)
 verbose ""
-verbose "=== Step 1/11: System preparation ==="
+verbose "=== Step 1/12: System preparation ==="
 resources/pre-install.sh
 
 # Step 2: PHP and PHP-FPM
 verbose ""
-verbose "=== Step 2/11: Installing PHP ==="
+verbose "=== Step 2/12: Installing PHP ==="
 resources/php.sh
 
 # Step 3: NGINX web server
 verbose ""
-verbose "=== Step 3/11: Installing NGINX ==="
+verbose "=== Step 3/12: Installing NGINX ==="
 resources/nginx.sh
 
 # Step 4: PostgreSQL database
 verbose ""
-verbose "=== Step 4/11: Installing PostgreSQL ==="
+verbose "=== Step 4/12: Installing PostgreSQL ==="
 resources/postgresql.sh
 
 # Step 5: FusionPBX application
 verbose ""
-verbose "=== Step 5/11: Installing FusionPBX ==="
+verbose "=== Step 5/12: Installing FusionPBX ==="
 resources/fusionpbx.sh
 resources/applications.sh
 
 # Step 6: FreeSWITCH
 verbose ""
-verbose "=== Step 6/11: Installing FreeSWITCH ==="
+verbose "=== Step 6/12: Installing FreeSWITCH ==="
 resources/switch.sh
 
 # Step 7: Firewall
 verbose ""
-verbose "=== Step 7/11: Configuring firewall ==="
+verbose "=== Step 7/12: Configuring firewall ==="
 resources/iptables.sh
 
 # Step 8: Fail2ban
 verbose ""
-verbose "=== Step 8/11: Configuring Fail2ban ==="
+verbose "=== Step 8/12: Configuring Fail2ban ==="
 resources/fail2ban.sh
 
 # Step 9: Additional services (sngrep, monit)
 verbose ""
-verbose "=== Step 9/11: Additional services ==="
+verbose "=== Step 9/12: Additional services ==="
 resources/sngrep.sh
 resources/monit.sh
 
 # Step 10: Finish (database schema, admin user, service startup)
 # This step creates the database tables (v_vars, v_domains, etc.)
 verbose ""
-verbose "=== Step 10/11: Finalizing installation ==="
+verbose "=== Step 10/12: Finalizing installation ==="
 resources/finish.sh
 
 # Step 11: FreeSWITCH DSN Configuration
@@ -120,16 +120,57 @@ resources/finish.sh
 # which is created by upgrade.php --schema in finish.sh.
 # This configures FreeSWITCH to use PostgreSQL instead of SQLite.
 verbose ""
-verbose "=== Step 11/11: Configuring FreeSWITCH database ==="
+verbose "=== Step 11/12: Configuring FreeSWITCH database ==="
 resources/switch/dsn.sh
 
-# =============================================================================
-# Final restart of FreeSWITCH with DSN configured
-# =============================================================================
+# Step 12: Post-start configuration
+# MUST run AFTER FreeSWITCH has been started with DSN configuration.
+# This step fixes the chicken-and-egg problem where FreeSWITCH must be
+# running to provide switch settings, but music_on_hold app_defaults
+# needs those settings to populate v_music_on_hold.
+#
+# Flow:
+#   1. Start FreeSWITCH with DSN configuration
+#   2. Wait for FreeSWITCH to be ready (event socket)
+#   3. Run music-on-hold.sh (fixes switch settings, populates v_music_on_hold)
+#   4. Final restart of FreeSWITCH with all configuration in place
 
-verbose "Restarting FreeSWITCH with DSN configuration..."
+verbose ""
+verbose "=== Step 12/12: Post-start configuration ==="
+
+# Start FreeSWITCH with DSN configuration
+verbose "Starting FreeSWITCH with DSN configuration..."
 systemctl restart freeswitch || warn "FreeSWITCH restart failed"
-verbose "FreeSWITCH restarted with PostgreSQL DSN"
+
+# Wait for FreeSWITCH to be ready (event socket)
+# FreeSWITCH takes time to start — wait up to 90 seconds
+verbose "Waiting for FreeSWITCH to be ready..."
+_fs_ready=0
+for _i in $(seq 1 45); do
+    if fs_cli -x "status" >/dev/null 2>&1; then
+        _fs_ready=1
+        verbose "  FreeSWITCH is ready (took ~$((_i * 2)) seconds)"
+        break
+    fi
+    sleep 2
+done
+
+if [ "$_fs_ready" -eq 0 ]; then
+    warn "FreeSWITCH did not become ready within 90 seconds"
+    warn "Post-start configuration may not work correctly"
+    warn "Continuing anyway — music_on_hold will use SQL fallback"
+fi
+
+# Now FreeSWITCH is running — apply post-start configuration
+# This populates v_music_on_hold, fixes switch settings, creates symlink, etc.
+verbose "Running post-start configuration..."
+resources/switch/music-on-hold.sh
+
+# Final restart of FreeSWITCH with all configuration in place
+# This ensures mod_local_stream loads with the correct v_music_on_hold data
+verbose "Final restart of FreeSWITCH with complete configuration..."
+systemctl restart freeswitch || warn "FreeSWITCH final restart failed"
+verbose "FreeSWITCH restarted with complete configuration"
 
 # =============================================================================
 # Wait for FreeSWITCH to fully start

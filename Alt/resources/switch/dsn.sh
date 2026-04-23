@@ -118,6 +118,14 @@ fi
 
 verbose "  Using PostgreSQL for all FreeSWITCH databases (avoids SQLite issues on Alt Linux)"
 
+# Build the DSN connection strings
+# ALL FreeSWITCH databases use the same PostgreSQL database as FusionPBX.
+# This is simpler and more robust than using a separate 'freeswitch' database,
+# and avoids the need to create/manage an additional database.
+_dsn_system="pgsql://hostaddr=$database_host port=$database_port dbname=$database_name user=$database_username password=$database_password options="
+_dsn="$_dsn_system"
+_dsn_callcenter="$_dsn_system"
+
 # =============================================================================
 # Add DSN variables to vars.xml
 # These variables are referenced by the odbc-dsn parameters above.
@@ -131,13 +139,6 @@ if [ -f "$_vars_xml" ]; then
     # Check if DSN variables already exist (idempotent)
     if ! grep -q 'dsn_system' "$_vars_xml" 2>/dev/null; then
         verbose "  Adding DSN variables to vars.xml"
-
-        # Build the DSN connection strings
-        # ALL FreeSWITCH databases use PostgreSQL on Alt Linux (not SQLite)
-        # to avoid the "readonly database" issue with SQLite file locking.
-        _dsn_system="pgsql://hostaddr=$database_host port=$database_port dbname=$database_name user=$database_username password=$database_password options="
-        _dsn="$_dsn_system"
-        _dsn_callcenter="$_dsn_system"
 
         echo "" >> "$_vars_xml"
         echo "<!-- DSN -->" >> "$_vars_xml"
@@ -163,12 +164,6 @@ fi
 # =============================================================================
 
 verbose "Inserting DSN variables into database (v_vars table)..."
-
-# Build the DSN connection strings (same as what goes into vars.xml)
-# ALL FreeSWITCH databases use PostgreSQL on Alt Linux
-_dsn_system="pgsql://hostaddr=$database_host port=$database_port dbname=$database_name user=$database_username password=$database_password options="
-_dsn="$_dsn_system"
-_dsn_callcenter="$_dsn_system"
 
 # Set PGPASSWORD for psql commands
 export PGPASSWORD=$database_password
@@ -281,4 +276,8 @@ verbose "  DSN system:         pgsql://$database_host:$database_port/$database_n
 verbose "  DSN core:           pgsql://$database_host:$database_port/$database_name"
 verbose "  DSN callcenter:     pgsql://$database_host:$database_port/$database_name"
 verbose "  Switch settings:    deleted (will be recreated by upgrade.php --defaults)"
+verbose ""
+verbose "  Note: On Debian, core and callcenter use SQLite in /dev/shm."
+verbose "  Alt Linux uses PostgreSQL for all databases due to SQLite"
+verbose "  readonly issues on /dev/shm with the _nginx user."
 verbose ""
