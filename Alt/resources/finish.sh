@@ -3,6 +3,11 @@
 # FusionPBX Alt Linux Installer - Finish
 # Final step: database schema, admin user, service configuration, and startup.
 #
+# This script matches the Debian installer's finish.sh flow.
+# FreeSWITCH is already running (started by package-systemd.sh in switch.sh)
+# which means upgrade.php --defaults can access the event socket and populate
+# switch settings correctly — including v_music_on_hold.
+#
 # Alt Linux specifics:
 #   - Web user: _nginx:_nginx (NOT www-data:www-data)
 #   - FreeSWITCH user: _nginx:_nginx (same as web user, like Debian's www-data)
@@ -10,10 +15,6 @@
 #   - tmpfiles.d for /var/run/fusionpbx persistence across reboots
 #   - upgrade.php --permissions uses 'www-data' — must do manual chown instead
 #   - PHP CLI must have pdo_pgsql loaded for FusionPBX DB access
-#
-# IMPORTANT: FreeSWITCH is NOT restarted in this script.
-# It will be restarted in install.sh AFTER dsn.sh runs (which requires
-# the v_vars table created by upgrade.php --schema in this script).
 
 # Determine script directory
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -82,8 +83,7 @@ sed -i "s/zzz/$database_password/g" /etc/cron.daily/fusionpbx-maintenance
 
 # =============================================================================
 # FusionPBX configuration
-# Deploy config.conf to BOTH /etc/fusionpbx/ AND /var/www/fusionpbx/resources/
-# to ensure FusionPBX can always find it regardless of which path it checks.
+# Deploy config.conf to /etc/fusionpbx/
 # =============================================================================
 
 verbose "Configuring FusionPBX..."
@@ -99,22 +99,14 @@ sed -i /etc/fusionpbx/config.conf -e s:"{database_username}:$database_username:"
 sed -i /etc/fusionpbx/config.conf -e s:"{database_password}:$database_password:"
 
 # Also update the resources/ fallback config with real values
-# (dsn.sh may have modified this file, so update it in-place)
 _fpbx_res_config="/var/www/fusionpbx/resources/config.conf"
 if [ -f "$_fpbx_res_config" ]; then
-    # Replace placeholders if they still exist
     sed -i "$_fpbx_res_config" -e s:"{database_host}:$database_host:"
     sed -i "$_fpbx_res_config" -e s:"{database_name}:$database_name:"
     sed -i "$_fpbx_res_config" -e s:"{database_username}:$database_username:"
     sed -i "$_fpbx_res_config" -e s:"{database_password}:$database_password:"
     verbose "  resources/config.conf also updated with database credentials"
 fi
-
-# IMPORTANT: On Alt Linux, we keep the switch DB directory at /var/lib/freeswitch/db
-# instead of moving it to /dev/shm (shared memory). The Debian installer uses /dev/shm
-# for performance, but on Alt Linux, SQLite's file locking (fcntl F_SETLK) does not
-# work correctly on tmpfs, causing "attempt to write a readonly database" errors.
-# The config.conf template already has the correct /var/lib/freeswitch/db path.
 
 # =============================================================================
 # Verify PHP can connect to PostgreSQL via PDO
@@ -158,9 +150,7 @@ try {
 if echo "$_pdo_test" | grep -q "^OK"; then
     verbose "  PDO connection to PostgreSQL: successful"
 else
-    pdo_drivers=$(\$_php_cmd -r 'print_r(PDO::getAvailableDrivers());' 2>/dev/null)
     error "PDO connection test FAILED: $_pdo_test"
-    error "Available PDO drivers: $pdo_drivers"
     die "Cannot proceed — PHP cannot connect to PostgreSQL via PDO. Check the error above."
 fi
 
@@ -205,10 +195,12 @@ psql --host=$database_host --port=$database_port --username=$database_username -
     "insert into v_domains (domain_uuid, domain_name, domain_enabled) values('$domain_uuid', '$domain_name', 'true');"
 
 # =============================================================================
-# App defaults
+# App defaults (1st run)
+# FreeSWITCH is already running, so event socket is available.
+# This means switch settings will be populated correctly.
 # =============================================================================
 
-verbose "Running app defaults..."
+verbose "Running app defaults (1st run)..."
 
 cd /var/www/fusionpbx && /usr/bin/php /var/www/fusionpbx/core/upgrade/upgrade.php --defaults
 
@@ -262,12 +254,24 @@ sed -i /etc/freeswitch/autoload_configs/xml_cdr.conf.xml -e s:"{v_user}:$xml_cdr
 sed -i /etc/freeswitch/autoload_configs/xml_cdr.conf.xml -e s:"{v_pass}:$xml_cdr_password:"
 
 # =============================================================================
-# Update app defaults
+# Update app defaults (2nd run)
+# Matches Debian: runs upgrade.php --defaults a second time after
+# domain, user, and xml_cdr are configured.
 # =============================================================================
 
-verbose "Updating app defaults..."
+verbose "Updating app defaults (2nd run)..."
 
 cd /var/www/fusionpbx && /usr/bin/php /var/www/fusionpbx/core/upgrade/upgrade.php --defaults
+
+# =============================================================================
+# Verify v_music_on_hold was populated
+# If FreeSWITCH is running and app_defaults worked correctly, v_music_on_hold
+# should have entries. If it's still empty (edge case), the fallback script
+# will insert default entries via SQL.
+# =============================================================================
+
+verbose "Verifying music on hold configuration..."
+switch/music-on-hold.sh
 
 # =============================================================================
 # Set file permissions manually
@@ -310,6 +314,15 @@ EOF
 verbose "  Created /etc/tmpfiles.d/fusionpbx.conf"
 
 # =============================================================================
+# Restart FreeSWITCH (matches Debian)
+# After --defaults and --permissions, restart FreeSWITCH so it picks up
+# all the configuration changes made by upgrade.php.
+# =============================================================================
+
+verbose "Restarting FreeSWITCH..."
+systemctl restart freeswitch || warn "FreeSWITCH restart failed"
+
+# =============================================================================
 # Install cron (required for FusionPBX scheduled tasks and cron.daily scripts)
 # =============================================================================
 
@@ -333,7 +346,6 @@ cd /var/www/fusionpbx && /usr/bin/php /var/www/fusionpbx/core/upgrade/upgrade.ph
     warn "FusionPBX services installation had errors (some services may need manual setup)"
 
 # Patch any generated service files that reference www-data (doesn't exist on Alt Linux)
-# FusionPBX --services may create systemd service files or cron files with www-data
 verbose "Patching FusionPBX service files for Alt Linux user (${web_user})..."
 for _svc_file in /etc/systemd/system/fusionpbx*.service /lib/systemd/system/fusionpbx*.service; do
     if [ -f "$_svc_file" ]; then
@@ -367,33 +379,14 @@ for _svc in nginx "php${php_version}-fpm" postgresql freeswitch memcached; do
 done
 
 # =============================================================================
-# Restart ALL services (ensure correct order and fresh state)
-# Order: PostgreSQL first, then PHP-FPM, then nginx, then FreeSWITCH
+# Final restart of nginx and FreeSWITCH (matches Debian)
+# After services are installed and all configuration is complete,
+# do a final restart of both nginx and FreeSWITCH.
 # =============================================================================
 
-verbose "Restarting all services (correct order)..."
-
-# PostgreSQL must be running first
-verbose "  Restarting PostgreSQL..."
-systemctl restart postgresql || warn "PostgreSQL restart failed"
-
-# Wait for PostgreSQL to be ready
-wait_for_service postgresql 15 || warn "PostgreSQL not ready after 15s"
-
-# PHP-FPM must be running before nginx tries to connect
-verbose "  Restarting PHP-FPM..."
-systemctl restart "php${php_version}-fpm" || warn "PHP-FPM restart failed"
-
-# nginx connects to PHP-FPM via socket
-verbose "  Restarting nginx..."
-systemctl restart nginx || warn "nginx restart failed"
-
-# FreeSWITCH is NOT restarted here — it will be restarted in install.sh
-# AFTER dsn.sh configures the PostgreSQL DSN. Starting FreeSWITCH now
-# without DSN configuration would cause database connection failures.
-verbose "  FreeSWITCH: will be started after DSN configuration (step 11)"
-
-verbose "  PostgreSQL, PHP-FPM, and nginx restarted"
+verbose "Final restart of nginx and FreeSWITCH..."
+systemctl restart nginx freeswitch || warn "nginx/FreeSWITCH restart had issues"
+verbose "  nginx and FreeSWITCH restarted"
 
 # =============================================================================
 # Welcome message

@@ -15,6 +15,13 @@
 # that FusionPBX (also running as www-data via PHP-FPM) can read and write
 # FreeSWITCH configuration files. We replicate this on Alt Linux by running
 # FreeSWITCH as _nginx.
+#
+# IMPORTANT: FreeSWITCH is started here (during switch.sh), BEFORE finish.sh.
+# This matches the Debian installer's approach and is critical because:
+#   1. upgrade.php --defaults needs the event socket to get switch paths
+#   2. app_defaults (music_on_hold, etc.) need switch settings populated
+#   3. FreeSWITCH starts with default SQLite config, then dsn.sh later
+#      switches it to PostgreSQL and restarts
 
 # Determine script directory
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -115,15 +122,44 @@ fi
 
 # =============================================================================
 # Enable and start the service
+#
+# START FreeSWITCH NOW, just like the Debian installer does.
+# FreeSWITCH starts with default SQLite configuration. Later, dsn.sh will
+# switch it to PostgreSQL and restart.
+#
+# This is CRITICAL: upgrade.php --defaults (in finish.sh) needs the event
+# socket to get switch paths (mod_dir, sounds_dir, etc.). Without FreeSWITCH
+# running, all switch settings get empty values, breaking:
+#   - Module list in the web UI
+#   - v_music_on_hold (empty → mod_local_stream CRIT error)
+#   - Any other app_defaults that depend on switch settings
 # =============================================================================
 
 systemctl daemon-reload
 systemctl unmask "$_fs_service" 2>/dev/null || true
 systemctl enable "$_fs_service" 2>/dev/null || warn "Failed to enable $_fs_service"
 
-# Don't start FreeSWITCH yet - dsn.sh needs to configure it first
-# It will be started by finish.sh after all configuration is complete
-verbose "FreeSWITCH service enabled (will be started in finish.sh after configuration)"
+verbose "Starting FreeSWITCH (with default SQLite config)..."
+systemctl start "$_fs_service" 2>/dev/null || warn "FreeSWITCH start failed (will retry later)"
+
+# Wait for FreeSWITCH to become ready (event socket)
+# FreeSWITCH takes time to start — wait up to 60 seconds
+verbose "Waiting for FreeSWITCH event socket..."
+_fs_ready=0
+for _i in $(seq 1 30); do
+    if fs_cli -x "status" >/dev/null 2>&1; then
+        _fs_ready=1
+        verbose "  FreeSWITCH is ready (took ~$((_i * 2)) seconds)"
+        break
+    fi
+    sleep 2
+done
+
+if [ "$_fs_ready" -eq 0 ]; then
+    warn "FreeSWITCH did not start within 60 seconds"
+    warn "This may cause issues with upgrade.php --defaults in finish.sh"
+    warn "FreeSWITCH will be restarted later after DSN configuration"
+fi
 
 # =============================================================================
 # Summary
@@ -135,5 +171,5 @@ verbose "  Unit file:  $_fs_unit_alt"
 verbose "  Default:    $_fs_default"
 verbose "  User:       $fs_user"
 verbose "  Group:      $fs_group"
-verbose "  Service:    $_fs_service (enabled, not yet started)"
+verbose "  Service:    $_fs_service (enabled, $([ "$_fs_ready" -eq 1 ] && echo "running" || echo "starting"))"
 verbose ""

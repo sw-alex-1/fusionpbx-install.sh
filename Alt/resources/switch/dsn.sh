@@ -4,18 +4,9 @@
 # Configures FreeSWITCH to use PostgreSQL for its internal databases
 # instead of SQLite. Mirrors the Debian installer's dsn.sh logic.
 #
-# CRITICAL: This script does TWO things that the previous version missed:
-#   1. Adds DSN variables to vars.xml (FreeSWITCH reads these on startup)
-#   2. Inserts DSN variables into the v_vars database table (FusionPBX reads
-#      these to generate XML configs for FreeSWITCH via the XML handler)
-#   3. Enables odbc-dsn in SIP profiles via SQL UPDATE
-#
-# Without step 2, FreeSWITCH cannot build the correct DSN connection strings
-# from the database, and FusionPBX cannot configure FreeSWITCH's database
-# connections dynamically. This was the ROOT CAUSE of:
-#   - "Failure to connect to CORE_DB pgsql://..." errors
-#   - Modules count = 0 in FusionPBX dashboard
-#   - "uncontrollable" system behavior
+# This script runs AFTER finish.sh, which has already run upgrade.php --defaults
+# with FreeSWITCH running. The switch settings should already be correct.
+# This script switches FreeSWITCH from SQLite to PostgreSQL and restarts it.
 
 # Determine script directory
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -155,10 +146,10 @@ fi
 # =============================================================================
 # CRITICAL: Insert DSN variables into the database (v_vars table)
 #
-# This is what the Debian installer does but was MISSING from the Alt installer.
-# FusionPBX uses these database records to generate FreeSWITCH XML configuration
-# dynamically via the XML handler. Without them, FreeSWITCH cannot connect to
-# PostgreSQL and the system is "uncontrollable" from the FusionPBX web interface.
+# This is what the Debian installer does. FusionPBX uses these database
+# records to generate FreeSWITCH XML configuration dynamically via the
+# XML handler. Without them, FreeSWITCH cannot connect to PostgreSQL and
+# the system is "uncontrollable" from the FusionPBX web interface.
 #
 # These UUIDs are the SAME as in the Debian installer to ensure consistency.
 # =============================================================================
@@ -208,36 +199,25 @@ runuser -u postgres -- psql -d "$database_name" -c \
     || verbose "  SIP profile odbc-dsn update skipped (table may not exist yet)"
 
 # =============================================================================
-# Update v_default_settings: delete empty switch settings
-#
-# When upgrade.php --defaults ran the first time (before FreeSWITCH started),
-# the event socket was not available. The switch_settings::settings() method
-# got empty values for all switch paths (mod_dir, db_dir, sounds_dir, etc.)
-# and inserted them into v_default_settings with empty values.
-#
-# The second run of upgrade.php --defaults (after FreeSWITCH starts) only
-# adds MISSING settings — it does NOT update existing ones. So the empty
-# values persist even after FreeSWITCH is running.
-#
-# The fix: delete all switch default settings so they can be recreated
-# correctly by the second upgrade.php --defaults run.
+# Update the switch DB directory in default settings
+# The Debian installer updates v_default_settings to set the switch DB
+# directory to /dev/shm instead of /var/lib/freeswitch/db.
 # =============================================================================
 
-verbose "Deleting empty switch default settings (will be recreated by upgrade.php --defaults)..."
+verbose "Updating switch DB directory in default settings..."
 
 runuser -u postgres -- psql -d "$database_name" -c \
-    "DELETE FROM v_default_settings WHERE default_setting_category = 'switch';" 2>/dev/null \
-    || verbose "  switch default settings deletion skipped (table may not exist yet)"
-
-verbose "  Switch default settings deleted (will be recreated with correct values)"
+    "UPDATE v_default_settings SET default_setting_value = '/dev/shm'
+     WHERE default_setting_category = 'switch' AND default_setting_subcategory = 'db';" 2>/dev/null \
+    || verbose "  Default settings update skipped (table may not exist yet)"
 
 # Unset PGPASSWORD for security
 unset PGPASSWORD
 
 # =============================================================================
 # Remove SQLite database files
-# Since we use PostgreSQL for all FreeSWITCH databases, SQLite files are
-# no longer needed. Remove them to avoid confusion.
+# These will be recreated in shared memory (/dev/shm) or replaced by
+# PostgreSQL on the next FreeSWITCH start.
 # =============================================================================
 
 _dbs="/var/lib/freeswitch/db/core.db /var/lib/freeswitch/db/fifo.db /var/lib/freeswitch/db/call_limit.db"
@@ -257,6 +237,36 @@ for _db in /var/lib/freeswitch/db/sofia_reg_*; do
 done
 
 # =============================================================================
+# Create symlink /usr/local/etc/fusionpbx → /etc/fusionpbx
+# FusionPBX's Lua scripts look for config.conf at the hardcoded path
+# /usr/local/etc/fusionpbx/config.conf. On Alt Linux, config.conf is
+# at /etc/fusionpbx/config.conf. The symlink ensures Lua scripts can
+# find the configuration.
+# =============================================================================
+
+verbose "Creating config.conf path symlink for Lua scripts..."
+
+_local_etc_fpbx="/usr/local/etc/fusionpbx"
+_etc_fpbx="/etc/fusionpbx"
+
+if [ -f "$_etc_fpbx/config.conf" ]; then
+    if [ ! -e "$_local_etc_fpbx" ]; then
+        mkdir -p /usr/local/etc
+        ln -s "$_etc_fpbx" "$_local_etc_fpbx"
+        verbose "  Symlink created: $_local_etc_fpbx -> $_etc_fpbx"
+    elif [ -L "$_local_etc_fpbx" ]; then
+        verbose "  Symlink already exists: $_local_etc_fpbx -> $(readlink "$_local_etc_fpbx")"
+    elif [ -d "$_local_etc_fpbx" ]; then
+        if [ ! -f "$_local_etc_fpbx/config.conf" ]; then
+            cp "$_etc_fpbx/config.conf" "$_local_etc_fpbx/config.conf"
+            verbose "  Copied config.conf to $_local_etc_fpbx"
+        fi
+    fi
+else
+    warn "  config.conf not found at $_etc_fpbx (skipping symlink creation)"
+fi
+
+# =============================================================================
 # Flush FusionPBX cache
 # =============================================================================
 
@@ -265,6 +275,20 @@ if [ -d "/var/cache/fusionpbx" ]; then
     verbose "  FusionPBX cache flushed"
 fi
 
+# =============================================================================
+# Restart FreeSWITCH with PostgreSQL DSN
+# Now that DSN is configured in vars.xml and v_vars, FreeSWITCH will
+# connect to PostgreSQL instead of SQLite on the next start.
+# =============================================================================
+
+verbose "Restarting FreeSWITCH with PostgreSQL DSN..."
+systemctl restart freeswitch || warn "FreeSWITCH restart failed"
+verbose "FreeSWITCH restarted with PostgreSQL configuration"
+
+# =============================================================================
+# Summary
+# =============================================================================
+
 verbose ""
 verbose "FreeSWITCH DSN configuration summary:"
 verbose "  auto-create-schemas: enabled"
@@ -272,10 +296,11 @@ verbose "  odbc-dsn:           enabled (db, fifo, switch)"
 verbose "  DSN in vars.xml:    yes"
 verbose "  DSN in v_vars DB:   yes (dsn_system, dsn, dsn_callcenter)"
 verbose "  SIP odbc-dsn:       enabled"
+verbose "  Lua config symlink: $([ -L "$_local_etc_fpbx" ] && echo "yes" || echo "no")"
 verbose "  DSN system:         pgsql://$database_host:$database_port/$database_name"
 verbose "  DSN core:           pgsql://$database_host:$database_port/$database_name"
 verbose "  DSN callcenter:     pgsql://$database_host:$database_port/$database_name"
-verbose "  Switch settings:    deleted (will be recreated by upgrade.php --defaults)"
+verbose "  Switch DB dir:      /dev/shm (shared memory)"
 verbose ""
 verbose "  Note: On Debian, core and callcenter use SQLite in /dev/shm."
 verbose "  Alt Linux uses PostgreSQL for all databases due to SQLite"
