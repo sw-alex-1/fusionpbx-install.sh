@@ -274,7 +274,7 @@ cd /var/www/fusionpbx && /usr/bin/php /var/www/fusionpbx/core/upgrade/upgrade.ph
 # =============================================================================
 
 verbose "Verifying music on hold configuration..."
-switch/music-on-hold.sh || die "Music on hold configuration failed"
+"$SCRIPT_DIR/switch/music-on-hold.sh" || die "Music on hold configuration failed"
 
 # =============================================================================
 # Set file permissions manually
