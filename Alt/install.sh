@@ -35,11 +35,11 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
 # Includes - order matters: config first, then utilities, then environment
-. ./resources/config.sh
-. ./resources/colors.sh
-. ./resources/util.sh
-. ./resources/environment.sh
-. ./resources/arguments.sh
+. "$SCRIPT_DIR/resources/config.sh"
+. "$SCRIPT_DIR/resources/colors.sh"
+. "$SCRIPT_DIR/resources/util.sh"
+. "$SCRIPT_DIR/resources/environment.sh"
+. "$SCRIPT_DIR/resources/arguments.sh"
 
 # =============================================================================
 # Error tracking — counts failed steps for final summary
@@ -132,7 +132,7 @@ fi
 # Configure proxy (MUST run before any network operations)
 # =============================================================================
 
-. ./resources/proxy.sh
+. "$SCRIPT_DIR/resources/proxy.sh"
 
 # =============================================================================
 # Banner
@@ -169,47 +169,47 @@ verbose ""
 # =============================================================================
 
 # Step 1: System preparation (update, base packages, cdrom cleanup)
-run_step "1/11" "System preparation" resources/pre-install.sh
+run_step "1/11" "System preparation" "$SCRIPT_DIR/resources/pre-install.sh"
 
 # Step 2: PHP and PHP-FPM
-run_step "2/11" "Installing PHP" resources/php.sh
+run_step "2/11" "Installing PHP" "$SCRIPT_DIR/resources/php.sh"
 
 # Step 3: NGINX web server
-run_step "3/11" "Installing NGINX" resources/nginx.sh
+run_step "3/11" "Installing NGINX" "$SCRIPT_DIR/resources/nginx.sh"
 
 # Step 4: PostgreSQL database
-run_step "4/11" "Installing PostgreSQL" resources/postgresql.sh
+run_step "4/11" "Installing PostgreSQL" "$SCRIPT_DIR/resources/postgresql.sh"
 
 # Step 5: FusionPBX application
-run_step "5a/11" "Installing FusionPBX" resources/fusionpbx.sh
-run_step "5b/11" "Installing FusionPBX applications" resources/applications.sh
+run_step "5a/11" "Installing FusionPBX" "$SCRIPT_DIR/resources/fusionpbx.sh"
+run_step "5b/11" "Installing FusionPBX applications" "$SCRIPT_DIR/resources/applications.sh"
 
 # Step 6: FreeSWITCH
 # This step also STARTS FreeSWITCH (with default SQLite config).
 # FreeSWITCH must be running before finish.sh so that upgrade.php --defaults
 # can access the event socket and populate switch settings correctly.
-run_step "6/11" "Installing and starting FreeSWITCH" resources/switch.sh
+run_step "6/11" "Installing and starting FreeSWITCH" "$SCRIPT_DIR/resources/switch.sh"
 
 # Step 7: Firewall
-run_step "7/11" "Configuring firewall" resources/iptables.sh
+run_step "7/11" "Configuring firewall" "$SCRIPT_DIR/resources/iptables.sh"
 
 # Step 8: Fail2ban
-run_step "8/11" "Configuring Fail2ban" resources/fail2ban.sh
+run_step "8/11" "Configuring Fail2ban" "$SCRIPT_DIR/resources/fail2ban.sh"
 
 # Step 9: Additional services (sngrep, monit)
-run_step "9a/11" "Installing sngrep" resources/sngrep.sh
-run_step "9b/11" "Installing monit" resources/monit.sh
+run_step "9a/11" "Installing sngrep" "$SCRIPT_DIR/resources/sngrep.sh"
+run_step "9b/11" "Installing monit" "$SCRIPT_DIR/resources/monit.sh"
 
 # Step 10: Finish (database schema, admin user, upgrade.php)
 # FreeSWITCH is already running, so upgrade.php --defaults gets correct
 # switch paths from the event socket.
-run_step "10/11" "Finalizing installation" resources/finish.sh
+run_step "10/11" "Finalizing installation" "$SCRIPT_DIR/resources/finish.sh"
 
 # Step 11: FreeSWITCH DSN Configuration
 # Switches FreeSWITCH from SQLite to PostgreSQL for all databases.
 # MUST run AFTER finish.sh because it inserts data into v_vars table
 # which is created by upgrade.php --schema in finish.sh.
-run_step "11/11" "Configuring FreeSWITCH database (PostgreSQL)" resources/switch/dsn.sh
+run_step "11/11" "Configuring FreeSWITCH database (PostgreSQL)" "$SCRIPT_DIR/resources/switch/dsn.sh"
 
 # =============================================================================
 # Completion

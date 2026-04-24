@@ -13,9 +13,9 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
 # Includes
-. ../config.sh
-. ../colors.sh
-. ../util.sh
+. "$SCRIPT_DIR/../config.sh"
+. "$SCRIPT_DIR/../colors.sh"
+. "$SCRIPT_DIR/../util.sh"
 
 # =============================================================================
 # Read database credentials

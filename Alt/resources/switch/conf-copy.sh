@@ -10,9 +10,9 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
 # Includes
-. ../config.sh
-. ../colors.sh
-. ../util.sh
+. "$SCRIPT_DIR/../config.sh"
+. "$SCRIPT_DIR/../colors.sh"
+. "$SCRIPT_DIR/../util.sh"
 
 _fs_conf_dir="/etc/freeswitch"
 _fpbx_conf_source="/var/www/fusionpbx/app/switch/resources/conf"

@@ -16,10 +16,10 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
 # Includes
-. ./config.sh
-. ./colors.sh
-. ./util.sh
-. ./environment.sh
+. "$SCRIPT_DIR/config.sh"
+. "$SCRIPT_DIR/colors.sh"
+. "$SCRIPT_DIR/util.sh"
+. "$SCRIPT_DIR/environment.sh"
 
 # =============================================================================
 # Install PHP and required modules

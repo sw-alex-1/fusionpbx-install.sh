@@ -21,10 +21,10 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
 # Includes
-. ./config.sh
-. ./colors.sh
-. ./util.sh
-. ./environment.sh
+. "$SCRIPT_DIR/config.sh"
+. "$SCRIPT_DIR/colors.sh"
+. "$SCRIPT_DIR/util.sh"
+. "$SCRIPT_DIR/environment.sh"
 
 # =============================================================================
 # Database password
@@ -72,8 +72,8 @@ fi
 verbose "Installing backup and maintenance scripts..."
 
 # Copy backup scripts to cron.daily
-cp backup/fusionpbx-backup /etc/cron.daily/fusionpbx-backup
-cp backup/fusionpbx-maintenance /etc/cron.daily/fusionpbx-maintenance
+cp "$SCRIPT_DIR/backup/fusionpbx-backup" /etc/cron.daily/fusionpbx-backup
+cp "$SCRIPT_DIR/backup/fusionpbx-maintenance" /etc/cron.daily/fusionpbx-maintenance
 chmod 755 /etc/cron.daily/fusionpbx-backup
 chmod 755 /etc/cron.daily/fusionpbx-maintenance
 
@@ -90,7 +90,7 @@ verbose "Configuring FusionPBX..."
 
 # Deploy to /etc/fusionpbx/config.conf (primary location)
 ensure_dir "/etc/fusionpbx"
-cp fusionpbx/config.conf /etc/fusionpbx/config.conf
+cp "$SCRIPT_DIR/fusionpbx/config.conf" /etc/fusionpbx/config.conf
 
 # Replace placeholders with actual values
 sed -i /etc/fusionpbx/config.conf -e s:"{database_host}:$database_host:"
