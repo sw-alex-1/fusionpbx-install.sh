@@ -206,7 +206,7 @@ fi
 
 if [ "$database_host" = "127.0.0.1" ] || [ "$database_host" = "::1" ] || [ "$database_host" = "localhost" ]; then
     systemctl daemon-reload
-    service_enable_start "$pg_service"
+    service_enable_start_required "$pg_service"
 
     if ! wait_for_service "$pg_service" 30; then
         die "PostgreSQL service failed to start within 30 seconds. Check: journalctl -u $pg_service -n 50"

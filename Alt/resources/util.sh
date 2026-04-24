@@ -8,10 +8,14 @@
 # Error Handling
 # =============================================================================
 
-# Fatal error: print message and exit
+# Fatal error: print message and exit the script with code 1
+# This causes the calling install.sh to detect the failure via run_step()
+# and abort the entire installation.
 # Usage: die "error message"
 die() {
+    error ""
     error "FATAL: $1"
+    error ""
     exit 1
 }
 
@@ -38,14 +42,16 @@ pkg_is_installed() {
 }
 
 # Install packages idempotently - skips already installed packages
-# Usage: pkg_install package1 package2 ...
 # Returns: 0 on success, 1 if any package failed to install
+# This is the SOFT version — callers should check the return code
+# or use pkg_install_required for critical packages.
+# Usage: pkg_install package1 package2 ...
 pkg_install() {
     local _pi_failed=0
     local _pi_to_install=()
     local _pi_pkg
 
-    # Проверяем, какие пакеты нужно установить
+    # Check which packages need to be installed
     for _pi_pkg in "$@"; do
         if pkg_is_installed "$_pi_pkg"; then
             verbose "Package already installed: $_pi_pkg"
@@ -55,13 +61,13 @@ pkg_install() {
         fi
     done
 
-    # Если нет пакетов для установки, выходим успешно
+    # If no packages to install, exit successfully
     if [ ${#_pi_to_install[@]} -eq 0 ]; then
         verbose "All packages are already installed"
         return 0
     fi
 
-    # Обновляем кэш перед установкой (рекомендуется для ALT Linux)
+    # Update package cache before install (recommended for ALT Linux)
     verbose "Updating package index..."
     if ! apt-get update; then
         error "Failed to update package index"
@@ -69,7 +75,7 @@ pkg_install() {
         return $_pi_failed
     fi
 
-    # Устанавливаем все пакеты одной командой
+    # Install all packages in one command
     verbose "Installing packages: ${_pi_to_install[*]}"
     if ! apt-get install -y "${_pi_to_install[@]}"; then
         error "Failed to install some packages: ${_pi_to_install[*]}"
@@ -77,6 +83,53 @@ pkg_install() {
     fi
 
     return $_pi_failed
+}
+
+# Install required packages — FATAL on failure
+# Same as pkg_install but calls die() if any package fails to install.
+# Use this for packages that are absolutely required for the system to work.
+# Usage: pkg_install_required package1 package2 ...
+pkg_install_required() {
+    local _pir_pkg
+
+    # Check which packages need to be installed
+    local _pir_to_install=()
+    for _pir_pkg in "$@"; do
+        if pkg_is_installed "$_pir_pkg"; then
+            verbose "Package already installed: $_pir_pkg"
+        else
+            verbose "Will install package: $_pir_pkg"
+            _pir_to_install+=("$_pir_pkg")
+        fi
+    done
+
+    # If no packages to install, exit successfully
+    if [ ${#_pir_to_install[@]} -eq 0 ]; then
+        verbose "All required packages are already installed"
+        return 0
+    fi
+
+    # Update package cache before install
+    verbose "Updating package index..."
+    if ! apt-get update; then
+        die "Failed to update package index. Check your repository configuration and network connectivity."
+    fi
+
+    # Install all packages in one command
+    verbose "Installing required packages: ${_pir_to_install[*]}"
+    if ! apt-get install -y "${_pir_to_install[@]}"; then
+        die "Failed to install required packages: ${_pir_to_install[*]}. The installer cannot continue without them."
+    fi
+
+    # Verify all packages were actually installed
+    for _pir_pkg in "${_pir_to_install[@]}"; do
+        if ! pkg_is_installed "$_pir_pkg"; then
+            die "Package '$_pir_pkg' was not installed successfully. The installer cannot continue."
+        fi
+    done
+
+    verbose "All required packages installed successfully"
+    return 0
 }
 
 # Remove packages idempotently - skips packages that are not installed
@@ -162,6 +215,22 @@ service_enable_start() {
     systemctl restart "$_ses_svc" 2>/dev/null || warn "Failed to start service: $_ses_svc"
 }
 
+# Enable and start a CRITICAL systemd service — FATAL on failure
+# Use this for services that must be running for the installer to continue
+# (e.g. PostgreSQL, PHP-FPM, nginx).
+# Usage: service_enable_start_required <service_name>
+service_enable_start_required() {
+    _sesr_svc="$1"
+    verbose "Enabling service: $_sesr_svc"
+    if ! systemctl enable "$_sesr_svc" 2>/dev/null; then
+        warn "Failed to enable service: $_sesr_svc (may already be enabled)"
+    fi
+    verbose "Starting service: $_sesr_svc"
+    if ! systemctl restart "$_sesr_svc" 2>/dev/null; then
+        die "Failed to start required service: $_sesr_svc. Check: journalctl -u $_sesr_svc -n 50"
+    fi
+}
+
 # Restart a systemd service safely (start if not running, restart if running)
 # Usage: service_restart <service_name>
 # Safe for re-runs: handles both running and stopped states
@@ -173,6 +242,23 @@ service_restart() {
     else
         verbose "Starting service: $_sr_svc"
         systemctl start "$_sr_svc" || warn "Failed to start service: $_sr_svc"
+    fi
+}
+
+# Restart a CRITICAL service — FATAL on failure
+# Usage: service_restart_required <service_name>
+service_restart_required() {
+    _srr_svc="$1"
+    if systemctl is-active --quiet "$_srr_svc" 2>/dev/null; then
+        verbose "Restarting service: $_srr_svc"
+        if ! systemctl restart "$_srr_svc"; then
+            die "Failed to restart required service: $_srr_svc. Check: journalctl -u $_srr_svc -n 50"
+        fi
+    else
+        verbose "Starting service: $_srr_svc"
+        if ! systemctl start "$_srr_svc"; then
+            die "Failed to start required service: $_srr_svc. Check: journalctl -u $_srr_svc -n 50"
+        fi
     fi
 }
 
@@ -214,6 +300,16 @@ wait_for_service() {
     done
     error "Service $_wfs_svc did not become active within ${_wfs_timeout}s"
     return 1
+}
+
+# Wait for a CRITICAL service — FATAL on timeout
+# Usage: wait_for_service_required <service_name> [timeout_seconds]
+wait_for_service_required() {
+    _wfsr_svc="$1"
+    _wfsr_timeout="${2:-30}"
+    if ! wait_for_service "$_wfsr_svc" "$_wfsr_timeout"; then
+        die "Required service $_wfsr_svc failed to start within ${_wfsr_timeout}s. Check: journalctl -u $_wfsr_svc -n 50"
+    fi
 }
 
 # =============================================================================

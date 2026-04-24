@@ -118,14 +118,14 @@ verbose "Installing build dependencies..."
 # nasm: required by bundled libvpx (VP8/VP9 codec) which is built as part
 # of the FreeSWITCH core library. Without nasm, libvpx configure fails with:
 #   "Neither yasm nor nasm have been found"
-pkg_install gcc gcc-c++ make autoconf automake libtool pkg-config wget nasm
+pkg_install_required gcc gcc-c++ make autoconf automake libtool pkg-config wget nasm
 
 # FreeSWITCH core dependencies (required by configure even for minimal build)
-pkg_install libssl-devel libsqlite3-devel libpcre-devel libncurses-devel
-pkg_install libcurl-devel libedit-devel libjpeg-devel
+pkg_install_required libssl-devel libsqlite3-devel libpcre-devel libncurses-devel
+pkg_install_required libcurl-devel libedit-devel libjpeg-devel
 
 # PostgreSQL client development headers (CRITICAL for mod_pgsql)
-pkg_install libpq-devel
+pkg_install_required libpq-devel
 
 # Additional dependencies that may be needed by the core build
 # These are soft dependencies - install if available, don't fail if not
@@ -156,7 +156,7 @@ verbose "Installing FreeSWITCH core build dependencies from packages..."
 #  ks (required by sofia-sip and FreeSWITCH core),
 #  zlib (required by sofia-sip and FreeSWITCH core),
 #  speexdsp (required by sofia-sip and FreeSWITCH core)
-pkg_install \
+pkg_install_required \
  libspandsp3 libspandsp3-devel \
  libsofia-sip libsofia-sip-devel \
  libks2 libks-devel \

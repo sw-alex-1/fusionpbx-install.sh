@@ -150,8 +150,7 @@ try {
 if echo "$_pdo_test" | grep -q "^OK"; then
     verbose "  PDO connection to PostgreSQL: successful"
 else
-    error "PDO connection test FAILED: $_pdo_test"
-    die "Cannot proceed — PHP cannot connect to PostgreSQL via PDO. Check the error above."
+    die "PDO connection test FAILED: $_pdo_test — PHP cannot connect to PostgreSQL via PDO. The installer cannot continue."
 fi
 
 # =============================================================================

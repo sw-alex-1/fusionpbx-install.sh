@@ -282,7 +282,7 @@ fi
 # =============================================================================
 
 verbose "Restarting FreeSWITCH with PostgreSQL DSN..."
-systemctl restart freeswitch || warn "FreeSWITCH restart failed"
+service_restart_required freeswitch
 verbose "FreeSWITCH restarted with PostgreSQL configuration"
 
 # =============================================================================

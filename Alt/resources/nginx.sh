@@ -25,7 +25,7 @@ cd "$SCRIPT_DIR"
 # =============================================================================
 
 verbose "Installing NGINX web server..."
-pkg_install nginx
+pkg_install_required nginx
 
 # =============================================================================
 # Ensure sites directories exist
@@ -220,15 +220,13 @@ verbose "nginx enabled for auto-start on boot"
 
 # Flush systemd cache and restart
 systemctl daemon-reload
-service_restart nginx
+service_restart_required nginx
 
 # Verify nginx is running
 if service_is_active nginx; then
     verbose "nginx is running"
 else
-    error "nginx failed to start"
-    error "Check logs: journalctl -u nginx -n 50"
-    error "Check config: nginx -t"
+    die "nginx failed to start. Check: journalctl -u nginx -n 50, and run 'nginx -t' to test config"
 fi
 
 # =============================================================================

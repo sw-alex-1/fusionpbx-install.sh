@@ -29,7 +29,7 @@ verbose "Installing FusionPBX dependencies..."
 
 # Required packages - these are known to exist in Alt Linux
 # Some were already installed in pre-install.sh, pkg_install skips them
-pkg_install \
+pkg_install_required \
     git \
     vim-console \
     ghostscript \

@@ -8,6 +8,11 @@
 # packages will be skipped and existing configs will be backed up before
 # modification.
 #
+# ERROR HANDLING: The installer STOPS on critical errors. Each step is
+# executed via run_step() which checks the exit code. If a step fails,
+# the installer aborts with a clear error message explaining what went
+# wrong and which step to re-run after fixing the issue.
+#
 # Installation order matches the Debian installer:
 #   1. System prep, PHP, nginx, PostgreSQL, FusionPBX, FreeSWITCH
 #   2. FreeSWITCH starts with default SQLite config (provides event socket)
@@ -36,21 +41,103 @@ cd "$SCRIPT_DIR"
 . ./resources/environment.sh
 . ./resources/arguments.sh
 
+# =============================================================================
+# Error tracking — counts failed steps for final summary
+# =============================================================================
+
+_INSTALL_FAILED_STEPS=""
+_INSTALL_CURRENT_STEP=""
+
+# =============================================================================
+# run_step — execute an installation step with error checking
+#
+# Usage: run_step <step_number> <description> <script_path> [script_args...]
+#
+# If the script exits with non-zero code, the installer ABORTS immediately.
+# This prevents cascading failures where a later step depends on an
+# earlier step that silently failed.
+#
+# The user is told exactly which step failed and how to re-run it after
+# fixing the issue.
+# =============================================================================
+
+run_step() {
+    _rs_step_num="$1"
+    _rs_desc="$2"
+    _rs_script="$3"
+    shift 3
+    # Remaining args are passed to the script
+
+    _INSTALL_CURRENT_STEP="$_rs_step_num"
+
+    verbose ""
+    verbose "=== Step $_rs_step_num: $_rs_desc ==="
+
+    if [ ! -f "$_rs_script" ]; then
+        error ""
+        error "========================================="
+        error " INSTALLATION ABORTED"
+        error "========================================="
+        error ""
+        error "Step $_rs_step_num ($_rs_desc) FAILED:"
+        error "  Script not found: $_rs_script"
+        error ""
+        error "This is a bug in the installer. Please report it."
+        error ""
+        exit 1
+    fi
+
+    # Run the step script
+    # Capture the exit code — this is the critical check
+    "$_rs_script" "$@"
+    _rs_exit_code=$?
+
+    if [ $_rs_exit_code -ne 0 ]; then
+        _INSTALL_FAILED_STEPS="$_INSTALL_FAILED_STEPS $_rs_step_num"
+
+        error ""
+        error "========================================="
+        error " INSTALLATION ABORTED"
+        error "========================================="
+        error ""
+        error "Step $_rs_step_num ($_rs_desc) FAILED with exit code $_rs_exit_code."
+        error ""
+        error "The installer cannot continue because this step is required"
+        error "for subsequent steps to work correctly."
+        error ""
+        error "What to do:"
+        error "  1. Read the error messages above carefully"
+        error "  2. Fix the problem (missing package, network issue, etc.)"
+        error "  3. Re-run the installer — it will skip already completed steps"
+        error ""
+        error "To re-run just this step for debugging:"
+        error "  cd $SCRIPT_DIR && $_rs_script"
+        error ""
+
+        exit 1
+    fi
+
+    verbose "Step $_rs_step_num completed successfully."
+}
+
+# =============================================================================
 # Skip CPU check if requested
+# =============================================================================
+
 if [ "$CPU_CHECK" = "false" ]; then
     verbose "CPU check skipped (--no-cpu-check)"
 fi
 
+# =============================================================================
 # Configure proxy (MUST run before any network operations)
-# Sets environment variables, APT config, git config, wget/curl config.
-# Safe no-op if --proxy was not specified.
-# IMPORTANT: This is SOURCED (not executed) so that exported environment
-# variables (http_proxy, https_proxy, etc.) propagate to install.sh and
-# all subsequent subprocess calls. Running it as a subprocess would lose
-# the env vars when proxy.sh exits.
+# =============================================================================
+
 . ./resources/proxy.sh
 
+# =============================================================================
 # Banner
+# =============================================================================
+
 verbose "========================================="
 verbose " FusionPBX Installer for Alt Linux"
 verbose "========================================="
@@ -71,80 +158,58 @@ verbose ""
 
 # =============================================================================
 # Installation Steps
-# Each step is a separate script that can be independently debugged and re-run.
-# Failed steps will print warnings but the installer will continue to allow
-# manual intervention. Critical failures use die() to abort.
+#
+# Each step is executed via run_step() which checks the exit code.
+# If a step fails, the installer ABORTS immediately with a clear
+# error message. This prevents cascading failures.
+#
+# Steps marked as (optional) may use warn() for non-critical failures
+# inside the script but will still abort if the script itself exits
+# with a non-zero code.
 # =============================================================================
 
 # Step 1: System preparation (update, base packages, cdrom cleanup)
-verbose ""
-verbose "=== Step 1/11: System preparation ==="
-resources/pre-install.sh
+run_step "1/11" "System preparation" resources/pre-install.sh
 
 # Step 2: PHP and PHP-FPM
-verbose ""
-verbose "=== Step 2/11: Installing PHP ==="
-resources/php.sh
+run_step "2/11" "Installing PHP" resources/php.sh
 
 # Step 3: NGINX web server
-verbose ""
-verbose "=== Step 3/11: Installing NGINX ==="
-resources/nginx.sh
+run_step "3/11" "Installing NGINX" resources/nginx.sh
 
 # Step 4: PostgreSQL database
-verbose ""
-verbose "=== Step 4/11: Installing PostgreSQL ==="
-resources/postgresql.sh
+run_step "4/11" "Installing PostgreSQL" resources/postgresql.sh
 
 # Step 5: FusionPBX application
-verbose ""
-verbose "=== Step 5/11: Installing FusionPBX ==="
-resources/fusionpbx.sh
-resources/applications.sh
+run_step "5a/11" "Installing FusionPBX" resources/fusionpbx.sh
+run_step "5b/11" "Installing FusionPBX applications" resources/applications.sh
 
 # Step 6: FreeSWITCH
 # This step also STARTS FreeSWITCH (with default SQLite config).
 # FreeSWITCH must be running before finish.sh so that upgrade.php --defaults
 # can access the event socket and populate switch settings correctly.
-# This matches the Debian installer's approach.
-verbose ""
-verbose "=== Step 6/11: Installing and starting FreeSWITCH ==="
-resources/switch.sh
+run_step "6/11" "Installing and starting FreeSWITCH" resources/switch.sh
 
 # Step 7: Firewall
-verbose ""
-verbose "=== Step 7/11: Configuring firewall ==="
-resources/iptables.sh
+run_step "7/11" "Configuring firewall" resources/iptables.sh
 
 # Step 8: Fail2ban
-verbose ""
-verbose "=== Step 8/11: Configuring Fail2ban ==="
-resources/fail2ban.sh
+run_step "8/11" "Configuring Fail2ban" resources/fail2ban.sh
 
 # Step 9: Additional services (sngrep, monit)
-verbose ""
-verbose "=== Step 9/11: Additional services ==="
-resources/sngrep.sh
-resources/monit.sh
+run_step "9a/11" "Installing sngrep" resources/sngrep.sh
+run_step "9b/11" "Installing monit" resources/monit.sh
 
 # Step 10: Finish (database schema, admin user, upgrade.php)
 # FreeSWITCH is already running, so upgrade.php --defaults gets correct
-# switch paths from the event socket. This naturally populates:
-#   - v_default_settings with correct switch paths
-#   - v_music_on_hold from local_stream.conf
-#   - v_modules from scanning mod_dir
-verbose ""
-verbose "=== Step 10/11: Finalizing installation ==="
-resources/finish.sh
+# switch paths from the event socket.
+run_step "10/11" "Finalizing installation" resources/finish.sh
 
 # Step 11: FreeSWITCH DSN Configuration
 # Switches FreeSWITCH from SQLite to PostgreSQL for all databases.
 # MUST run AFTER finish.sh because it inserts data into v_vars table
 # which is created by upgrade.php --schema in finish.sh.
-# After DSN is configured, FreeSWITCH is restarted with PostgreSQL.
-verbose ""
-verbose "=== Step 11/11: Configuring FreeSWITCH database (PostgreSQL) ==="
-resources/switch/dsn.sh
+run_step "11/11" "Configuring FreeSWITCH database (PostgreSQL)" resources/switch/dsn.sh
 
 # =============================================================================
 # Completion
@@ -152,7 +217,8 @@ resources/switch/dsn.sh
 
 verbose ""
 verbose "========================================="
-verbose " Installation steps completed."
+verbose " Installation completed successfully!"
 verbose "========================================="
 verbose ""
-verbose "All installation steps completed successfully!"
+verbose "All 11 installation steps completed without errors."
+verbose ""

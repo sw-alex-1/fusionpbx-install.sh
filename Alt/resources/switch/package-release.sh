@@ -34,7 +34,7 @@ verbose "Installing FreeSWITCH core packages..."
 
 # Core daemon and library,
 # Lua scripting (required for FusionPBX integration)
-pkg_install \
+pkg_install_required \
     "freeswitch-daemon" \
     "libfreeswitch" \
     "freeswitch-lua"

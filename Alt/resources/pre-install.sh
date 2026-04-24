@@ -48,10 +48,10 @@ done
 # =============================================================================
 
 verbose "Updating package index..."
-apt-get update || warn "apt-get update encountered warnings (may be normal for some repos)"
+apt-get update || die "apt-get update failed. Check your repository configuration and network connectivity."
 
 verbose "Upgrading installed packages..."
-apt-get dist-upgrade -y || warn "apt-get dist-upgrade encountered warnings"
+apt-get dist-upgrade -y || die "apt-get dist-upgrade failed. Check the error output above."
 
 # =============================================================================
 # Install base utilities
@@ -61,7 +61,7 @@ apt-get dist-upgrade -y || warn "apt-get dist-upgrade encountered warnings"
 
 verbose "Installing base utilities..."
 
-pkg_install \
+pkg_install_required \
     wget \
     git \
     ca-certificates \

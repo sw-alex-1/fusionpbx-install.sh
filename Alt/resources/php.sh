@@ -29,7 +29,7 @@ verbose "Installing PHP $php_version and modules..."
 
 # Core PHP packages (required for FusionPBX)
 # Using variable interpolation instead of repetitive if-blocks (optimization #1)
-pkg_install \
+pkg_install_required \
     "php${php_version}" \
     "php${php_version}-fpm-fcgi" \
     "php${php_version}-pgsql" \
@@ -347,15 +347,13 @@ systemctl enable "$_php_fpm_service" 2>/dev/null || warn "Failed to enable $_php
 verbose "PHP-FPM enabled for auto-start on boot"
 
 systemctl daemon-reload
-service_restart "$_php_fpm_service"
+service_restart_required "$_php_fpm_service"
 
 # Verify FPM is running
 if service_is_active "$_php_fpm_service"; then
     verbose "PHP-FPM is running (service: $_php_fpm_service)"
 else
-    error "PHP-FPM failed to start (service: $_php_fpm_service)"
-    error "Check logs: journalctl -u $_php_fpm_service -n 50"
-    error "You can continue the installation and fix this later."
+    die "PHP-FPM failed to start (service: $_php_fpm_service). Check: journalctl -u $_php_fpm_service -n 50"
 fi
 
 # =============================================================================
