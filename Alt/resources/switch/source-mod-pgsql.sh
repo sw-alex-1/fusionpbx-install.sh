@@ -341,15 +341,22 @@ if [ -f "$_PATCH_FILE" ] && [ -f "$_MOD_PGSQL_SRC" ]; then
     #   "reversed (or previously applied) patch detected!  Assume -R? [n]"
     if grep -q 'PG_VERSION_NUM' "$_MOD_PGSQL_SRC" 2>/dev/null; then
         verbose "  Patch already applied (PG_VERSION_NUM found in source)"
-    elif patch -u "$_MOD_PGSQL_SRC" -i "$_PATCH_FILE" --dry-run 2>/dev/null; then
+    elif echo 'n' | patch -u "$_MOD_PGSQL_SRC" -i "$_PATCH_FILE" --dry-run 2>/dev/null; then
         # Dry-run passed — apply the patch non-interactively.
-        # --force prevents interactive prompts (e.g. "Assume -R?" questions).
-        patch -u --force "$_MOD_PGSQL_SRC" -i "$_PATCH_FILE"
+        # We pipe 'yes' to automatically answer any prompts from patch
+        # (e.g. "Assume -R?" or "apply anyway?").
+        yes | patch -u "$_MOD_PGSQL_SRC" -i "$_PATCH_FILE"
         verbose "  Patch applied successfully"
     else
-        warn "  Patch does not apply cleanly (source may have changed)"
-        warn "  Building without patch — may fail with PostgreSQL 14+"
-        warn "  If the build fails, try manually patching mod_pgsql.c"
+        # Dry-run failed — the patch may already be applied.
+        # Check if this is a "reversed patch" situation by trying with --reverse.
+        if echo 'n' | patch -uR "$_MOD_PGSQL_SRC" -i "$_PATCH_FILE" --dry-run 2>/dev/null; then
+            verbose "  Patch was already applied (reverse dry-run succeeded)"
+        else
+            warn "  Patch does not apply cleanly (source may have changed)"
+            warn "  Building without patch — may fail with PostgreSQL 14+"
+            warn "  If the build fails, try manually patching mod_pgsql.c"
+        fi
     fi
 else
     warn "  Patch file not found at $_PATCH_FILE"
