@@ -145,10 +145,27 @@ verbose "  Build dependencies installed"
 #
 #   spandsp >= 3.0 : libspandsp3, libspandsp3-devel
 #   sofia-sip      : libsofia-sip, libsofia-sip-devel
-#   libks          : libks2, libks-devel
+#   libks          : libks2 or libks1 (varies by Alt Linux version), libks-devel
 # =============================================================================
 
 verbose "Installing FreeSWITCH core build dependencies from packages..."
+
+# Detect the correct libks package name.
+# Different Alt Linux versions ship different SONAME versions:
+#   - Alt Linux 10.x / p10:  libks2
+#   - Alt Linux 11.x / p11:  libks1  (or vice-versa)
+# We try both and use whichever is available in the repository.
+_ks_lib_pkg=""
+for _ks_candidate in libks2 libks1 libks; do
+    if apt-cache search "^${_ks_candidate}$" 2>/dev/null | grep -q "$_ks_candidate"; then
+        _ks_lib_pkg="$_ks_candidate"
+        verbose "  Found libks runtime package: $_ks_lib_pkg"
+        break
+    fi
+done
+if [ -z "$_ks_lib_pkg" ]; then
+    die "Could not find libks package in repository (tried: libks2, libks1, libks). FreeSWITCH core requires libks to build."
+fi
 
 # Installing:
 #  spandsp >= 3.0 (required by FreeSWITCH core — configure checks for it),
@@ -159,7 +176,7 @@ verbose "Installing FreeSWITCH core build dependencies from packages..."
 pkg_install_required \
  libspandsp3 libspandsp3-devel \
  libsofia-sip libsofia-sip-devel \
- libks2 libks-devel \
+ "$_ks_lib_pkg" libks-devel \
  zlib zlib-devel \
  libspeex libspeex-devel libspeexdsp libspeexdsp-devel
 

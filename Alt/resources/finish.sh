@@ -54,7 +54,7 @@ export PGPASSWORD=$database_password
 verbose "Setting database passwords..."
 
 # Update fusionpbx user password
-runuser -u postgres -- psql -c "ALTER USER fusionpbx WITH PASSWORD '$database_password';"
+runuser -u postgres -- psql -c "ALTER USER fusionpbx WITH PASSWORD '$database_password';" || die "Failed to update fusionpbx database password"
 
 # Also create/update freeswitch role (required by FusionPBX internals)
 if runuser -u postgres -- psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='freeswitch'" 2>/dev/null | grep -q 1; then
@@ -159,7 +159,8 @@ fi
 
 verbose "Installing database schema..."
 
-cd /var/www/fusionpbx && /usr/bin/php /var/www/fusionpbx/core/upgrade/upgrade.php --schema
+cd /var/www/fusionpbx && /usr/bin/php /var/www/fusionpbx/core/upgrade/upgrade.php --schema \
+    || die "upgrade.php --schema failed. Check database connectivity and PHP configuration."
 
 # =============================================================================
 # Domain configuration
@@ -187,11 +188,12 @@ fi
 verbose "Domain: $domain_name"
 
 #get the domain_uuid
-domain_uuid=$(/usr/bin/php /var/www/fusionpbx/resources/uuid.php)
+domain_uuid=$(/usr/bin/php /var/www/fusionpbx/resources/uuid.php) || die "Failed to generate domain UUID"
 
 #add the domain name
 psql --host=$database_host --port=$database_port --username=$database_username -c \
-    "insert into v_domains (domain_uuid, domain_name, domain_enabled) values('$domain_uuid', '$domain_name', 'true');"
+    "insert into v_domains (domain_uuid, domain_name, domain_enabled) values('$domain_uuid', '$domain_name', 'true');" \
+    || die "Failed to insert domain into v_domains"
 
 # =============================================================================
 # App defaults (1st run)
@@ -201,7 +203,8 @@ psql --host=$database_host --port=$database_port --username=$database_username -
 
 verbose "Running app defaults (1st run)..."
 
-cd /var/www/fusionpbx && /usr/bin/php /var/www/fusionpbx/core/upgrade/upgrade.php --defaults
+cd /var/www/fusionpbx && /usr/bin/php /var/www/fusionpbx/core/upgrade/upgrade.php --defaults \
+    || die "upgrade.php --defaults (1st run) failed. Check PHP and database connectivity."
 
 # =============================================================================
 # Admin user
@@ -209,8 +212,8 @@ cd /var/www/fusionpbx && /usr/bin/php /var/www/fusionpbx/core/upgrade/upgrade.ph
 
 verbose "Creating admin user..."
 
-user_uuid=$(/usr/bin/php /var/www/fusionpbx/resources/uuid.php)
-user_salt=$(/usr/bin/php /var/www/fusionpbx/resources/uuid.php)
+user_uuid=$(/usr/bin/php /var/www/fusionpbx/resources/uuid.php) || die "Failed to generate user UUID"
+user_salt=$(/usr/bin/php /var/www/fusionpbx/resources/uuid.php) || die "Failed to generate user salt"
 user_name=$system_username
 
 if [ ."${system_password}" = ."random" ]; then
@@ -260,7 +263,8 @@ sed -i /etc/freeswitch/autoload_configs/xml_cdr.conf.xml -e s:"{v_pass}:$xml_cdr
 
 verbose "Updating app defaults (2nd run)..."
 
-cd /var/www/fusionpbx && /usr/bin/php /var/www/fusionpbx/core/upgrade/upgrade.php --defaults
+cd /var/www/fusionpbx && /usr/bin/php /var/www/fusionpbx/core/upgrade/upgrade.php --defaults \
+    || die "upgrade.php --defaults (2nd run) failed. Check PHP and database connectivity."
 
 # =============================================================================
 # Verify v_music_on_hold was populated
@@ -270,7 +274,7 @@ cd /var/www/fusionpbx && /usr/bin/php /var/www/fusionpbx/core/upgrade/upgrade.ph
 # =============================================================================
 
 verbose "Verifying music on hold configuration..."
-switch/music-on-hold.sh
+switch/music-on-hold.sh || die "Music on hold configuration failed"
 
 # =============================================================================
 # Set file permissions manually

@@ -28,10 +28,10 @@ cd "$SCRIPT_DIR"
 
 if [ "$switch_package" = "true" ]; then
     verbose "Installing FreeSWITCH from RPM packages..."
-    switch/package-release.sh
+    switch/package-release.sh || die "FreeSWITCH package installation failed (package-release.sh)"
 
     # Copy the FusionPBX-provided FreeSWITCH configuration
-    switch/conf-copy.sh
+    switch/conf-copy.sh || die "FreeSWITCH config copy failed (conf-copy.sh)"
 
     # Build and install mod_pgsql from source
     # This is CRITICAL: without mod_pgsql, FreeSWITCH cannot connect to
@@ -39,25 +39,25 @@ if [ "$switch_package" = "true" ]; then
     # Must run AFTER package-release.sh (needs installed FreeSWITCH headers)
     # Must run BEFORE disable-missing-modules.sh (so the .so file exists)
     verbose "Building mod_pgsql from source (not included in Alt Linux RPMs)..."
-    switch/source-mod-pgsql.sh
+    switch/source-mod-pgsql.sh || die "mod_pgsql build failed (source-mod-pgsql.sh). Without mod_pgsql, FusionPBX cannot use PostgreSQL."
 
     # Disable modules that don't exist in Alt Linux RPM packages
     # Note: mod_pgsql.so now exists (built above), so it won't be disabled
-    switch/disable-missing-modules.sh
+    switch/disable-missing-modules.sh || die "FreeSWITCH module disabling failed (disable-missing-modules.sh)"
 
     # Set file permissions for FreeSWITCH directories
-    switch/package-permissions.sh
+    switch/package-permissions.sh || die "FreeSWITCH permissions setup failed (package-permissions.sh)"
 
     # Configure and start the systemd service
-    switch/package-systemd.sh
+    switch/package-systemd.sh || die "FreeSWITCH systemd setup failed (package-systemd.sh)"
 else
     warn "switch_package=false but source build is not supported on Alt Linux"
     warn "Setting switch_package=true and proceeding with RPM installation"
     switch_package=true
-    switch/package-release.sh
-    switch/conf-copy.sh
-    switch/source-mod-pgsql.sh
-    switch/disable-missing-modules.sh
-    switch/package-permissions.sh
-    switch/package-systemd.sh
+    switch/package-release.sh || die "FreeSWITCH package installation failed (package-release.sh)"
+    switch/conf-copy.sh || die "FreeSWITCH config copy failed (conf-copy.sh)"
+    switch/source-mod-pgsql.sh || die "mod_pgsql build failed (source-mod-pgsql.sh). Without mod_pgsql, FusionPBX cannot use PostgreSQL."
+    switch/disable-missing-modules.sh || die "FreeSWITCH module disabling failed (disable-missing-modules.sh)"
+    switch/package-permissions.sh || die "FreeSWITCH permissions setup failed (package-permissions.sh)"
+    switch/package-systemd.sh || die "FreeSWITCH systemd setup failed (package-systemd.sh)"
 fi
