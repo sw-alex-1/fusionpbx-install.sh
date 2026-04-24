@@ -336,19 +336,20 @@ _MOD_PGSQL_SRC="$BUILD_DIR/src/mod/databases/mod_pgsql/mod_pgsql.c"
 _PATCH_FILE="$SCRIPT_DIR/source/mod_pgsql.patch"
 
 if [ -f "$_PATCH_FILE" ] && [ -f "$_MOD_PGSQL_SRC" ]; then
-    # Try dry-run first to check if the patch applies cleanly
-    if patch -u "$_MOD_PGSQL_SRC" -i "$_PATCH_FILE" --dry-run 2>/dev/null; then
-        patch -u "$_MOD_PGSQL_SRC" -i "$_PATCH_FILE"
+    # Check if the patch is already applied (source already has PG_VERSION_NUM)
+    # This MUST be checked FIRST to avoid the interactive prompt:
+    #   "reversed (or previously applied) patch detected!  Assume -R? [n]"
+    if grep -q 'PG_VERSION_NUM' "$_MOD_PGSQL_SRC" 2>/dev/null; then
+        verbose "  Patch already applied (PG_VERSION_NUM found in source)"
+    elif patch -u "$_MOD_PGSQL_SRC" -i "$_PATCH_FILE" --dry-run 2>/dev/null; then
+        # Dry-run passed — apply the patch non-interactively.
+        # --force prevents interactive prompts (e.g. "Assume -R?" questions).
+        patch -u --force "$_MOD_PGSQL_SRC" -i "$_PATCH_FILE"
         verbose "  Patch applied successfully"
     else
-        # Check if the patch is already applied (source already has PG_VERSION_NUM)
-        if grep -q 'PG_VERSION_NUM' "$_MOD_PGSQL_SRC" 2>/dev/null; then
-            verbose "  Patch already applied (PG_VERSION_NUM found in source)"
-        else
-            warn "  Patch does not apply cleanly (source may have changed)"
-            warn "  Building without patch — may fail with PostgreSQL 14+"
-            warn "  If the build fails, try manually patching mod_pgsql.c"
-        fi
+        warn "  Patch does not apply cleanly (source may have changed)"
+        warn "  Building without patch — may fail with PostgreSQL 14+"
+        warn "  If the build fails, try manually patching mod_pgsql.c"
     fi
 else
     warn "  Patch file not found at $_PATCH_FILE"
