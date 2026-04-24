@@ -35,10 +35,16 @@ cmd_exists() {
 # =============================================================================
 
 # Check if an RPM package is installed
+# Handles both real package names and virtual packages (Provides:).
+# In Alt Linux, APT may resolve a virtual package name (e.g. php8.2-xml)
+# to a different real package (e.g. php8.2-libs).  The plain `rpm -q`
+# only matches real RPM names, so we fall back to `--whatprovides`
+# when the direct query fails.
 # Usage: pkg_is_installed <package_name>
 # Returns: 0 if installed, 1 if not
 pkg_is_installed() {
-    rpm -q "$1" >/dev/null 2>&1
+    rpm -q "$1" >/dev/null 2>&1 && return 0
+    rpm -q --whatprovides "$1" >/dev/null 2>&1
 }
 
 # Install packages idempotently - skips already installed packages
