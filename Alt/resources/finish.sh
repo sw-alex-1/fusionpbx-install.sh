@@ -54,14 +54,15 @@ export PGPASSWORD=$database_password
 verbose "Setting database passwords..."
 
 # Update fusionpbx user password
-runuser -u postgres -- psql -c "ALTER USER fusionpbx WITH PASSWORD '$database_password';" || die "Failed to update fusionpbx database password"
+# Force md5 encryption to match pg_hba.conf auth method (see postgresql.sh)
+runuser -u postgres -- psql -c "SET password_encryption = 'md5'; ALTER USER fusionpbx WITH PASSWORD '$database_password';" || die "Failed to update fusionpbx database password"
 
 # Also create/update freeswitch role (required by FusionPBX internals)
 if runuser -u postgres -- psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='freeswitch'" 2>/dev/null | grep -q 1; then
-    runuser -u postgres -- psql -c "ALTER USER freeswitch WITH PASSWORD '$database_password';" 2>/dev/null
+    runuser -u postgres -- psql -c "SET password_encryption = 'md5'; ALTER USER freeswitch WITH PASSWORD '$database_password';" 2>/dev/null
     verbose "  freeswitch role password updated"
 else
-    runuser -u postgres -- psql -c "CREATE ROLE freeswitch WITH SUPERUSER LOGIN PASSWORD '$database_password';" 2>/dev/null
+    runuser -u postgres -- psql -c "SET password_encryption = 'md5'; CREATE ROLE freeswitch WITH SUPERUSER LOGIN PASSWORD '$database_password';" 2>/dev/null
     verbose "  freeswitch role created"
 fi
 

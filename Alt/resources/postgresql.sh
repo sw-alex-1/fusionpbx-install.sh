@@ -231,12 +231,15 @@ if [ "$database_host" = "127.0.0.1" ] || [ "$database_host" = "::1" ] || [ "$dat
     cd /tmp
 
     # Set postgres superuser password
+    # CRITICAL: Force password_encryption = 'md5' before setting any passwords.
+    # PostgreSQL 15+ defaults to scram-sha-256, but we use 'md5' auth in
+    # pg_hba.conf for TCP connections. The md5 auth method CANNOT verify
+    # scram-sha-256 hashed passwords, so we must ensure passwords are stored
+    # as md5 hashes. This SET only affects the current session.
     verbose "Setting postgres superuser password..."
-    if runuser -u postgres -- psql -c "ALTER USER postgres WITH PASSWORD '$database_password';" 2>/dev/null; then
-        verbose "  Postgres superuser password set"
-    else
-        warn "  Failed to set postgres superuser password (may already be set or not needed)"
-    fi
+    runuser -u postgres -- psql -c "SET password_encryption = 'md5'; ALTER USER postgres WITH PASSWORD '$database_password';" 2>/dev/null \
+        && verbose "  Postgres superuser password set (md5 hash)" \
+        || warn "  Failed to set postgres superuser password (may already be set or not needed)"
 
     # Create database (idempotent: skip if exists)
     if pg_db_exists "$database_name"; then
@@ -250,16 +253,23 @@ if [ "$database_host" = "127.0.0.1" ] || [ "$database_host" = "::1" ] || [ "$dat
         fi
     fi
 
-    # Create role (idempotent: skip if exists)
+    # Create or update role (idempotent)
+    # IMPORTANT: Always update the password, even if the role already exists.
+    # On re-runs or pre-existing systems, the stored password hash may be
+    # scram-sha-256 (PG 15+ default) while pg_hba.conf expects md5 auth.
+    # Force md5 encryption so the hash matches our pg_hba.conf setting.
     if pg_role_exists "$database_username"; then
-        verbose "Role '$database_username' already exists (keeping, password unchanged)"
+        verbose "Role '$database_username' already exists — updating password to match current credentials"
+        runuser -u postgres -- psql \
+            -c "SET password_encryption = 'md5'; ALTER USER $database_username WITH PASSWORD '$database_password';" 2>/dev/null \
+            || warn "  Failed to update password for role '$database_username'"
     else
         verbose "Creating role '$database_username'..."
         runuser -u postgres -- psql \
-            -c "CREATE ROLE $database_username WITH SUPERUSER LOGIN PASSWORD '$database_password';" 2>/dev/null
+            -c "SET password_encryption = 'md5'; CREATE ROLE $database_username WITH SUPERUSER LOGIN PASSWORD '$database_password';" 2>/dev/null
 
         if pg_role_exists "$database_username"; then
-            verbose "  Role '$database_username' created with SUPERUSER privileges"
+            verbose "  Role '$database_username' created with SUPERUSER privileges (md5 hash)"
         else
             die "Failed to create role '$database_username'"
         fi
