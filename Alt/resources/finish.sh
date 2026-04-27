@@ -338,52 +338,56 @@ verbose "  Cron daemon installed and started"
 
 # =============================================================================
 # Install FusionPBX services
-# upgrade.php --services creates systemd service files or cron entries
-# for FusionPBX background services (xml_cdr, email_queue, fax_queue, etc.)
-# IMPORTANT: The generated files may reference 'www-data' which doesn't exist
-# on Alt Linux. We patch them after creation.
+# upgrade.php --services copies service templates from the FusionPBX source
+# tree (app/*/resources/service/*.service) to /etc/systemd/system/.
+# These templates have User=www-data (Debian default) hardcoded.
+#
+# SOLUTION: Patch the SOURCE templates BEFORE running upgrade.php --services.
+# This way the correct user is baked into the templates permanently, so:
+#   - Current services get the right user
+#   - Future module activations will also generate correct service files
+#   - Re-running upgrade.php --services won't revert the fix
 # =============================================================================
 
-verbose "Installing FusionPBX services..."
+# Patch all FusionPBX service templates in the source tree
+verbose "Patching FusionPBX service templates (${web_user} instead of www-data)..."
+_fpbx_dir="/var/www/fusionpbx"
+_tmpl_patched=0
+for _tmpl_file in "$_fpbx_dir"/app/*/resources/service/*.service \
+                   "$_fpbx_dir"/core/*/resources/service/*.service; do
+    if [ -f "$_tmpl_file" ] && grep -q 'www-data' "$_tmpl_file" 2>/dev/null; then
+        sed -i "s/www-data/${web_user}/g" "$_tmpl_file"
+        verbose "  Patched template: $(echo "$_tmpl_file" | sed "s|$_fpbx_dir/||")"
+        _tmpl_patched=$((_tmpl_patched + 1))
+    fi
+done
+if [ "$_tmpl_patched" -eq 0 ]; then
+    verbose "  No www-data references found in service templates"
+else
+    verbose "  Patched $_tmpl_patched template(s)"
+fi
 
+# Now run upgrade.php --services — it will copy the patched templates
+verbose "Installing FusionPBX services..."
 cd /var/www/fusionpbx && /usr/bin/php /var/www/fusionpbx/core/upgrade/upgrade.php --services || \
     warn "FusionPBX services installation had errors (some services may need manual setup)"
 
-# Patch any generated service files that reference www-data (doesn't exist on Alt Linux)
-# FusionPBX's upgrade.php --services generates systemd units with User=www-data
-# because it doesn't know about Alt Linux's _nginx user. The service filenames
-# vary (xml_cdr.service, fax_queue.service, etc.) so we search by content, not name.
-#
-# SAFETY: www-data is a Debian-specific user that does NOT exist on Alt Linux.
-# No Alt Linux system package would ever contain "www-data" in its service files.
-# Only FusionPBX's PHP code generates these references, so replacing www-data
-# is safe and will not affect any other service.
-#
-# If you enable additional FusionPBX modules later, they may generate new
-# service files with www-data. Run the fix-services.sh script to patch them:
-#   /usr/src/fusionpbx-install.sh/Alt/resources/fix-services.sh
-verbose "Patching FusionPBX service files for Alt Linux user (${web_user})..."
-_svc_patched=0
+# Safety net: also patch any already-installed service files that might
+# still have www-data (e.g. from a previous run before this fix).
+# This is idempotent — already-patched files won't be touched.
 for _svc_file in /etc/systemd/system/*.service /lib/systemd/system/*.service; do
     if [ -f "$_svc_file" ] && grep -q 'www-data' "$_svc_file" 2>/dev/null; then
         sed -i "s/www-data/${web_user}/g" "$_svc_file"
-        verbose "  Patched: $(basename "$_svc_file") (www-data -> ${web_user})"
-        _svc_patched=$((_svc_patched + 1))
+        verbose "  Patched installed: $(basename "$_svc_file")"
     fi
 done
-# Also patch any cron files that reference www-data
+# Also patch any cron files
 for _cron_file in /etc/cron.d/*; do
     if [ -f "$_cron_file" ] && grep -q 'www-data' "$_cron_file" 2>/dev/null; then
         sed -i "s/www-data/${web_user}/g" "$_cron_file"
-        verbose "  Patched cron: $(basename "$_cron_file") (www-data -> ${web_user})"
-        _svc_patched=$((_svc_patched + 1))
+        verbose "  Patched cron: $(basename "$_cron_file")"
     fi
 done
-if [ "$_svc_patched" -eq 0 ]; then
-    verbose "  No www-data references found in service/cron files"
-else
-    verbose "  Patched $_svc_patched file(s)"
-fi
 systemctl daemon-reload
 
 # =============================================================================
