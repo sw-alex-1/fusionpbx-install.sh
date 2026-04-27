@@ -39,6 +39,7 @@ pkg_install_required \
     "php${php_version}-imap" \
     "php${php_version}-libs" \
     "php${php_version}-gd" \
+    "php${php_version}-pcntl" \
     "php${php_version}-mbstring" \
     "php${php_version}-ldap" \
     "php${php_version}-snmp" \
