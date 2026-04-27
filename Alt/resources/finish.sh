@@ -353,6 +353,15 @@ cd /var/www/fusionpbx && /usr/bin/php /var/www/fusionpbx/core/upgrade/upgrade.ph
 # FusionPBX's upgrade.php --services generates systemd units with User=www-data
 # because it doesn't know about Alt Linux's _nginx user. The service filenames
 # vary (xml_cdr.service, fax_queue.service, etc.) so we search by content, not name.
+#
+# SAFETY: www-data is a Debian-specific user that does NOT exist on Alt Linux.
+# No Alt Linux system package would ever contain "www-data" in its service files.
+# Only FusionPBX's PHP code generates these references, so replacing www-data
+# is safe and will not affect any other service.
+#
+# If you enable additional FusionPBX modules later, they may generate new
+# service files with www-data. Run the fix-services.sh script to patch them:
+#   /usr/src/fusionpbx-install.sh/Alt/resources/fix-services.sh
 verbose "Patching FusionPBX service files for Alt Linux user (${web_user})..."
 _svc_patched=0
 for _svc_file in /etc/systemd/system/*.service /lib/systemd/system/*.service; do
