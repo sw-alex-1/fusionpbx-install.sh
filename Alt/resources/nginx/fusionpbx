@@ -189,9 +189,11 @@ server {
         ssl_session_timeout     2h;
         ssl_session_tickets     off;
 
-        #redirect websockets to port 8080
+        #redirect websockets
+        # Alt Linux: port 8080 is occupied by Alterator (system config tool).
+        # FusionPBX WebSocket uses port {WEBSOCKET_PORT} instead (see config.conf).
         location /websockets/ {
-                proxy_pass http://127.0.0.1:8080;
+                proxy_pass http://127.0.0.1:{WEBSOCKET_PORT};
                 proxy_http_version 1.1;
                 proxy_set_header Upgrade $http_upgrade;
                 proxy_set_header Connection "upgrade";

@@ -128,10 +128,12 @@ if [ -f "nginx/fusionpbx" ]; then
 
     # Replace placeholders in the template
     sed -e "s|{PHP_FPM_SOCKET}|${_fpm_socket}|g" \
+        -e "s|{WEBSOCKET_PORT}|${websocket_port}|g" \
         nginx/fusionpbx > "$_fusionpbx_conf"
 
     verbose "FusionPBX nginx config deployed to $_fusionpbx_conf"
     verbose "  PHP-FPM socket: $_fpm_socket"
+    verbose "  WebSocket port: $websocket_port"
 else
     die "nginx template not found: nginx/fusionpbx"
 fi
@@ -240,6 +242,7 @@ verbose "  Site config:    $_fusionpbx_conf"
 verbose "  SSL cert:       $_ssl_crt"
 verbose "  SSL key:        $_ssl_key"
 verbose "  PHP-FPM socket: $_fpm_socket"
+verbose "  WebSocket port: $websocket_port (Alt Linux: avoids Alterator on 8080)"
 verbose "  Web user:       $web_user"
 verbose "  LetsEncrypt:    $([ "$letsencrypt_folder" = "true" ] && echo "ready" || echo "disabled")"
 verbose ""

@@ -61,6 +61,12 @@ web_group=_nginx                            # nginx, php-fpm, AND FreeSWITCH gro
 fs_user=_nginx                              # FreeSWITCH runtime user (= web_user, like Debian's www-data)
 fs_group=_nginx                             # FreeSWITCH runtime group (= web_group, like Debian's www-data)
 
+# Alt Linux WebSocket Port
+# Port 8080 is occupied by Alterator (Alt Linux system configuration tool).
+# Use port 8088 for FusionPBX WebSocket to avoid conflict.
+# This value is used in: config.conf, nginx fusionpbx.conf, v_default_settings
+websocket_port=8088
+
 # Optional Applications
 application_transcribe=true                # Speech to Text
 application_speech=true                    # Text to Speech

@@ -13,7 +13,8 @@
 #   - FreeSWITCH user: _nginx:_nginx (same as web user, like Debian's www-data)
 #   - hostname -I not supported — use 'ip addr' instead
 #   - tmpfiles.d for /var/run/fusionpbx persistence across reboots
-#   - upgrade.php --permissions uses 'www-data' — must do manual chown instead
+#   - FusionPBX source patched in fusionpbx.sh to use _nginx instead of www-data
+#   - Safety net: post-generation scan for any remaining www-data references
 #   - PHP CLI must have pdo_pgsql loaded for FusionPBX DB access
 
 # Determine script directory
@@ -98,6 +99,7 @@ sed -i /etc/fusionpbx/config.conf -e s:"{database_host}:$database_host:"
 sed -i /etc/fusionpbx/config.conf -e s:"{database_name}:$database_name:"
 sed -i /etc/fusionpbx/config.conf -e s:"{database_username}:$database_username:"
 sed -i /etc/fusionpbx/config.conf -e s:"{database_password}:$database_password:"
+sed -i /etc/fusionpbx/config.conf -e s:"{WEBSOCKET_PORT}:$websocket_port:"
 
 # Also update the resources/ fallback config with real values
 _fpbx_res_config="/var/www/fusionpbx/resources/config.conf"
@@ -106,6 +108,7 @@ if [ -f "$_fpbx_res_config" ]; then
     sed -i "$_fpbx_res_config" -e s:"{database_name}:$database_name:"
     sed -i "$_fpbx_res_config" -e s:"{database_username}:$database_username:"
     sed -i "$_fpbx_res_config" -e s:"{database_password}:$database_password:"
+    sed -i "$_fpbx_res_config" -e s:"{WEBSOCKET_PORT}:$websocket_port:"
     verbose "  resources/config.conf also updated with database credentials"
 fi
 
@@ -268,6 +271,28 @@ cd /var/www/fusionpbx && /usr/bin/php /var/www/fusionpbx/core/upgrade/upgrade.ph
     || die "upgrade.php --defaults (2nd run) failed. Check PHP and database connectivity."
 
 # =============================================================================
+# WebSocket port configuration (Alt Linux specific)
+# Alt Linux uses port 8080 for Alterator (system configuration tool),
+# which conflicts with FusionPBX's default WebSocket port.
+# We change the WebSocket bind port to $websocket_port via v_default_settings.
+# This is also configured in config.conf (websocket.port) and nginx
+# (proxy_pass), but the database setting ensures the FusionPBX web UI
+# and WebSocket daemon use the correct port.
+# =============================================================================
+
+verbose "Configuring WebSocket port (${websocket_port} — avoids Alterator conflict on 8080)..."
+
+_ws_uuid=$(/usr/bin/php /var/www/fusionpbx/resources/uuid.php) || die "Failed to generate UUID for websocket setting"
+
+psql --host=$database_host --port=$database_port --username=$database_username -c \
+    "INSERT INTO v_default_settings (default_setting_uuid, default_setting_category, default_setting_subcategory, default_setting_name, default_setting_value, default_setting_enabled, default_setting_description)
+     VALUES ('$_ws_uuid', 'websocket_server', 'bind_port', 'numeric', '${websocket_port}', 'true', 'Alt Linux: use ${websocket_port} instead of 8080 (Alterator)')
+     ON CONFLICT (default_setting_uuid) DO UPDATE SET default_setting_value = EXCLUDED.default_setting_value;" 2>/dev/null \
+    || warn "WebSocket port setting could not be inserted (table may not exist yet — will use config.conf value)"
+
+verbose "  WebSocket bind port set to $websocket_port"
+
+# =============================================================================
 # Verify v_music_on_hold was populated
 # If FreeSWITCH is running and app_defaults worked correctly, v_music_on_hold
 # should have entries. If it's still empty (edge case), the fallback script
@@ -279,8 +304,9 @@ verbose "Verifying music on hold configuration..."
 
 # =============================================================================
 # Set file permissions manually
-# FusionPBX's upgrade.php --permissions uses 'www-data' which doesn't exist
-# on Alt Linux. We do manual chown with the correct web user instead.
+# We do manual chown with the correct web user instead of relying on
+# upgrade.php --permissions (which now uses _nginx after our source patch
+# in fusionpbx.sh, but manual chown is simpler and more reliable).
 # =============================================================================
 
 verbose "Setting file permissions..."
@@ -338,18 +364,23 @@ verbose "  Cron daemon installed and started"
 
 # =============================================================================
 # Install FusionPBX services
-# upgrade.php --services copies service templates from the FusionPBX source
-# tree (app/*/resources/service/*.service) to /etc/systemd/system/.
-# These templates have User=www-data (Debian default) hardcoded.
+# =============================================================================
+# Install FusionPBX services
+# upgrade.php --services creates systemd service files or cron entries
+# for FusionPBX background services (xml_cdr, email_queue, fax_queue, etc.)
 #
-# SOLUTION: Patch the SOURCE templates BEFORE running upgrade.php --services.
-# This way the correct user is baked into the templates permanently, so:
-#   - Current services get the right user
-#   - Future module activations will also generate correct service files
-#   - Re-running upgrade.php --services won't revert the fix
+# The FusionPBX source was already patched in fusionpbx.sh to use ${web_user}
+# instead of www-data in .service templates and PHP chown commands.
+# As an extra safety measure, we also patch the source templates here
+# (before running --services) to catch any that were updated by git pull.
+#
+# SAFETY NET: After --services, we scan installed files for any remaining
+# 'www-data' references (grep by content, not filename pattern).
 # =============================================================================
 
 # Patch all FusionPBX service templates in the source tree
+# (extra safety — templates were already patched in fusionpbx.sh but
+# may have been updated by git pull or other operations since then)
 verbose "Patching FusionPBX service templates (${web_user} instead of www-data)..."
 _fpbx_dir="/var/www/fusionpbx"
 _tmpl_patched=0
@@ -362,7 +393,7 @@ for _tmpl_file in "$_fpbx_dir"/app/*/resources/service/*.service \
     fi
 done
 if [ "$_tmpl_patched" -eq 0 ]; then
-    verbose "  No www-data references found in service templates"
+    verbose "  No www-data references found in service templates (already patched)"
 else
     verbose "  Patched $_tmpl_patched template(s)"
 fi
@@ -372,22 +403,27 @@ verbose "Installing FusionPBX services..."
 cd /var/www/fusionpbx && /usr/bin/php /var/www/fusionpbx/core/upgrade/upgrade.php --services || \
     warn "FusionPBX services installation had errors (some services may need manual setup)"
 
-# Safety net: also patch any already-installed service files that might
-# still have www-data (e.g. from a previous run before this fix).
-# This is idempotent — already-patched files won't be touched.
-for _svc_file in /etc/systemd/system/*.service /lib/systemd/system/*.service; do
-    if [ -f "$_svc_file" ] && grep -q 'www-data' "$_svc_file" 2>/dev/null; then
+# Safety net: patch any generated files still referencing www-data
+# (should be none if source patching worked correctly)
+verbose "Checking for www-data references in service/cron files..."
+
+# Patch systemd service files containing www-data
+for _svc_file in $(grep -rl 'www-data' /etc/systemd/system/ /lib/systemd/system/ 2>/dev/null); do
+    if [ -f "$_svc_file" ]; then
         sed -i "s/www-data/${web_user}/g" "$_svc_file"
-        verbose "  Patched installed: $(basename "$_svc_file")"
+        verbose "  Patched: $_svc_file"
     fi
 done
-# Also patch any cron files
-for _cron_file in /etc/cron.d/*; do
-    if [ -f "$_cron_file" ] && grep -q 'www-data' "$_cron_file" 2>/dev/null; then
+
+# Patch cron files containing www-data
+for _cron_file in $(grep -rl 'www-data' /etc/cron.d/ 2>/dev/null); do
+    if [ -f "$_cron_file" ]; then
         sed -i "s/www-data/${web_user}/g" "$_cron_file"
-        verbose "  Patched cron: $(basename "$_cron_file")"
+        verbose "  Patched: $_cron_file"
     fi
 done
+
+
 systemctl daemon-reload
 
 # =============================================================================

@@ -129,12 +129,6 @@ if [ -d "$_music_dir" ] && [ "$(ls -A "$_music_dir" 2>/dev/null)" ]; then
     # Remove the music packages (files are now safe in temp)
     verbose "Removing music packages (music files preserved)"
     apt-get remove -y freeswitch-sounds-music-8000 freeswitch-sounds-music-16000 freeswitch-sounds-music-32000
-#    for _mpkg in freeswitch-sounds-music-8000 freeswitch-sounds-music-16000 freeswitch-sounds-music-32000; do
-#        if pkg_is_installed "$_mpkg"; then
-#            verbose "Removing package $_mpkg (music files preserved)"
-#            apt-get remove -y "$_mpkg" 2>/dev/null || warn "Failed to remove $_mpkg (may be dependency)"
-#        fi
-#    done
 
     # Restore music files
     mkdir -p "$_music_dir/default"

@@ -115,6 +115,44 @@ else
 fi
 
 # =============================================================================
+# Patch FusionPBX source: replace www-data with Alt Linux web user
+#
+# FusionPBX hardcodes 'www-data' (Debian web user) in:
+#   1. Systemd .service files under core/*/resources/service/ and app/*/resources/service/
+#      — copied verbatim to /etc/systemd/system/ by upgrade.php --services
+#   2. PHP chown commands in core/upgrade/upgrade.php and core/upgrade/upgrade_menu.php
+#      — executed by upgrade.php --permissions
+#
+# We replace 'www-data' with the Alt Linux web user ($web_user) directly in
+# the source AFTER cloning, BEFORE any upgrade.php runs. This ensures:
+#   - upgrade.php --services generates correct service files (User=_nginx, Group=_nginx)
+#   - upgrade.php --permissions sets correct ownership (chown _nginx:_nginx)
+#   - Any future module activation also generates correct files
+#
+# The post-generation patching in finish.sh remains as a safety net only.
+# =============================================================================
+
+verbose "Patching FusionPBX source for Alt Linux user (${web_user})..."
+
+# Replace in .service template files (User=www-data → User=_nginx, Group=www-data → Group=_nginx)
+_service_count=0
+for _svc_file in "$_fpbx_dir"/core/*/resources/service/*.service "$_fpbx_dir"/app/*/resources/service/*.service; do
+    if [ -f "$_svc_file" ]; then
+        sed -i "s/www-data/${web_user}/g" "$_svc_file"
+        _service_count=$((_service_count + 1))
+    fi
+done
+verbose "  Patched $_service_count service template files"
+
+# Replace in PHP files (chown -R www-data:www-data → chown -R _nginx:_nginx)
+for _php_file in "$_fpbx_dir"/core/upgrade/upgrade.php "$_fpbx_dir"/core/upgrade/upgrade_menu.php; do
+    if [ -f "$_php_file" ]; then
+        sed -i "s/www-data:www-data/${web_user}:${web_group}/g" "$_php_file"
+        verbose "  Patched: $(basename "$_php_file")"
+    fi
+done
+
+# =============================================================================
 # Create cache directory
 # FusionPBX uses /var/cache/fusionpbx for template caching and other data.
 # =============================================================================
@@ -149,8 +187,10 @@ else
     # These will be filled in by finish.sh with actual database credentials
     if [ -f "fusionpbx/config.conf" ]; then
         cp -f fusionpbx/config.conf "$_fpbx_config"
+        # Replace {WEBSOCKET_PORT} placeholder (database placeholders left for finish.sh)
+        sed -i "s/{WEBSOCKET_PORT}/${websocket_port}/g" "$_fpbx_config"
         chown "$web_user:$web_group" "$_fpbx_config"
-        verbose "FusionPBX config.conf template deployed (placeholders will be replaced in finish.sh)"
+        verbose "FusionPBX config.conf template deployed (websocket port: $websocket_port, DB placeholders will be replaced in finish.sh)"
     else
         warn "FusionPBX config.conf template not found at fusionpbx/config.conf"
     fi
