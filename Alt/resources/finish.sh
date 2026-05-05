@@ -271,26 +271,71 @@ cd /var/www/fusionpbx && /usr/bin/php /var/www/fusionpbx/core/upgrade/upgrade.ph
     || die "upgrade.php --defaults (2nd run) failed. Check PHP and database connectivity."
 
 # =============================================================================
-# WebSocket port configuration (Alt Linux specific)
-# Alt Linux uses port 8080 for Alterator (system configuration tool),
-# which conflicts with FusionPBX's default WebSocket port.
-# We change the WebSocket bind port to $websocket_port via v_default_settings.
-# This is also configured in config.conf (websocket.port) and nginx
-# (proxy_pass), but the database setting ensures the FusionPBX web UI
-# and WebSocket daemon use the correct port.
+# Alt Linux default settings — switch directories and WebSocket port
+#
+# FusionPBX reads settings from two database sources:
+#   1. v_default_settings — used by the settings API and the web interface
+#      (Advanced > Default Settings)
+#   2. v_vars — used by the XML handler to generate FreeSWITCH configuration
+#      dynamically (visible as Advanced > Variables)
+#
+# On a fresh install, upgrade.php --defaults may NOT populate all entries.
+# We insert them explicitly to ensure correct values for Alt Linux:
+#   - Recordings directory: /var/lib/freeswitch/recordings (NOT /var/spool/freeswitch)
+#   - WebSocket port: 8088 (NOT 8080, which is occupied by Alterator)
 # =============================================================================
 
-verbose "Configuring WebSocket port (${websocket_port} — avoids Alterator conflict on 8080)..."
+verbose "Configuring Alt Linux database defaults..."
 
+# --- Recordings directory (v_default_settings) ---
+# Most critical setting — affects call recording uploads
+_rec_uuid=$(/usr/bin/php /var/www/fusionpbx/resources/uuid.php) || die "Failed to generate UUID"
+psql --host=$database_host --port=$database_port --username=$database_username -c \
+    "INSERT INTO v_default_settings (default_setting_uuid, default_setting_category, default_setting_subcategory, default_setting_name, default_setting_value, default_setting_enabled, default_setting_description)
+     VALUES ('$_rec_uuid', 'switch', 'recordings', 'dir', '/var/lib/freeswitch/recordings', 'true', 'Alt Linux: recordings directory')
+     ON CONFLICT (default_setting_uuid) DO UPDATE SET default_setting_value = EXCLUDED.default_setting_value;" 2>/dev/null \
+    || warn "switch/recordings setting could not be inserted"
+
+# Update existing if wrong value (e.g. /var/spool/freeswitch)
+psql --host=$database_host --port=$database_port --username=$database_username -c \
+    "UPDATE v_default_settings SET default_setting_value = '/var/lib/freeswitch/recordings'
+     WHERE default_setting_category = 'switch' AND default_setting_subcategory = 'recordings'
+       AND default_setting_value != '/var/lib/freeswitch/recordings';" 2>/dev/null
+
+verbose "  switch/recordings = /var/lib/freeswitch/recordings"
+
+# --- Recordings variable (v_vars) ---
+# Visible as Advanced > Variables > Defaults > recordings_dir
+_rec_var_uuid=$(/usr/bin/php /var/www/fusionpbx/resources/uuid.php) || die "Failed to generate UUID"
+psql --host=$database_host --port=$database_port --username=$database_username -c \
+    "INSERT INTO v_vars (var_uuid, var_name, var_value, var_category, var_enabled, var_order, var_description, var_hostname)
+     VALUES ('$_rec_var_uuid', 'recordings_dir', '/var/lib/freeswitch/recordings', 'Defaults', 'true', '0', 'Alt Linux: recordings directory', null)
+     ON CONFLICT (var_uuid) DO UPDATE SET var_value = EXCLUDED.var_value;" 2>/dev/null \
+    || warn "recordings_dir variable could not be inserted"
+
+# Update existing if wrong value
+psql --host=$database_host --port=$database_port --username=$database_username -c \
+    "UPDATE v_vars SET var_value = '/var/lib/freeswitch/recordings'
+     WHERE var_name = 'recordings_dir'
+       AND var_value != '/var/lib/freeswitch/recordings';" 2>/dev/null
+
+verbose "  recordings_dir (v_vars) = /var/lib/freeswitch/recordings"
+
+# Ensure the recordings directory exists with correct ownership
+mkdir -p /var/lib/freeswitch/recordings
+chown -R ${web_user}:${web_group} /var/lib/freeswitch/recordings
+verbose "  Recordings directory created and ownership set"
+
+# --- WebSocket port (v_default_settings) ---
+# Alt Linux: port 8080 is occupied by Alterator (system configuration tool)
 _ws_uuid=$(/usr/bin/php /var/www/fusionpbx/resources/uuid.php) || die "Failed to generate UUID for websocket setting"
-
 psql --host=$database_host --port=$database_port --username=$database_username -c \
     "INSERT INTO v_default_settings (default_setting_uuid, default_setting_category, default_setting_subcategory, default_setting_name, default_setting_value, default_setting_enabled, default_setting_description)
      VALUES ('$_ws_uuid', 'websocket_server', 'bind_port', 'numeric', '${websocket_port}', 'true', 'Alt Linux: use ${websocket_port} instead of 8080 (Alterator)')
      ON CONFLICT (default_setting_uuid) DO UPDATE SET default_setting_value = EXCLUDED.default_setting_value;" 2>/dev/null \
     || warn "WebSocket port setting could not be inserted (table may not exist yet — will use config.conf value)"
 
-verbose "  WebSocket bind port set to $websocket_port"
+verbose "  WebSocket bind port = $websocket_port"
 
 # =============================================================================
 # Verify v_music_on_hold was populated
