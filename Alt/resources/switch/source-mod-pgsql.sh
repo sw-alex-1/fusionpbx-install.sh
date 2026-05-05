@@ -121,7 +121,10 @@ verbose "Installing build dependencies..."
 pkg_install_required gcc gcc-c++ make autoconf automake libtool pkg-config wget nasm
 
 # FreeSWITCH core dependencies (required by configure even for minimal build)
-pkg_install_required libssl-devel libsqlite3-devel libpcre-devel libncurses-devel
+# NOTE: libpcre2-devel is required by FreeSWITCH 1.10.13+ which switched from
+# PCRE1 (libpcre) to PCRE2 (libpcre2-8). Older versions only needed libpcre-devel.
+# We install both to cover all FreeSWITCH versions the script may encounter.
+pkg_install_required libssl-devel libsqlite3-devel libpcre2-devel libpcre-devel libncurses-devel
 pkg_install_required libcurl-devel libedit-devel libjpeg-devel
 
 # PostgreSQL client development headers (CRITICAL for mod_pgsql)
