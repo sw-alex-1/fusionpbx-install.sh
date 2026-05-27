@@ -1,4 +1,0 @@
-# /etc/default/freeswitch
-FS_USER="www-data"
-FS_GROUP="www-data"
-DAEMON_OPTS="DAEMON_OPTS="-run /var/run/freeswitch -scripts /var/www/fusionpbx/app/scripts/resources/scripts/"
