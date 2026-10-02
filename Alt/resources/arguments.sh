@@ -11,7 +11,7 @@ if [ -z "$ARGUMENTS_PROCESSED" ]; then
     # Parse options using getopt
     # Fixed bug from original: used single quotes around $script_name preventing expansion
     # --proxy requires an argument (the colon after proxy means "takes a value")
-    ARGS=$(getopt -n "$script_name" -o h -l help,use-switch-source,use-switch-package-all,use-switch-master,use-system-master,no-cpu-check,proxy: -- "$@")
+    ARGS=$(getopt -n "$script_name" -o h -l help,use-switch-source,use-switch-package-all,use-switch-master,use-system-master,no-cpu-check,force,proxy: -- "$@")
 
     if [ $? -ne 0 ]; then
         error "Failed parsing command line options."
@@ -24,6 +24,7 @@ if [ -z "$ARGUMENTS_PROCESSED" ]; then
     export USE_SWITCH_MASTER=false
     export USE_SYSTEM_MASTER=false
     export CPU_CHECK=true
+    export FORCE_INSTALL=false
     export ARGUMENTS_PROCESSED=true
     export PROXY_SERVER=""
     HELP=false
@@ -49,6 +50,10 @@ if [ -z "$ARGUMENTS_PROCESSED" ]; then
                 ;;
             --no-cpu-check )
                 export CPU_CHECK=false
+                shift
+                ;;
+            --force )
+                export FORCE_INSTALL=true
                 shift
                 ;;
             --proxy )
@@ -81,6 +86,9 @@ if [ -z "$ARGUMENTS_PROCESSED" ]; then
         warning "  --use-switch-master      Use FreeSWITCH master branch instead of ${green}(default: stable)"
         warning "  --use-system-master      Use FusionPBX master branch instead of ${green}(default: $system_branch)"
         warning "  --no-cpu-check           Skip CPU architecture validation ${green}(default: check enabled)"
+        warning "  --force                  Bypass the installed-system protection"
+        warning "                           DANGER: re-running on an installed system"
+        warning "                           destroys its configuration (see resources/guard.sh)"
         warning "  --proxy host:port        Use HTTP proxy for all network operations"
         warning "                           Example: --proxy 192.168.0.1:8080"
         warning "  -h, --help               Show this help message"

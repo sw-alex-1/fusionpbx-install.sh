@@ -7,6 +7,13 @@
 # Usage:
 #   ./pre-install.sh                              # Default
 #   ./pre-install.sh --proxy 192.168.0.1:8080     # Use HTTP proxy
+#   ./pre-install.sh --force                      # Bypass installed-system
+#                                                 # protection (DANGER)
+#
+# INSTALLED-SYSTEM PROTECTION: this script refuses to run when FusionPBX
+# is already installed and configured on this system, because it runs
+# 'apt-get dist-upgrade' which can restart telephony services on a
+# production system. --force bypasses. Detection logic: resources/guard.sh.
 #
 # If your server has no direct internet access, use --proxy to specify
 # an HTTP proxy server. All subsequent network operations (apt-get, git)
@@ -18,9 +25,10 @@
 #   ./pre-install.sh
 
 # =============================================================================
-# Parse --proxy argument
+# Parse arguments (--proxy host:port, --force)
 # =============================================================================
 PROXY_SERVER=""
+FORCE_INSTALL=false
 
 for _arg in "$@"; do
     case "$_arg" in
@@ -31,6 +39,9 @@ for _arg in "$@"; do
             # Next argument is the proxy value (handled below)
             _next_arg=true
             ;;
+        --force)
+            FORCE_INSTALL=true
+            ;;
         *)
             if [ "$_next_arg" = "true" ]; then
                 PROXY_SERVER="$_arg"
@@ -39,6 +50,18 @@ for _arg in "$@"; do
             ;;
     esac
 done
+
+# =============================================================================
+# Installed-system protection
+# pre-install.sh runs 'apt-get dist-upgrade', which can restart telephony
+# services (FreeSWITCH, PostgreSQL, nginx) on a production system.
+# Refuse to run when FusionPBX is already installed. --force bypasses.
+# Detection logic: resources/guard.sh
+# =============================================================================
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+. "$SCRIPT_DIR/resources/guard.sh"
+guard_check_installed
 
 # =============================================================================
 # Configure proxy (if specified)
@@ -141,9 +164,13 @@ if [ -n "$PROXY_SERVER" ]; then
 fi
 
 # =============================================================================
-# Download the installer
+# Download the installer (skip if already downloaded)
 # =============================================================================
-cd /usr/src && git clone https://github.com/sw-alex-1/fusionpbx-install.sh.git
+if [ -d /usr/src/fusionpbx-install.sh/.git ]; then
+    echo "Installer already downloaded: /usr/src/fusionpbx-install.sh (skipping git clone)"
+else
+    cd /usr/src && git clone https://github.com/sw-alex-1/fusionpbx-install.sh.git
+fi
 
 # =============================================================================
 # Change to the installer directory

@@ -22,6 +22,7 @@ cd /usr/src/fusionpbx-install.sh/Alt && ./install.sh
 |--------|-------------|
 | `--proxy host:port` | Route all network requests through an HTTP proxy |
 | `--no-cpu-check` | Skip CPU validation (for testing in VMs) |
+| `--force` | Bypass the installed-system protection. **DANGER:** re-running on an installed system destroys its configuration |
 
 ### Examples
 
@@ -99,7 +100,11 @@ The installer works fully behind an HTTP proxy. Proxy is configured for:
 
 ## Re-running
 
-The installer is idempotent — safe to re-run on a partially configured system. Already installed packages are skipped, existing databases and roles are preserved, and configs are backed up before modification.
+The installer is protected against accidental re-runs on a live system:
+
+- **After a failed step** — safe to re-run. The installer detects the incomplete previous attempt (progress state in `/etc/fusionpbx/.installer-state`) and resumes, skipping work that is already done.
+- **On an installed system** — the installer **refuses to run**. After a successful install, the marker `/etc/fusionpbx/.installed` is created; systems installed by older installer versions are detected by their configured `config.conf` and database schema. A re-run would reset database passwords, replace `/etc/freeswitch` with defaults, and add duplicate domain/admin records. To update FusionPBX use *Advanced → Upgrade* in the web interface instead.
+- **`--force`** — bypasses this protection for a conscious re-installation (destroys the existing configuration).
 
 ## Security
 
@@ -131,6 +136,7 @@ cd /usr/src/fusionpbx-install.sh/Alt && ./install.sh
 |----------|----------|
 | `--proxy хост:порт` | Направить все сетевые запросы через HTTP-прокси |
 | `--no-cpu-check` | Пропустить проверку CPU (для тестирования в ВМ) |
+| `--force` | Обойти защиту от повторного запуска. **ОПАСНО:** повторный запуск на установленной системе уничтожает её настройки |
 
 ### Примеры
 
@@ -208,7 +214,11 @@ php_version=8.2              # версия PHP
 
 ## Повторный запуск
 
-Установщик идемпотентен — безопасен для повторного запуска на частично настроенной системе. Уже установленные пакеты пропускаются, существующие базы данных и роли сохраняются, конфигурации резервируются перед изменением.
+Установщик защищён от случайного повторного запуска на боевой системе:
+
+- **После сбоя на одном из шагов** — повторный запуск безопасен. Установщик распознаёт незавершённую предыдущую попытку (файл прогресса `/etc/fusionpbx/.installer-state`) и продолжает установку, пропуская уже выполненное.
+- **На установленной системе** — установщик **отказывается запускаться**. После успешной установки создаётся маркер `/etc/fusionpbx/.installed`; системы, установленные старыми версиями установщика, распознаются по настроенному `config.conf` и схеме базы данных. Повторный запуск сбросил бы пароли БД, заменил `/etc/freeswitch` дефолтным конфигом и добавил бы дубликаты домена и администратора. Для обновления FusionPBX используйте *Advanced → Upgrade* в веб-интерфейсе.
+- **`--force`** — обход защиты для осознанной переустановки (уничтожает текущие настройки).
 
 ## Безопасность
 

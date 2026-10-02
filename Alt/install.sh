@@ -6,7 +6,16 @@
 # This script installs FusionPBX and all dependencies on Alt Linux.
 # It is safe to re-run on a partially configured system - already installed
 # packages will be skipped and existing configs will be backed up before
-# modification.
+# modification. Re-running after a failed step is the documented recovery
+# path: the installer detects an incomplete previous run via the progress
+# state file (/etc/fusionpbx/.installer-state, see resources/guard.sh).
+#
+# INSTALLED-SYSTEM PROTECTION: the installer REFUSES to run when FusionPBX
+# is already installed and configured on this system, because a re-run
+# would destroy the existing configuration (reset database passwords,
+# replace /etc/freeswitch with defaults, add duplicate domain/admin
+# records). Use --force to bypass the protection for a conscious
+# re-installation. See resources/guard.sh for the detection logic.
 #
 # ERROR HANDLING: The installer STOPS on critical errors. Each step is
 # executed via run_step() which checks the exit code. If a step fails,
@@ -26,6 +35,9 @@
 #   ./install.sh --use-switch-master          # Use FreeSWITCH master branch
 #   ./install.sh --no-cpu-check               # Skip CPU validation
 #   ./install.sh --proxy 192.168.0.1:8080     # Use HTTP proxy
+#   ./install.sh --force                      # DANGER: run even if FusionPBX
+#                                             # is already installed (destroys
+#                                             # existing configuration)
 #   ./install.sh -h                           # Show help
 
 # Determine the script directory (robust against symlinks and unusual paths)
@@ -109,6 +121,8 @@ run_step() {
         error "  1. Read the error messages above carefully"
         error "  2. Fix the problem (missing package, network issue, etc.)"
         error "  3. Re-run the installer — it will skip already completed steps"
+        error "     (if it refuses to re-run because the system looks fully"
+        error "      installed, add --force — see resources/guard.sh)"
         error ""
         error "To re-run just this step for debugging:"
         error "  cd $SCRIPT_DIR && $_rs_script"
@@ -118,7 +132,25 @@ run_step() {
     fi
 
     verbose "Step $_rs_step_num completed successfully."
+
+    # Record progress for the installed-system guard (recovery detection).
+    # Must never fail the step - guard_record_step ignores write errors.
+    guard_record_step "$_rs_step_num" "$_rs_desc"
 }
+
+# =============================================================================
+# Installed-system protection
+#
+# Refuses to run when FusionPBX is already installed and configured on this
+# system: a re-run would reset database passwords, replace /etc/freeswitch
+# with defaults, and add duplicate domain/admin records to the database.
+# A previous run of THIS installer that did not complete is detected via
+# the progress state file and re-running is allowed (recovery).
+# --force bypasses the protection. Detection logic: resources/guard.sh.
+# =============================================================================
+
+. "$SCRIPT_DIR/resources/guard.sh"
+guard_check_installed
 
 # =============================================================================
 # Skip CPU check if requested
@@ -155,6 +187,14 @@ fi
 verbose ""
 verbose "Starting installation..."
 verbose ""
+
+# =============================================================================
+# Record installation start
+# Creates the progress state file so that a failed run is recognized as
+# "incomplete" (recovery) instead of "installed" (blocked) on the next start.
+# =============================================================================
+
+guard_install_started
 
 # =============================================================================
 # Installation Steps
@@ -221,4 +261,15 @@ verbose " Installation completed successfully!"
 verbose "========================================="
 verbose ""
 verbose "All 11 installation steps completed without errors."
+verbose ""
+
+# =============================================================================
+# Installed-system guard: mark this system as installed
+# From now on the installer refuses to re-run here (protection against
+# destroying a live system). --force bypasses; see resources/guard.sh.
+# =============================================================================
+
+guard_install_finished
+verbose "System marked as installed: $GUARD_MARKER_FILE"
+verbose "The installer will refuse to re-run on this system from now on."
 verbose ""
