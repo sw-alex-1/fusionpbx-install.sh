@@ -1,15 +1,16 @@
 ;;;;; FreeSWITCH systemd service unit for Alt Linux
 ;;;;; Adapted from the Debian package by Travis Cross <tc@traviscross.com>
 ;;;;; Changes for Alt Linux:
-;;;;;   - USER=_nginx, GROUP=_nginx (same as web user, mirroring Debian's www-data)
+;;;;;   - USER=angie, GROUP=angie (same as web user, mirroring Debian's www-data)
 ;;;;;   - After=postgresql.service (ensure DB is ready)
 ;;;;;   - ExecStart path: /usr/sbin/freeswitch (Alt Linux RPM path)
 ;;;;;
 ;;;;; DESIGN NOTE: In Debian, FreeSWITCH runs as www-data (the web server user)
 ;;;;; so that FusionPBX (also running as www-data via PHP-FPM) can read and
 ;;;;; write FreeSWITCH configuration files. We replicate this on Alt Linux by
-;;;;; running FreeSWITCH as _nginx. Previously using _pbx caused permission
-;;;;; conflicts that made the system uncontrollable from FusionPBX.
+;;;;; running FreeSWITCH as angie (the Angie web server user). Previously
+;;;;; using _pbx caused permission conflicts that made the system
+;;;;; uncontrollable from FusionPBX.
 
 [Unit]
 Description=FreeSWITCH open source softswitch
@@ -22,8 +23,8 @@ After=network.target network-online.target local-fs.target postgresql.service
 Type=forking
 PIDFile=/run/freeswitch/freeswitch.pid
 Environment="DAEMON_OPTS=-nonat"
-Environment="USER=_nginx"
-Environment="GROUP=_nginx"
+Environment="USER=angie"
+Environment="GROUP=angie"
 EnvironmentFile=-/etc/default/freeswitch
 ExecStartPre=/bin/mkdir -p /var/run/freeswitch
 ExecStartPre=/bin/chown -R ${USER}:${GROUP} /var/lib/freeswitch /var/log/freeswitch /etc/freeswitch /usr/share/freeswitch /var/run/freeswitch

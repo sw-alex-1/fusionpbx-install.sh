@@ -9,11 +9,11 @@
 # switch settings correctly — including v_music_on_hold.
 #
 # Alt Linux specifics:
-#   - Web user: _nginx:_nginx (NOT www-data:www-data)
-#   - FreeSWITCH user: _nginx:_nginx (same as web user, like Debian's www-data)
+#   - Web user: angie:angie (NOT www-data:www-data)
+#   - FreeSWITCH user: angie:angie (same as web user, like Debian's www-data)
 #   - hostname -I not supported — use 'ip addr' instead
 #   - tmpfiles.d for /var/run/fusionpbx persistence across reboots
-#   - FusionPBX source patched in fusionpbx.sh to use _nginx instead of www-data
+#   - FusionPBX source patched in fusionpbx.sh to use angie instead of www-data
 #   - Safety net: post-generation scan for any remaining www-data references
 #   - PHP CLI must have pdo_pgsql loaded for FusionPBX DB access
 
@@ -350,7 +350,7 @@ verbose "Verifying music on hold configuration..."
 # =============================================================================
 # Set file permissions manually
 # We do manual chown with the correct web user instead of relying on
-# upgrade.php --permissions (which now uses _nginx after our source patch
+# upgrade.php --permissions (which now uses angie after our source patch
 # in fusionpbx.sh, but manual chown is simpler and more reliable).
 # =============================================================================
 
@@ -484,7 +484,7 @@ systemctl daemon-reload
 
 verbose "Enabling services for auto-start on boot..."
 
-for _svc in nginx "php${php_version}-fpm" postgresql freeswitch memcached; do
+for _svc in angie "php${php_version}-fpm" postgresql freeswitch memcached; do
     if systemctl is-enabled "$_svc" 2>/dev/null; then
         verbose "  $_svc: already enabled"
     else
@@ -518,14 +518,14 @@ if [ "$_fpbx_svc_enabled" -eq 0 ]; then
 fi
 
 # =============================================================================
-# Final restart of nginx and FreeSWITCH (matches Debian)
+# Final restart of Angie and FreeSWITCH (matches Debian)
 # After services are installed and all configuration is complete,
-# do a final restart of both nginx and FreeSWITCH.
+# do a final restart of both Angie and FreeSWITCH.
 # =============================================================================
 
-verbose "Final restart of nginx and FreeSWITCH..."
-systemctl restart nginx freeswitch || warn "nginx/FreeSWITCH restart had issues"
-verbose "  nginx and FreeSWITCH restarted"
+verbose "Final restart of Angie and FreeSWITCH..."
+systemctl restart angie freeswitch || warn "Angie/FreeSWITCH restart had issues"
+verbose "  Angie and FreeSWITCH restarted"
 
 # =============================================================================
 # Welcome message

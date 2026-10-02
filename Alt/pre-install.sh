@@ -54,7 +54,7 @@ done
 # =============================================================================
 # Installed-system protection
 # pre-install.sh runs 'apt-get dist-upgrade', which can restart telephony
-# services (FreeSWITCH, PostgreSQL, nginx) on a production system.
+# services (FreeSWITCH, PostgreSQL, Angie) on a production system.
 # Refuse to run when FusionPBX is already installed. --force bypasses.
 # Detection logic: resources/guard.sh
 # =============================================================================

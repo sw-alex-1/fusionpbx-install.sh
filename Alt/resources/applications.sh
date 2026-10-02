@@ -5,7 +5,7 @@
 # Safe for re-runs: skips already installed apps.
 #
 # Alt Linux specifics:
-#   - Web user: _nginx:_nginx (NOT www-data:www-data)
+#   - Web user: angie:angie (NOT www-data:www-data)
 #   - Applications are cloned into /var/www/fusionpbx/app/
 
 # Determine script directory

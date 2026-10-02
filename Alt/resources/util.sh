@@ -192,7 +192,7 @@ backup_file() {
 
 # Replace a pattern in a file, with automatic backup
 # Usage: file_replace <file> <pattern> <replacement>
-# Example: file_replace /etc/nginx/nginx.conf "user nginx" "user _nginx"
+# Example: file_replace /etc/angie/angie.conf "user nobody" "user angie"
 # Safe for re-runs: backs up before modifying, pattern replacement is idempotent
 file_replace() {
     _fr_file="$1"
@@ -223,7 +223,7 @@ service_enable_start() {
 
 # Enable and start a CRITICAL systemd service — FATAL on failure
 # Use this for services that must be running for the installer to continue
-# (e.g. PostgreSQL, PHP-FPM, nginx).
+# (e.g. PostgreSQL, PHP-FPM, Angie).
 # Usage: service_enable_start_required <service_name>
 service_enable_start_required() {
     _sesr_svc="$1"

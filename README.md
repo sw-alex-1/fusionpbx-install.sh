@@ -39,12 +39,12 @@ cd /usr/src/fusionpbx-install.sh/Alt && ./install.sh
 | Component | Details |
 |-----------|---------|
 | **PHP** | 8.2 (FCGI + FPM) |
-| **nginx** | From Alt Linux repository |
+| **Angie** | Web server (advanced nginx fork) from the official Angie repository |
 | **PostgreSQL** | 16 (md5 auth for TCP, trust for local socket) |
 | **FreeSWITCH** | RPM packages from Alt Linux repository |
 | **mod_pgsql** | Compiled from matching FreeSWITCH source (PostgreSQL 14+ patch applied) |
 | **FusionPBX** | 5.6 branch from Git (single point of entry) |
-| **Fail2ban** | Pre-configured for FusionPBX, FreeSWITCH, nginx, and SSH |
+| **Fail2ban** | Pre-configured for FusionPBX, FreeSWITCH, Angie, and SSH |
 | **iptables** | Pre-configured for SIP, RTP, HTTP, and SSH |
 | **Monit** | Process monitoring |
 | **sngrep** | SIP call capture tool |
@@ -55,7 +55,7 @@ The installer runs 11 steps and **stops on any error** with a clear message:
 
 1. System preparation (packages, updates)
 2. PHP and PHP-FPM
-3. nginx
+3. Angie web server (from the official Angie repository)
 4. PostgreSQL
 5. FusionPBX (Git clone + Composer)
 6. FreeSWITCH (RPM + mod_pgsql from source + config)
@@ -68,10 +68,11 @@ The installer runs 11 steps and **stops on any error** with a clear message:
 ## Alt Linux Specifics
 
 - **APT-RPM**: Package names differ from Debian (e.g., `php8.2-fpm-fcgi` instead of `php8.2-fpm`)
-- **User model**: Both nginx and FreeSWITCH run as `_nginx:_nginx` (mirrors Debian's `www-data` approach)
+- **Web server**: Angie instead of nginx — installed from the official Angie repository (`download.angie.software`), configuration is nginx-compatible (supported: Alt 11, Alt 10, Alt SP 10, Alt SP 8)
+- **User model**: Angie, PHP-FPM, and FreeSWITCH all run as `angie:angie` (mirrors Debian's `www-data` approach)
 - **PostgreSQL**: Data directory is `/var/lib/pgsql/data/` (no version subdirectory)
 - **mod_pgsql**: Not included in Alt Linux FreeSWITCH RPMs — compiled from source with a PostgreSQL 14+ compatibility patch
-- **All FreeSWITCH databases use PostgreSQL** instead of SQLite (avoids file-locking issues with the `_nginx` user on Alt Linux)
+- **All FreeSWITCH databases use PostgreSQL** instead of SQLite (avoids file-locking issues with the `angie` user on Alt Linux)
 - **Virtual packages**: The installer correctly handles APT package resolution (e.g., `php8.2-xml` → `php8.2-libs`)
 - **Password encryption**: Forces `md5` for PostgreSQL user passwords to ensure compatibility with `pg_hba.conf` auth settings across all PG versions
 
@@ -153,12 +154,12 @@ cd /usr/src/fusionpbx-install.sh/Alt && ./install.sh
 | Компонент | Подробности |
 |-----------|-------------|
 | **PHP** | 8.2 (FCGI + FPM) |
-| **nginx** | Из репозитория Альт Линукс |
+| **Angie** | Веб-сервер (продвинутый форк nginx) из официального репозитория Angie |
 | **PostgreSQL** | 16 (md5-аутентификация для TCP, trust для локального сокета) |
 | **FreeSWITCH** | RPM-пакеты из репозитория Альт Линукс |
 | **mod_pgsql** | Компилируется из исходников FreeSWITCH (с патчем для PostgreSQL 14+) |
 | **FusionPBX** | Ветка 5.6 из Git (single point of entry) |
-| **Fail2ban** | Преднастроен для FusionPBX, FreeSWITCH, nginx и SSH |
+| **Fail2ban** | Преднастроен для FusionPBX, FreeSWITCH, Angie и SSH |
 | **iptables** | Преднастроен для SIP, RTP, HTTP и SSH |
 | **Monit** | Мониторинг процессов |
 | **sngrep** | Перехват SIP-вызовов |
@@ -169,7 +170,7 @@ cd /usr/src/fusionpbx-install.sh/Alt && ./install.sh
 
 1. Подготовка системы (пакеты, обновления)
 2. PHP и PHP-FPM
-3. nginx
+3. Веб-сервер Angie (из официального репозитория Angie)
 4. PostgreSQL
 5. FusionPBX (Git-клонирование + Composer)
 6. FreeSWITCH (RPM + mod_pgsql из исходников + конфигурация)
@@ -182,10 +183,11 @@ cd /usr/src/fusionpbx-install.sh/Alt && ./install.sh
 ## Особенности Альт Линукс
 
 - **APT-RPM**: Имена пакетов отличаются от Debian (например, `php8.2-fpm-fcgi` вместо `php8.2-fpm`)
-- **Пользователь**: nginx и FreeSWITCH работают от имени `_nginx:_nginx` (аналог `www-data` в Debian)
+- **Веб-сервер**: Angie вместо nginx — устанавливается из официального репозитория Angie (`download.angie.software`), конфигурация совместима с nginx (поддерживаются: Альт 11, Альт 10, Альт СП 10, Альт СП 8)
+- **Пользователь**: Angie, PHP-FPM и FreeSWITCH работают от имени `angie:angie` (аналог `www-data` в Debian)
 - **PostgreSQL**: Каталог данных — `/var/lib/pgsql/data/` (без подкаталога версии)
 - **mod_pgsql**: Отсутствует в RPM-пакетах FreeSWITCH — компилируется из исходников с патчем совместимости для PostgreSQL 14+
-- **Все базы данных FreeSWITCH используют PostgreSQL** вместо SQLite (устраняет проблемы с блокировками файлов от пользователя `_nginx`)
+- **Все базы данных FreeSWITCH используют PostgreSQL** вместо SQLite (устраняет проблемы с блокировками файлов от пользователя `angie`)
 - **Виртуальные пакеты**: Корректно обрабатывается разрешение виртуальных пакетов APT (например, `php8.2-xml` → `php8.2-libs`)
 - **Шифрование паролей**: Принудительно используется `md5` для паролей PostgreSQL, чтобы обеспечить совместимость с аутентификацией `pg_hba.conf` во всех версиях PG
 

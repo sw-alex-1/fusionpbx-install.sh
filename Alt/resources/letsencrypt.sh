@@ -5,9 +5,9 @@
 #
 # Alt Linux specifics:
 #   - curl available in repos (same as Debian)
-#   - nginx sites dir: /etc/nginx/sites-available.d/ (NOT sites-available)
-#   - nginx SSL paths: /etc/nginx/ssl/ (same)
-#   - FreeSWITCH TLS owner: _pbx:_pbx (NOT www-data:www-data)
+#   - Angie site config: /etc/angie/http.d/fusionpbx.conf
+#   - Angie SSL paths: /etc/angie/ssl/ (self-signed by angie.sh)
+#   - FreeSWITCH TLS owner: fs_user:fs_group (NOT www-data:www-data)
 #   - No certbot — dehydrated is used (same as Debian installer)
 #
 # This script is interactive — it prompts for domain name and email.
@@ -126,25 +126,26 @@ else
 fi
 
 # =============================================================================
-# Update nginx configuration
+# Update Angie configuration
 # =============================================================================
 
-verbose "Updating nginx SSL configuration..."
+verbose "Updating Angie SSL configuration..."
 
-mkdir -p /etc/nginx/ssl
+# Alt Linux: Angie site config lives in /etc/angie/http.d/
+_angie_site="/etc/angie/http.d/fusionpbx.conf"
 
-# Alt Linux: sites-available.d directory (not sites-available)
-_nginx_site="/etc/nginx/sites-available.d/fusionpbx"
-
-if [ -f "$_nginx_site" ]; then
-    sed "s@ssl_certificate[ \t]*/etc/ssl/certs/nginx.crt;@ssl_certificate /etc/dehydrated/certs/$domain_alias/fullchain.pem;@g" -i "$_nginx_site"
-    sed "s@ssl_certificate_key[ \t]*/etc/ssl/private/nginx.key;@ssl_certificate_key /etc/dehydrated/certs/$domain_alias/privkey.pem;@g" -i "$_nginx_site"
+if [ -f "$_angie_site" ]; then
+    # Replace the self-signed certificate paths (created by angie.sh)
+    # with the LetsEncrypt certificate paths
+    sed "s@ssl_certificate[ \t]*/etc/angie/ssl/angie.crt;@ssl_certificate /etc/dehydrated/certs/$domain_alias/fullchain.pem;@g" -i "$_angie_site"
+    sed "s@ssl_certificate_key[ \t]*/etc/angie/ssl/angie.key;@ssl_certificate_key /etc/dehydrated/certs/$domain_alias/privkey.pem;@g" -i "$_angie_site"
+    verbose "Angie SSL paths updated to LetsEncrypt certificate"
 else
-    warn "nginx site config not found at $_nginx_site — update SSL paths manually"
+    warn "Angie site config not found at $_angie_site — update SSL paths manually"
 fi
 
-# Test and reload nginx
-/usr/sbin/nginx -t && /usr/sbin/nginx -s reload
+# Test and reload Angie
+/usr/sbin/angie -t && systemctl reload angie
 
 # =============================================================================
 # FreeSWITCH TLS setup

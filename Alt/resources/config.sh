@@ -5,7 +5,7 @@ system_username=admin                       # default username admin
 system_password=random                      # random or a custom value
 system_branch=5.6                           # master, 5.6, 5.5
                                              # 5.6: single point of entry (public/index.php)
-                                             # requires the SPE nginx config (nginx/fusionpbx)
+                                             # requires the SPE web server config (angie/fusionpbx)
 
 # FreeSWITCH Settings
 switch_branch=stable                        # master, stable
@@ -55,18 +55,18 @@ syslog_path=/var/log/syslog/messages         # Syslog (NOT /var/log/syslog)
 # CRITICAL: In the Debian installer, FreeSWITCH runs as www-data (same as the
 # web server user) so that FusionPBX (PHP-FPM, also www-data) can read and
 # write FreeSWITCH configuration files. We replicate this on Alt Linux by
-# running FreeSWITCH as _nginx (same as the web server user). Using a separate
+# running FreeSWITCH as angie (same as the web server user). Using a separate
 # _pbx user caused permission conflicts that made the system uncontrollable
 # from the FusionPBX web interface.
-web_user=_nginx                             # nginx, php-fpm, AND FreeSWITCH user
-web_group=_nginx                            # nginx, php-fpm, AND FreeSWITCH group
-fs_user=_nginx                              # FreeSWITCH runtime user (= web_user, like Debian's www-data)
-fs_group=_nginx                             # FreeSWITCH runtime group (= web_group, like Debian's www-data)
+web_user=angie                              # angie, php-fpm, AND FreeSWITCH user
+web_group=angie                             # angie, php-fpm, AND FreeSWITCH group
+fs_user=angie                               # FreeSWITCH runtime user (= web_user, like Debian's www-data)
+fs_group=angie                              # FreeSWITCH runtime group (= web_group, like Debian's www-data)
 
 # Alt Linux WebSocket Port
 # Port 8080 is occupied by Alterator (Alt Linux system configuration tool).
 # Use port 8088 for FusionPBX WebSocket to avoid conflict.
-# This value is used in: config.conf, nginx fusionpbx.conf, v_default_settings
+# This value is used in: config.conf, angie fusionpbx.conf, v_default_settings
 websocket_port=8088
 
 # Optional Applications

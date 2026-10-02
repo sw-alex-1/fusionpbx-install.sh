@@ -2,7 +2,7 @@
 # Adapted from the Debian version with Alt Linux log paths:
 #   - /var/log/auth/secure  (was /var/log/auth.log)
 #   - /var/log/syslog/messages (was /var/log/syslog)
-#   - nginx and FreeSWITCH paths are the same
+#   - Angie logs: /var/log/angie/ (the old nginx layout is no longer used)
 
 [ssh]
 enabled  = true
@@ -114,26 +114,26 @@ maxretry = 10
 findtime = 60
 bantime  = 86400
 
-[nginx-404]
+[angie-404]
 enabled  = true
 port     = 80,443
 protocol = tcp
-filter   = nginx-404
-logpath  = /var/log/nginx/access*.log
-action   = iptables-allports[name=nginx-404, protocol=all]
+filter   = angie-404
+logpath  = /var/log/angie/access*.log
+action   = iptables-allports[name=angie-404, protocol=all]
 bantime  = 3600
 findtime = 60
 maxretry = 300
 
-[nginx-dos]
+[angie-dos]
 # Based on apache-badbots but a simple IP check (any IP requesting more than
 # 300 pages in 60 seconds, or 5p/s average, is suspicious)
 enabled  = true
 port     = 80,443
 protocol = tcp
-filter   = nginx-dos
-logpath  = /var/log/nginx/access*.log
-action   = iptables-allports[name=nginx-dos, protocol=all]
+filter   = angie-dos
+logpath  = /var/log/angie/access*.log
+action   = iptables-allports[name=angie-dos, protocol=all]
 findtime = 60
 bantime  = 86400
 maxretry = 800

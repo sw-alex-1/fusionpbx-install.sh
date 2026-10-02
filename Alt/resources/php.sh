@@ -169,8 +169,29 @@ else
 fi
 
 # =============================================================================
+# Ensure the web user exists
+# The web user (angie) is normally created by the angie package, but that is
+# installed later (step 3) - PHP-FPM is configured and started here first.
+# Create the user now if missing; the angie package will detect it and skip
+# its own creation (its pre-install script checks getent passwd).
+# Mirrors the Debian www-data model: angie, php-fpm and FreeSWITCH all run
+# as the same user.
+# =============================================================================
+
+if ! id "${web_user}" >/dev/null 2>&1; then
+    verbose "Web user (${web_user}) does not exist yet - creating..."
+    groupadd -r "${web_group}" 2>/dev/null || warn "groupadd ${web_group} failed (may already exist)"
+    useradd -r -c "Angie web server" -d /var/cache/angie -g "${web_group}" -s /sbin/nologin "${web_user}" \
+        || die "Failed to create the web user ${web_user}"
+    verbose "Web user created: ${web_user}:${web_group}"
+else
+    verbose "Web user (${web_user}) already exists"
+fi
+
+# =============================================================================
 # Configure PHP-FPM pool to run as web user
-# Alt Linux FPM may default to a different user; ensure it matches nginx.
+# Alt Linux FPM may default to a different user; ensure it matches the web
+# server (Angie).
 # =============================================================================
 
 verbose "Configuring PHP-FPM pool settings..."
@@ -193,7 +214,7 @@ done
 if [ -n "$_fpm_pool_conf" ]; then
     backup_file "$_fpm_pool_conf"
 
-    # Set the FPM pool user and group to match nginx
+    # Set the FPM pool user and group to match the web server (Angie)
     # This ensures PHP can read/write files owned by the web server
     sed -i "s/^user = .*/user = ${web_user}/g" "$_fpm_pool_conf"
     sed -i "s/^group = .*/group = ${web_group}/g" "$_fpm_pool_conf"
@@ -203,7 +224,7 @@ if [ -n "$_fpm_pool_conf" ]; then
     _fpm_socket="/var/run/php${php_version}-fpm/php${php_version}-fpm.sock"
     sed -i "s|^listen = .*|listen = ${_fpm_socket}|g" "$_fpm_pool_conf"
 
-    # Set socket permissions so nginx can connect
+    # Set socket permissions so the web server (Angie) can connect
     sed -i "s/^;listen.owner = .*/listen.owner = ${web_user}/g" "$_fpm_pool_conf"
     sed -i "s/^;listen.group = .*/listen.group = ${web_group}/g" "$_fpm_pool_conf"
     sed -i "s/^listen.owner = .*/listen.owner = ${web_user}/g" "$_fpm_pool_conf"

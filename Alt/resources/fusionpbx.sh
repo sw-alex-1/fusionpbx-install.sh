@@ -5,10 +5,10 @@
 # Safe for re-runs: skips git clone if directory already exists.
 #
 # Alt Linux specifics:
-#   - No ssl-cert package (already handled in nginx.sh with self-signed)
+#   - No ssl-cert package (already handled in angie.sh with self-signed)
 #   - No libtiff5-dev (dev package not needed for runtime)
 #   - Some packages (qrencode, libtiff-tools, at) are optional
-#   - File ownership: _nginx:_nginx (web server user, not www-data)
+#   - File ownership: angie:angie (web server user, not www-data)
 
 # Determine script directory
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -135,8 +135,8 @@ fi
 #
 # We replace 'www-data' with the Alt Linux web user ($web_user) directly in
 # the source AFTER cloning, BEFORE any upgrade.php runs. This ensures:
-#   - upgrade.php --services generates correct service files (User=_nginx, Group=_nginx)
-#   - upgrade.php --permissions sets correct ownership (chown _nginx:_nginx)
+#   - upgrade.php --services generates correct service files (User=angie, Group=angie)
+#   - upgrade.php --permissions sets correct ownership (chown angie:angie)
 #   - Any future module activation also generates correct files
 #
 # The post-generation patching in finish.sh remains as a safety net only.
@@ -144,7 +144,7 @@ fi
 
 verbose "Patching FusionPBX source for Alt Linux user (${web_user})..."
 
-# Replace in .service template files (User=www-data → User=_nginx, Group=www-data → Group=_nginx)
+# Replace in .service template files (User=www-data → User=angie, Group=www-data → Group=angie)
 _service_count=0
 for _svc_file in "$_fpbx_dir"/core/*/resources/service/*.service \
                  "$_fpbx_dir"/core/*/resources/service/*/*.service \
@@ -157,7 +157,7 @@ for _svc_file in "$_fpbx_dir"/core/*/resources/service/*.service \
 done
 verbose "  Patched $_service_count service template files"
 
-# Replace in PHP files (chown -R www-data:www-data → chown -R _nginx:_nginx)
+# Replace in PHP files (chown -R www-data:www-data → chown -R angie:angie)
 for _php_file in "$_fpbx_dir"/core/upgrade/upgrade.php "$_fpbx_dir"/core/upgrade/upgrade_menu.php; do
     if [ -f "$_php_file" ]; then
         sed -i "s/www-data:www-data/${web_user}:${web_group}/g" "$_php_file"
@@ -175,7 +175,7 @@ ensure_dir "/var/cache/fusionpbx" "$web_user:$web_group"
 
 # =============================================================================
 # Set file ownership
-# FusionPBX files must be owned by the web server user (_nginx) so that
+# FusionPBX files must be owned by the web server user (angie) so that
 # PHP-FPM can write to them (uploads, cache, config, etc.).
 # FreeSWITCH directories will be handled separately in switch.sh.
 # =============================================================================

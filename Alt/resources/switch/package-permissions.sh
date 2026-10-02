@@ -10,8 +10,8 @@
 # to read and write FreeSWITCH configuration files, scripts, and recordings.
 #
 # On Alt Linux, we replicate this pattern:
-#   - FreeSWITCH files are owned by _nginx:_nginx (the web server user)
-#   - FreeSWITCH is started as _nginx:_nginx (via the systemd unit file)
+#   - FreeSWITCH files are owned by angie:angie (the web server user)
+#   - FreeSWITCH is started as angie:angie (via the systemd unit file)
 #   - This ensures both FreeSWITCH and FusionPBX (PHP-FPM) can access
 #     all the same files without permission conflicts
 #
@@ -33,9 +33,9 @@ verbose "Setting FreeSWITCH file permissions..."
 # so that BOTH the FreeSWITCH daemon AND FusionPBX (PHP-FPM) can
 # read/write configuration, logs, recordings, and data.
 #
-# IMPORTANT: We use $web_user:$web_group (_nginx:_nginx), NOT _pbx:_pbx.
+# IMPORTANT: We use $web_user:$web_group (angie:angie), NOT _pbx:_pbx.
 # The systemd unit file (freeswitch.service.package) must also use
-# _nginx:_nginx as USER/GROUP for consistency.
+# angie:angie as USER/GROUP for consistency.
 _fs_dirs="
 /etc/freeswitch
 /var/lib/freeswitch

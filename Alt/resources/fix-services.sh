@@ -2,7 +2,7 @@
 
 # FusionPBX Alt Linux - Fix Service Files
 #
-# Replaces www-data with _nginx in:
+# Replaces www-data with angie in:
 #   1. FusionPBX service TEMPLATE files in the source tree
 #      (so future module activations generate correct services)
 #   2. Installed systemd service files in /etc/systemd/system/
@@ -19,8 +19,8 @@
 # This script is safe to run multiple times.
 
 # Alt Linux web/FreeSWITCH user
-_web_user="_nginx"
-_web_group="_nginx"
+_web_user="angie"
+_web_group="angie"
 _fpbx_dir="/var/www/fusionpbx"
 
 echo "Fixing www-data -> ${_web_user} in FusionPBX service files..."

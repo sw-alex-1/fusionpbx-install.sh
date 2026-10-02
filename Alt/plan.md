@@ -1,5 +1,12 @@
 # План портирования FusionPBX Installer на Alt Linux
 
+> **ОБНОВЛЕНИЕ (2026-10)**: веб-сервер заменён с nginx на **Angie** (продвинутый форк
+> nginx, без лицензионных рисков). Angie ставится из официального репозитория
+> `download.angie.software`, конфигурация nginx-совместима. Пользователь для
+> веб-сервера / PHP-FPM / FreeSWITCH — `angie:angie` (вместо `_nginx:_nginx`).
+> Рабочие скрипты: `resources/angie.sh`, `resources/angie/fusionpbx`.
+> Нижеизложенный план — исторический документ первоначального портирования.
+
 ## Контекст
 
 На основе анализа репозитория `fusionpbx-install.sh` и ответов на вопросы по Alt Linux,

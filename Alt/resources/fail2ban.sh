@@ -76,7 +76,8 @@ fi
 # =============================================================================
 # Install fail2ban filters
 # These filter configs are OS-independent — they match log message patterns
-# from FreeSWITCH, nginx, and FusionPBX which are the same on any distro.
+# from FreeSWITCH, Angie, and FusionPBX which are the same on any distro
+# (Angie uses the nginx-compatible log format).
 # =============================================================================
 
 verbose "Installing fail2ban filters..."
@@ -95,8 +96,8 @@ freeswitch-ip.conf
 fusionpbx.conf
 fusionpbx-mac.conf
 fusionpbx-404.conf
-nginx-404.conf
-nginx-dos.conf
+angie-404.conf
+angie-dos.conf
 "
 
 for _filter in $_filters; do
@@ -157,8 +158,8 @@ verbose "Fail2ban configuration summary:"
 verbose "  Auth log:     /var/log/auth/secure (Alt Linux path)"
 verbose "  Syslog:       /var/log/syslog/messages (Alt Linux path)"
 verbose "  FS log:       /var/log/freeswitch/freeswitch.log"
-verbose "  Nginx log:    /var/log/nginx/access*.log"
+verbose "  Web log:      /var/log/angie/access*.log (Angie web server)"
 verbose "  Action:       iptables-allports (compatible with iptables firewall)"
-verbose "  Active jails: ssh, fusionpbx, fusionpbx-mac, nginx-404, nginx-dos"
+verbose "  Active jails: ssh, fusionpbx, fusionpbx-mac, angie-404, angie-dos"
 verbose "  (FreeSWITCH jails disabled by default — enable after verifying logs)"
 verbose ""

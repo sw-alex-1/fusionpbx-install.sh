@@ -6,7 +6,7 @@
 # proper dependency on PostgreSQL.
 #
 # Alt Linux specifics:
-#   - FreeSWITCH user: _nginx:_nginx (same as web server, like Debian's www-data)
+#   - FreeSWITCH user: angie:angie (same as web server, like Debian's www-data)
 #   - Service must start after postgresql.service
 #   - The freeswitch-systemd package (if it exists) should be removed
 #     to avoid conflicts with our custom unit file.
@@ -14,7 +14,7 @@
 # DESIGN: In Debian, FreeSWITCH runs as www-data (the web server user) so
 # that FusionPBX (also running as www-data via PHP-FPM) can read and write
 # FreeSWITCH configuration files. We replicate this on Alt Linux by running
-# FreeSWITCH as _nginx.
+# FreeSWITCH as angie (the Angie web server user).
 #
 # IMPORTANT: FreeSWITCH is started here (during switch.sh), BEFORE finish.sh.
 # This matches the Debian installer's approach and is critical because:
@@ -107,9 +107,9 @@ fi
 
 # =============================================================================
 # Ensure FreeSWITCH user exists
-# The _nginx user should already exist (created by nginx package), but verify.
-# FreeSWITCH runs as _nginx (same as web server) so FusionPBX can access
-# FreeSWITCH configuration files.
+# The angie user should already exist (created by the angie package or by
+# php.sh), but verify. FreeSWITCH runs as angie (same as web server) so
+# FusionPBX can access FreeSWITCH configuration files.
 # =============================================================================
 
 if ! id "$fs_user" >/dev/null 2>&1; then

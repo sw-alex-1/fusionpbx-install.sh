@@ -23,7 +23,7 @@
 # wrong and which step to re-run after fixing the issue.
 #
 # Installation order matches the Debian installer:
-#   1. System prep, PHP, nginx, PostgreSQL, FusionPBX, FreeSWITCH
+#   1. System prep, PHP, Angie, PostgreSQL, FusionPBX, FreeSWITCH
 #   2. FreeSWITCH starts with default SQLite config (provides event socket)
 #   3. finish.sh: upgrade.php --defaults (event socket available = correct paths)
 #   4. dsn.sh: switch FreeSWITCH from SQLite to PostgreSQL
@@ -214,8 +214,8 @@ run_step "1/11" "System preparation" "$SCRIPT_DIR/resources/pre-install.sh"
 # Step 2: PHP and PHP-FPM
 run_step "2/11" "Installing PHP" "$SCRIPT_DIR/resources/php.sh"
 
-# Step 3: NGINX web server
-run_step "3/11" "Installing NGINX" "$SCRIPT_DIR/resources/nginx.sh"
+# Step 3: Angie web server (advanced nginx fork)
+run_step "3/11" "Installing Angie" "$SCRIPT_DIR/resources/angie.sh"
 
 # Step 4: PostgreSQL database
 run_step "4/11" "Installing PostgreSQL" "$SCRIPT_DIR/resources/postgresql.sh"
