@@ -43,7 +43,7 @@ cd /usr/src/fusionpbx-install.sh/Alt && ./install.sh
 | **PostgreSQL** | 16 (md5 auth for TCP, trust for local socket) |
 | **FreeSWITCH** | RPM packages from Alt Linux repository |
 | **mod_pgsql** | Compiled from matching FreeSWITCH source (PostgreSQL 14+ patch applied) |
-| **FusionPBX** | 5.5 branch from Git |
+| **FusionPBX** | 5.6 branch from Git (single point of entry) |
 | **Fail2ban** | Pre-configured for FusionPBX, FreeSWITCH, nginx, and SSH |
 | **iptables** | Pre-configured for SIP, RTP, HTTP, and SSH |
 | **Monit** | Process monitoring |
@@ -157,7 +157,7 @@ cd /usr/src/fusionpbx-install.sh/Alt && ./install.sh
 | **PostgreSQL** | 16 (md5-аутентификация для TCP, trust для локального сокета) |
 | **FreeSWITCH** | RPM-пакеты из репозитория Альт Линукс |
 | **mod_pgsql** | Компилируется из исходников FreeSWITCH (с патчем для PostgreSQL 14+) |
-| **FusionPBX** | Ветка 5.5 из Git |
+| **FusionPBX** | Ветка 5.6 из Git (single point of entry) |
 | **Fail2ban** | Преднастроен для FusionPBX, FreeSWITCH, nginx и SSH |
 | **iptables** | Преднастроен для SIP, RTP, HTTP и SSH |
 | **Monit** | Мониторинг процессов |

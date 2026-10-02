@@ -75,6 +75,10 @@ if [ -d "$_fpbx_dir/.git" ]; then
     # Optionally update the existing checkout
     verbose "Updating existing FusionPBX checkout..."
     cd "$_fpbx_dir"
+    # The repo is owned by the web user ($web_user) while this script runs as
+    # root — git >= 2.35.2 refuses to operate on such repos ("detected dubious
+    # ownership") unless the path is marked as safe. Same fix as upstream.
+    git config --global --add safe.directory "$_fpbx_dir"
     git pull 2>/dev/null || warn "Failed to update FusionPBX (may be offline or modified)"
     cd "$SCRIPT_DIR"
 elif [ -d "$_fpbx_dir" ] && [ "$(ls -A "$_fpbx_dir" 2>/dev/null)" ]; then
@@ -123,6 +127,12 @@ fi
 #   2. PHP chown commands in core/upgrade/upgrade.php and core/upgrade/upgrade_menu.php
 #      — executed by upgrade.php --permissions
 #
+# Service template locations differ between FusionPBX versions:
+#   - 5.5 and older:  core/*/resources/service/*.service        (flat)
+#   - 5.6 and newer:  core/*/resources/service/debian/*.service (per-OS subdir;
+#                     the services class picks the 'debian' dir on Linux)
+# Both layouts are patched below so the installer works with either branch.
+#
 # We replace 'www-data' with the Alt Linux web user ($web_user) directly in
 # the source AFTER cloning, BEFORE any upgrade.php runs. This ensures:
 #   - upgrade.php --services generates correct service files (User=_nginx, Group=_nginx)
@@ -136,7 +146,10 @@ verbose "Patching FusionPBX source for Alt Linux user (${web_user})..."
 
 # Replace in .service template files (User=www-data → User=_nginx, Group=www-data → Group=_nginx)
 _service_count=0
-for _svc_file in "$_fpbx_dir"/core/*/resources/service/*.service "$_fpbx_dir"/app/*/resources/service/*.service; do
+for _svc_file in "$_fpbx_dir"/core/*/resources/service/*.service \
+                 "$_fpbx_dir"/core/*/resources/service/*/*.service \
+                 "$_fpbx_dir"/app/*/resources/service/*.service \
+                 "$_fpbx_dir"/app/*/resources/service/*/*.service; do
     if [ -f "$_svc_file" ]; then
         sed -i "s/www-data/${web_user}/g" "$_svc_file"
         _service_count=$((_service_count + 1))

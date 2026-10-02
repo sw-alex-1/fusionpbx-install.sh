@@ -204,6 +204,26 @@ if [ -f "$_nginx_conf" ]; then
 fi
 
 # =============================================================================
+# Stop and disable Apache if present (port 80/443 conflict)
+# Ported from the official installer (debian/resources/nginx.sh).
+# Alt Linux names the Apache service 'httpd2' (package apache2); some setups
+# may use 'apache2' — check both. nginx cannot bind 80/443 while it runs.
+# No-op when Apache is not installed.
+# =============================================================================
+
+for _apache_svc in httpd2 apache2; do
+    if systemctl is-active --quiet "$_apache_svc" 2>/dev/null; then
+        verbose "Stopping $_apache_svc to free port 80/443..."
+        systemctl stop "$_apache_svc" 2>/dev/null || warn "Failed to stop $_apache_svc"
+    fi
+    # Prevent Apache from starting at boot and taking the ports back
+    if systemctl is-enabled "$_apache_svc" 2>/dev/null; then
+        systemctl disable "$_apache_svc" 2>/dev/null || true
+        verbose "  $_apache_svc disabled (will not start on boot)"
+    fi
+done
+
+# =============================================================================
 # Test and start nginx
 # =============================================================================
 

@@ -28,10 +28,16 @@ _patched=0
 
 # 1. Patch service TEMPLATES in the FusionPBX source tree
 # This ensures future upgrade.php --services calls generate correct files
+# Covers both template layouts:
+#   - FusionPBX 5.5 and older: app|core/*/resources/service/*.service (flat)
+#   - FusionPBX 5.6 and newer: app|core/*/resources/service/<os>/*.service
+#     (per-OS subdirectories; 'debian' is used for all Linux systems)
 echo ""
 echo "1. Patching service templates in FusionPBX source tree..."
 for _tmpl_file in "$_fpbx_dir"/app/*/resources/service/*.service \
-                   "$_fpbx_dir"/core/*/resources/service/*.service; do
+                   "$_fpbx_dir"/app/*/resources/service/*/*.service \
+                   "$_fpbx_dir"/core/*/resources/service/*.service \
+                   "$_fpbx_dir"/core/*/resources/service/*/*.service; do
     if [ -f "$_tmpl_file" ] && grep -q 'www-data' "$_tmpl_file" 2>/dev/null; then
         sed -i "s/www-data/${_web_user}/g" "$_tmpl_file"
         echo "  Patched template: $(echo "$_tmpl_file" | sed "s|$_fpbx_dir/||")"

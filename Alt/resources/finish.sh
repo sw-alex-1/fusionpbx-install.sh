@@ -426,11 +426,18 @@ verbose "  Cron daemon installed and started"
 # Patch all FusionPBX service templates in the source tree
 # (extra safety — templates were already patched in fusionpbx.sh but
 # may have been updated by git pull or other operations since then)
+#
+# NOTE: two template layouts are covered:
+#   - FusionPBX 5.5 and older: app|core/*/resources/service/*.service (flat)
+#   - FusionPBX 5.6 and newer: app|core/*/resources/service/<os>/*.service
+#     (per-OS subdirectories; 'debian' is used for all Linux systems)
 verbose "Patching FusionPBX service templates (${web_user} instead of www-data)..."
 _fpbx_dir="/var/www/fusionpbx"
 _tmpl_patched=0
 for _tmpl_file in "$_fpbx_dir"/app/*/resources/service/*.service \
-                   "$_fpbx_dir"/core/*/resources/service/*.service; do
+                   "$_fpbx_dir"/app/*/resources/service/*/*.service \
+                   "$_fpbx_dir"/core/*/resources/service/*.service \
+                   "$_fpbx_dir"/core/*/resources/service/*/*.service; do
     if [ -f "$_tmpl_file" ] && grep -q 'www-data' "$_tmpl_file" 2>/dev/null; then
         sed -i "s/www-data/${web_user}/g" "$_tmpl_file"
         verbose "  Patched template: $(echo "$_tmpl_file" | sed "s|$_fpbx_dir/||")"

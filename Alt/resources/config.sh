@@ -3,7 +3,9 @@
 domain_name=ip_address                      # hostname, ip_address or a custom value
 system_username=admin                       # default username admin
 system_password=random                      # random or a custom value
-system_branch=5.5                           # master, 5.5
+system_branch=5.6                           # master, 5.6, 5.5
+                                             # 5.6: single point of entry (public/index.php)
+                                             # requires the SPE nginx config (nginx/fusionpbx)
 
 # FreeSWITCH Settings
 switch_branch=stable                        # master, stable
