@@ -45,6 +45,28 @@ elif [ ."${database_password}" = ."random" ] || [ -z "$database_password" ]; the
     verbose "Generated new random database password"
 fi
 
+# =============================================================================
+# Validate the database password character set
+#
+# The password is embedded UNQUOTED into several configuration contexts:
+#   - /etc/fusionpbx/config.conf (INI file parsed by PHP parse_ini_file)
+#   - SQL statements (ALTER USER ... PASSWORD '...')
+#   - .pgpass and shell commands
+# Only letters and digits are safe in ALL of these contexts at once.
+# INI reserved characters would make parse_ini_file() return false and
+# every FusionPBX page and CLI script would die with a fatal error.
+# This enforces the same "safe characters" rule that config.sh documents.
+# =============================================================================
+
+case "$database_password" in
+    "")
+        die "database_password is empty. Set it in resources/config.sh (random or a value of A-Z a-z 0-9)."
+        ;;
+    *[!A-Za-z0-9]*)
+        die "database_password contains characters outside A-Z a-z 0-9. It is embedded unquoted into INI and SQL configuration files where special characters are not safe. Use a different password in resources/config.sh or set it to 'random'."
+        ;;
+esac
+
 # Set PGPASSWORD for psql commands in this script
 export PGPASSWORD=$database_password
 
@@ -101,15 +123,62 @@ sed -i /etc/fusionpbx/config.conf -e s:"{database_username}:$database_username:"
 sed -i /etc/fusionpbx/config.conf -e s:"{database_password}:$database_password:"
 sed -i /etc/fusionpbx/config.conf -e s:"{WEBSOCKET_PORT}:$websocket_port:"
 
-# Also update the resources/ fallback config with real values
+# Also update the resources/ fallback config with the real values.
+# Copy the freshly generated /etc/fusionpbx/config.conf over it so the
+# fallback stays identical to the primary file — including template
+# fixes picked up from installer updates on re-runs.
 _fpbx_res_config="/var/www/fusionpbx/resources/config.conf"
 if [ -f "$_fpbx_res_config" ]; then
-    sed -i "$_fpbx_res_config" -e s:"{database_host}:$database_host:"
-    sed -i "$_fpbx_res_config" -e s:"{database_name}:$database_name:"
-    sed -i "$_fpbx_res_config" -e s:"{database_username}:$database_username:"
-    sed -i "$_fpbx_res_config" -e s:"{database_password}:$database_password:"
-    sed -i "$_fpbx_res_config" -e s:"{WEBSOCKET_PORT}:$websocket_port:"
-    verbose "  resources/config.conf also updated with database credentials"
+    cp /etc/fusionpbx/config.conf "$_fpbx_res_config"
+    verbose "  resources/config.conf synced with /etc/fusionpbx/config.conf"
+fi
+
+# =============================================================================
+# Verify /etc/fusionpbx/config.conf parses correctly
+#
+# FusionPBX loads this file with PHP parse_ini_file(). '#' is NOT a
+# comment character for the INI parser: a '#' line is parsed as a regular
+# entry, and reserved characters inside it make parse_ini_file() return
+# false — after that every FusionPBX page and CLI script (including
+# upgrade.php below) dies with a fatal error. Verify the file parses and
+# carries the correct credentials BEFORE the schema install, with a
+# message that names the real problem.
+# =============================================================================
+
+verbose "Verifying /etc/fusionpbx/config.conf..."
+
+_php_cmd="php${php_version}"
+if ! command -v "$_php_cmd" >/dev/null 2>&1; then
+    _php_cmd="php"
+fi
+
+_cfg_check=$("$_php_cmd" -d display_errors=1 -r '
+    $c = parse_ini_file("/etc/fusionpbx/config.conf");
+    if ($c === false) {
+        echo "PARSE_FAILED: parse_ini_file returned false\n";
+        exit(1);
+    }
+    $expected = array(
+        "database.0.host"     => $argv[1],
+        "database.0.name"     => $argv[2],
+        "database.0.username" => $argv[3],
+        "database.0.password" => $argv[4]
+    );
+    foreach ($expected as $k => $v) {
+        if ((string)($c[$k] ?? "") !== (string)$v) {
+            echo "MISMATCH: $k does not contain the expected value\n";
+            exit(1);
+        }
+    }
+    echo "OK\n";
+' -- "$database_host" "$database_name" "$database_username" "$database_password" 2>&1)
+
+if echo "$_cfg_check" | grep -q "^OK"; then
+    verbose "  config.conf: valid INI, database credentials match"
+else
+    error "config.conf verification FAILED:"
+    echo "$_cfg_check" | sed 's/^/  /'
+    die "/etc/fusionpbx/config.conf is not parseable by PHP or contains wrong values. Fix the problem reported in the warning above (usually a forbidden character on the named line) and re-run the installer."
 fi
 
 # =============================================================================

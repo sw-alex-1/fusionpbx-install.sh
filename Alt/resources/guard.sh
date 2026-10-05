@@ -35,6 +35,11 @@
 #     NOT a blocking signal: both appear during a normal install long before
 #     it finishes, and re-running after a mid-way failure is the documented
 #     recovery path (the run_step error message tells the user to re-run).
+#   - The progress state file is checked BEFORE the legacy live-checks:
+#     step 10 (finish.sh) writes real database credentials into
+#     /etc/fusionpbx/config.conf before the installation completes, so at
+#     that point only the state file separates an interrupted install
+#     from an installed system.
 #   - Every check is best-effort and fault-tolerant: if a check cannot run
 #     (for example psql is not installed on a fresh system), it reports
 #     "no signal". The guard must NEVER break a normal installation.
@@ -67,18 +72,14 @@ _guard_info()  { echo "${green:-}$1${normal:-}"; }
 # Detection
 # =============================================================================
 
-# Returns 0 and sets GUARD_REASON when a fully installed system is detected.
+# Returns 0 and sets GUARD_REASON when a system installed by an OLDER
+# installer version (one that predates the marker and state files) is
+# detected. The marker file and the progress state file are handled by
+# guard_check_installed() itself, BEFORE this function runs.
 # Cheapest and most definitive checks first.
 _guard_installed_system_detected() {
 
-    # 1. Marker file written by guard_install_finished() after a successful
-    #    installation (installs made by this installer version)
-    if [ -f "$GUARD_MARKER_FILE" ]; then
-        GUARD_REASON="installation marker present: $GUARD_MARKER_FILE"
-        return 0
-    fi
-
-    # 2. Legacy systems installed before the guard existed:
+    # 1. Legacy systems installed before the guard existed:
     #    /etc/fusionpbx/config.conf with real database credentials is
     #    written by finish.sh (step 10) near the end of a successful
     #    installation. A file still containing {database_...} placeholders
@@ -89,7 +90,7 @@ _guard_installed_system_detected() {
         return 0
     fi
 
-    # 3. Legacy systems, plan B: the FusionPBX schema is already loaded into
+    # 2. Legacy systems, plan B: the FusionPBX schema is already loaded into
     #    the local PostgreSQL (table v_users exists in the fusionpbx
     #    database). Best-effort: when PostgreSQL is not installed or not
     #    running this is a fresh/partial system and the check silently
@@ -191,18 +192,35 @@ guard_check_installed() {
         return 0
     fi
 
-    # 2. Fully installed system -> block (exits 1 inside)
-    if _guard_installed_system_detected; then
+    # 2. Completion marker -> block (exits 1 inside). The marker is this
+    #    installer's own definitive "installed" signal and is written only
+    #    after a fully successful installation.
+    if [ -f "$GUARD_MARKER_FILE" ]; then
+        GUARD_REASON="installation marker present: $GUARD_MARKER_FILE"
         _guard_print_blocked "$GUARD_REASON"
     fi
 
-    # 3. Incomplete previous run of this installer -> recovery mode
+    # 3. Incomplete previous run of this installer -> recovery mode.
+    #    The progress state file is written by guard_install_started()
+    #    and removed by guard_install_finished(). Together with the
+    #    absence of the marker it unambiguously identifies an interrupted
+    #    install, so it must be checked BEFORE the legacy live-detection
+    #    below: finish.sh (step 10) writes /etc/fusionpbx/config.conf with
+    #    real database credentials while the installation is still
+    #    running, and the legacy check would misread that state as a
+    #    fully installed system, blocking the documented recovery path.
     if _guard_incomplete_run_detected; then
         _guard_print_recovery
         return 0
     fi
 
-    # 4. Fresh system
+    # 4. Legacy installed system (older installer versions) -> block
+    #    (exits 1 inside)
+    if _guard_installed_system_detected; then
+        _guard_print_blocked "$GUARD_REASON"
+    fi
+
+    # 5. Fresh system
     return 0
 }
 

@@ -42,6 +42,29 @@ else
 fi
 
 # =============================================================================
+# Validate the database password character set (fail fast, at the step
+# where the password enters the system).
+#
+# The password is embedded UNQUOTED into several configuration contexts:
+#   - /etc/fusionpbx/config.conf (INI file parsed by PHP parse_ini_file)
+#   - SQL statements (ALTER USER ... PASSWORD '...')
+#   - .pgpass and shell commands
+# Only letters and digits are safe in ALL of these contexts at once.
+# INI reserved characters would make parse_ini_file() return false and
+# every FusionPBX page and CLI script would die with a fatal error.
+# This enforces the same "safe characters" rule that config.sh documents.
+# =============================================================================
+
+case "$database_password" in
+    "")
+        die "database_password is empty. Set it in resources/config.sh (random or a value of A-Z a-z 0-9)."
+        ;;
+    *[!A-Za-z0-9]*)
+        die "database_password contains characters outside A-Z a-z 0-9. It is embedded unquoted into INI and SQL configuration files where special characters are not safe. Use a different password in resources/config.sh or set it to 'random'."
+        ;;
+esac
+
+# =============================================================================
 # Install PostgreSQL
 # =============================================================================
 
