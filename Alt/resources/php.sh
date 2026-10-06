@@ -36,6 +36,8 @@ pkg_install_required \
     "php${php_version}-pdo_sqlite" \
     "php${php_version}-pdo_odbc" \
     "php${php_version}-curl" \
+    "php${php_version}-fileinfo" \
+    "php${php_version}-opcache" \
     "php${php_version}-imap" \
     "php${php_version}-libs" \
     "php${php_version}-gd" \
@@ -367,6 +369,23 @@ verbose "Restarting PHP-FPM service..."
 # Enable PHP-FPM for auto-start on boot
 systemctl enable "$_php_fpm_service" 2>/dev/null || warn "Failed to enable $_php_fpm_service for auto-start"
 verbose "PHP-FPM enabled for auto-start on boot"
+
+# Install a systemd drop-in so the FPM socket directory survives reboots.
+# /var/run is tmpfs: on every boot the packaged php-fpm unit recreates
+# /run/php<version>-fpm with permissions that block the Angie worker
+# (user angie) from traversing into it -> connect() EACCES -> 502 Bad
+# Gateway after every reboot (manual fix was: chmod 0755).
+# install -d creates the dir if missing AND resets the mode of an
+# existing one, so this works on every start/restart. A drop-in in /etc
+# also survives php-fpm package updates (unlike patching the unit file).
+_fpm_dropin_dir="/etc/systemd/system/${_php_fpm_service}.service.d"
+mkdir -p "$_fpm_dropin_dir"
+cat > "${_fpm_dropin_dir}/fusionpbx-socket-dir.conf" <<EOF
+# FusionPBX installer: FPM run dir must be traversable by the web server
+[Service]
+ExecStartPre=/usr/bin/install -d -m 0755 /run/php${php_version}-fpm
+EOF
+verbose "Systemd drop-in installed: ${_fpm_dropin_dir}/fusionpbx-socket-dir.conf"
 
 systemctl daemon-reload
 service_restart_required "$_php_fpm_service"
