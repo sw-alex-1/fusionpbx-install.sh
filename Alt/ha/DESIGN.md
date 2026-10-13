@@ -1,0 +1,678 @@
+# Дизайн-документ: `fusionpbx-ha.sh`
+
+| | |
+|---|---|
+| **Версия** | 0.1 (черновик на согласование) |
+| **Дата** | 2026-10-13 |
+| **Дом** | `Alt/ha/` репозитория `fusionpbx-install.sh`, ветка `alt` |
+| **Статус** | Проектирование. Реализация не начата. |
+| **Язык сообщений скрипта** | Английский (как в установщике слоя 1) |
+
+---
+
+## 1. Резюме
+
+`fusionpbx-ha.sh` — надстройка (слой 2) над существующим установщиком
+FusionPBX для ALT Linux (слой 1, каталог `Alt/`). Она превращает три
+подготовленные виртуальные машины в HA-кластер АТС:
+
+- **VM1, VM2** (data-ноды): FusionPBX (Angie + php-fpm + FreeSWITCH) +
+  PostgreSQL + `repmgrd` + `haproxy` + `lsyncd`;
+- **VM3** (witness): крошечный PostgreSQL только с метаданными repmgr +
+  `repmgrd`. Никакого FusionPBX.
+
+Ключевые свойства решения:
+
+1. **Слой 1 не изменяется.** Установщик по-прежнему ставит одиночную ноду и
+   запускается на VM1 и VM2 независимо. Локальная база VM2 при кластеризации
+   затирается клоном с VM1 — это осознанно принятое следствие.
+2. **Всё из штатных репозиториев ALT** p10/p11: `postgresql16-repmgr`,
+   `haproxy`, `lsyncd` (Patroni в ALT отсутствует — см. §2).
+3. **Ноль установочного SSH между нодами.** Установочные части скрипта
+   координируются через сам кластерный софт: каждая команда просто ждёт
+   (poll) появления своего предусловия. SSH используется только рантаймом —
+   выделенным ключом для rsync медиа-файлов между data-нодами.
+4. **Идемпотентность и resume** — паттерны установщика слоя 1 (маркер
+   установленности + файл состояния шагов) переносятся один в один.
+5. **Ремонт — штатный режим**: пересобранная нода вводится повторным
+   запуском `--join`/`--repair`, без полного пересборка кластера.
+
+Топология «2+1» и отказные сценарии согласованы ранее; документ фиксирует
+их как проектные требования и раскладывает на реализуемые шаги.
+
+## 2. Принципы и границы
+
+### 2.1 Принципы
+
+| # | Принцип | Следствие для реализации |
+|---|---------|--------------------------|
+| P1 | Слоистость | Установщик слоя 1 — чёрный ящик: только запускается целиком, не парсится и не source'ится |
+| P2 | Репозитарная чистота | Только пакеты из ALT p10/p11; проверено по листингам зеркала (см. §13) |
+| P3 | Самокоординация | Каждая команда ждёт своё предусловие опросом локально доступного состояния (repmgr-метаданные, `pg_stat_replication`); никакого «дирижёра» |
+| P4 | Идемпотентность | Повторный запуск любой команды безопасен; деструктивное — только в `--repair`/затирании PGDATA VM2 с явным подтверждением |
+| P5 | Единая точка записи | Оба FusionPBX ходят в БД только через `127.0.0.1:5433` (haproxy → текущая primary). Прямая запись в локальную PG запрещена конструктивно |
+| P6 | Синхронная репликация | `synchronous_commit` + `synchronous_standby_names` — главный предохранитель от записи в обе стороны при сетевом разделе |
+
+### 2.2 Границы (что НЕ делает скрипт)
+
+- не устанавливает FusionPBX (слой 1), не управляет виртуальными машинами
+  Proxmox и их размещением (проектное правило: VM1/VM2/VM3 — на трёх разных
+  хостах, PVE-HA для этих VM не включается);
+- не является системой бэкапа (PBS/vzdump + `pg_dump` обязательны поверх);
+- не решает «двойной отказ» — при потере двух нод из трёх кластер
+  осознанно замораживает запись (защита от split-brain важнее
+  доступности); процедура вывода из заморозки — §12.4;
+- VIP для SIP/web — опциональный модуль будущего расширения (§17);
+  в v1 голосовой ярус active-active (телефоны знают оба сервера).
+
+### 2.3 Почему repmgr, а не Patroni
+
+Проверка по листингам репозиториев ALT (первоисточник, зеркало
+mirror.yandex.ru; `packages.altlinux.org` в момент проверки был закрыт
+anti-bot-заглушкой и для проверок непригоден):
+
+| Пакет | p10 | p11 | Вывод |
+|---|---|---|---|
+| `postgresql16-repmgr` | 5.4.1-alt4 | 5.5.0-alt5 | **используем** |
+| `haproxy` | 2.8.28 | 3.4.4 | используется |
+| `lsyncd` | 2.1.4 | 2.3.1 | используется |
+| `python3-module-psycopg2` | 2.9.1 | 2.9.5 | role-agent (§9.2) |
+| `etcd` | 3.5.23 | 3.5.32 | не нужен при repmgr |
+| `patroni` | нет | нет | **отвергнут** |
+| `osync`, `pg_auto_failover` | нет | нет | отвергнуты |
+
+repmgr: (а) есть в репозиториях и привязан к мажору PG (`postgresql16-*` —
+наш слой 1 ставит PG16); (б) witness — родная концепция repmgr, ровно наша
+схема 2+1; (в) `repmgr primary register` принимает существующий инстанс —
+база, созданная слоем 1 на VM1, становится базой кластера без
+dump/restore. Patroni остаётся запасным планом через pip (вне репозиториев),
+к нему возвращаемся только если репозитарный repmgr упрётся в фундаментальное
+ограничение.
+
+## 3. Архитектура
+
+### 3.1 Схема
+
+```
+                 телефоны / транки / SBC
+                    |              |
+              (secondary)      (primary registrar)
+                    |              |
+        +-----------+--------------+-----------+
+        |                active-active         |   голос + веб
+        |                                      |
+   [ VM1: fpbx-ha-1 ]                [ VM2: fpbx-ha-2 ]
+   Angie+php-fpm+FreeSWITCH          Angie+php-fpm+FreeSWITCH
+   haproxy :5433(localhost)          haproxy :5433(localhost)
+   role-agent :8008                  role-agent :8008
+   repmgrd                           repmgrd (failover=automatic)
+   PG primary <---- sync repl -----  PG standby
+        |                                      |
+        +--------------- rsync (SSH, ----------
+            lsyncd: только /var/lib/freeswitch/storage
+                         |
+                  [ VM3: fpbx-witness ]
+                  PG (только метаданные repmgr)
+                  repmgrd (третий голос)
+```
+
+### 3.2 Роли и состав ПО
+
+| Компонент | VM1 | VM2 | VM3 |
+|---|---|---|---|
+| Слой 1 (FusionPBX standalone) | да | да | **нет** |
+| PostgreSQL 16 | primary | standby (sync) | крошечный, метаданные repmgr |
+| `repmgrd` (юнит `repmgr.service`) | да (наблюдатель) | да (failover=automatic) | да (наблюдатель) |
+| `haproxy` (frontend `127.0.0.1:5433`) | да | да | нет |
+| role-agent (`:8008`, §9.2) | да | да | нет |
+| `lsyncd` (медиа-дерево → сосед) | да | да | нет |
+
+### 3.3 Порты
+
+| Порт | Кто и зачем | Разрешённые направления |
+|---|---|---|
+| 5432/tcp | PG: репликация VM1↔VM2, метаданные repmgr со всех нод, проверки haproxy/агента | VM1↔VM2, VM3→VM1, VM1/VM2→VM3 |
+| 5433/tcp | haproxy frontend (точка входа приложений) | только 127.0.0.1 на VM1/VM2 |
+| 8008/tcp | role-agent: haproxy соседа проверяет «кто primary» | VM1↔VM2 + 127.0.0.1 |
+| 22/tcp | rsync медиа-дерева (lsyncd/seed) | только VM1↔VM2, только выделенный ключ (§14.2) |
+
+### 3.4 Траектория SQL-запроса
+
+```
+FusionPBX / FreeSWITCH (VMx)
+   → 127.0.0.1:5433 (haproxy, mode tcp)
+      → health: GET /primary на role-agent :8008 обеих data-нод
+      → бэкенд, вернувший 200 (текущая primary)
+```
+
+## 4. Предусловия
+
+### 4.1 Обязательные
+
+1. Три VM на **трёх разных хостах Proxmox**; PVE-HA для этих VM выключен
+   (placement — руками, см. §2.2).
+2. Статические IP; разрешение имён — через `/etc/hosts` на всех трёх нодах
+   (скрипт вносит записи сам по данным cluster.conf).
+3. Синхронизация времени (NTP/chrony) на всех нодах — `--doctor` проверяет.
+4. VM1 и VM2: слой 1 отработал полностью (валидный `/etc/fusionpbx/config.conf`,
+   живая локальная БД `fusionpbx`, FreeSWITCH запущен). Вся настройка АТС
+   (домены, пользователи, расширения) делается на VM1 до `--init` — база VM2
+   будет затёрта.
+5. Один и тот же мажор PostgreSQL на всех нодах (слой 1 ставит PG16;
+   `--init` фиксирует мажор в cluster.conf, `--join` сверяет).
+6. Свободные порты 5433 и 8008 на VM1/VM2; 5432 свободен на VM3.
+
+### 4.2 Рекомендуемые
+
+- отдельный маленький диск/LV под WAL не обязателен: нагрузка АТС
+  (CDR-записи) далека от WAL-интерсива;
+- witness: 1 vCPU, 512MB–1GB RAM, ≥10GB диска.
+
+## 5. CLI-спецификация
+
+```
+fusionpbx-ha.sh --init [--node2 IP] [--node3 IP] [--cluster-name NAME] [--yes]
+fusionpbx-ha.sh --join TOKEN            # TOKEN — base64-строка, или @файл
+fusionpbx-ha.sh --config FILE ...       # альтернатива токену: файл cluster.conf
+fusionpbx-ha.sh --repair [--yes] [--force-clone]
+fusionpbx-ha.sh --status
+fusionpbx-ha.sh --doctor
+fusionpbx-ha.sh --print-token           # повторно показать токен (только VM1)
+
+Общие флаги:
+  --yes        неинтерактивный режим (ansible-совместимость; все подтверждения — да)
+  --force      переконфигурировать поверх установленного состояния
+  --no-color   без ANSI-цветов
+  --verbose    подробный вывод (как в установщике слоя 1)
+```
+
+Семантика по командам:
+
+| Команда | Нода | Назначение |
+|---|---|---|
+| `--init` | VM1 | Принять существующий standalone-FusionPBX как primary: repmgr-регистрация, haproxy, агент, репойнт DSN, печать токена, ожидание witness+standby, включение sync-режима |
+| `--join` | VM2, VM3 | Вступить в кластер по токену: роль определяется сопоставлением собственного IP со списком нод в токене |
+| `--repair` | любая | Вернуть пересобранную/упавшую ноду в кластер (§12). Работает по локальному `/etc/fusionpbx-ha/cluster.conf`, токен не нужен |
+| `--status` | любая | Только чтение: роль, repmgr-кластер, haproxy, лаг, sync-режим, lsyncd, сервисы |
+| `--doctor` | любая | Глубокая диагностика: NTP, pg_hba, порты, агент, ошибки lsyncd, WAL, права каталогов |
+
+Правила конфликтов: `--join` на ноде с маркером установленности → отказ с
+подсказкой `--repair`; `--repair` без маркера → отказ с подсказкой `--join`;
+`--init` на не-VM1 (нет слоя 1) → отказ.
+
+## 6. Конфигурация и токен
+
+### 6.1 `cluster.conf`
+
+Shell-sourceable INI (стиль слоя 1), живёт в `/etc/fusionpbx-ha/cluster.conf`
+(режим 600, владелец root). Генерируется на `--init`, копируется токеном.
+
+```sh
+# /etc/fusionpbx-ha/cluster.conf — генерируется fusionpbx-ha.sh --init
+HA_CLUSTER_NAME="fpbx-ha"
+HA_NODE1_NAME="fpbx-ha-1"; HA_NODE1_IP="10.0.0.11"; HA_NODE1_ROLE="primary"
+HA_NODE2_NAME="fpbx-ha-2"; HA_NODE2_IP="10.0.0.12"; HA_NODE2_ROLE="standby"
+HA_NODE3_NAME="fpbx-witness"; HA_NODE3_IP="10.0.0.13"; HA_NODE3_ROLE="witness"
+
+HA_PG_VERSION="16"                  # зафиксирован при --init (мажор слоя 1)
+HA_PG_PORT="5432"
+HA_DB_NAME="fusionpbx"              # читается из config.conf слоя 1
+HA_DB_USER="fusionpbx"
+HA_DB_PASSWORD="..."                # из config.conf слоя 1 (уже существует)
+HA_REPMGR_USER="repmgr"
+HA_REPMGR_PASSWORD="..."            # генерируется (A-Za-z0-9, 24 симв.)
+HA_REPMGR_DB="repmgr"
+HA_HAPROXY_PORT="5433"
+HA_AGENT_PORT="8008"
+HA_SYNC_DIR="/var/lib/freeswitch/storage"
+HA_SYNC_DELAY="5"                   # секунды; write-once файлы — можно коротко
+HA_SYNC_PRIVATE_KEY_B64="..."       # base64 PEM приватного ключа sync-ключа
+HA_SYNC_PUBLIC_KEY="ssh-ed25519 AAAA... fusionpbx-ha-sync"
+```
+
+Пароли — только `[A-Za-z0-9]` (то же правило, что в слое 1: пароль попадает в
+INI/SQL/`.pgpass` без квотирования). Приватный ключ хранится одной строкой
+base64, чтобы файл оставался source-able.
+
+### 6.2 Токен
+
+```
+TOKEN = base64( gzip( cluster.conf ) )     # одна печатная строка
+```
+
+- печатается командой `--init` сразу после генерации cluster.conf (не ждёт
+  завершения установки) и повторно — `--print-token`;
+- принимается `--join TOKEN` или `--join @файл` (для ansible);
+  `--config FILE` — прямой путь к файлу, минуя токен;
+- **содержит секреты** (пароль БД, пароль repmgr, приватный sync-ключ):
+  обращаться как с root-паролем; после ввода строка из истории shell
+  вычищается подсказкой (`history -d` не делаем — просто предупреждение).
+
+### 6.3 Sync-ключ (SSH для rsync)
+
+- при `--init` генерируется выделенная пара ed25519
+  (`/etc/fusionpbx-ha/sync_key`, 600); **одна пара на кластер** — она едет
+  в токене и кладётся на обе data-ноды (двунаправленный rsync одной парой);
+- `authorized_keys` (root) на обеих data-нодах:
+
+```
+from="10.0.0.11,10.0.0.12",command="/usr/bin/rrsync /var/lib/freeswitch/storage",\
+no-pty,no-agent-forwarding,no-X11-forwarding,no-port-forwarding \
+ssh-ed25519 AAAA... fusionpbx-ha-sync
+```
+
+- если `rrsync` в составе rsmgr-независимого пакета rsync в ALT не найден
+  (проверить путь — §16), деградация: `from=` без `command=` (ограничение
+  только по IP; допустимо, т.к. ключ всё равно единственного назначения);
+- known_hosts: первое подключение с `StrictHostKeyChecking=accept-new`
+  (TOFU в пределах management-сети; отпечатки равны доверию к токену).
+
+## 7. Состояния, идемпотентность, resume
+
+Маркеры — прямое повторение паттернов `guard.sh` слоя 1:
+
+| Файл | Значение |
+|---|---|
+| `/etc/fusionpbx-ha/.installed` | ставится **только** после полного успеха команды |
+| `/etc/fusionpbx-ha/.installer-state` | последний завершённый шаг (номер) текущей команды |
+| `/etc/fusionpbx-ha/cluster.conf` | конфигурация кластера (persist; нужна `--repair`) |
+
+Правила:
+
+- каждая команда = список шагов `ha_step<N>_<name>`; завершённый шаг
+  дописывается в `.installer-state`; повторный запуск продолжает с места
+  обрыва;
+- каждый шаг обязан быть идемпотентным сам по себе (существующее
+  состояние ≠ ошибка): пакет уже стоит — ок; юзер создан — ок; конфиг
+  совпадает — ок;
+- точка ожидания (WAIT) — тоже шаг: он опрашивает предусловие с таймаутом;
+  при таймауте команда завершается ненулевым кодом с инструкцией
+  «повторите ту же команду — продолжит с этого шага»;
+- `--force` игнорирует `.installer-state` (полный проход поверх), но никогда
+  не трогает данные PG и медиа-дерево без `--repair`;
+- сообщения об ошибках обязаны содержать: что проверяли, что нашли, каким
+  шагом исправлять (стиль слоя 1).
+
+## 8. Последовательности шагов
+
+Формат: `шаг [WAIT: предусловие]`. Точки WAIT — механизм самокоординации
+(P3): ноды не дёргают друг друга, каждая ждёт своей очереди по состоянию,
+которое видит локально.
+
+### 8.1 `--init` (VM1, primary)
+
+| # | Шаг | Детали |
+|---|-----|--------|
+| 1 | preflight | root; ALT; слой 1 установлен (`config.conf` валиден, psql SELECT по кредам БД `fusionpbx` проходит); PG16; `--node2/--node3` заданы и пингуются (мягкая проверка); 5433/8008 свободны |
+| 2 | config-gen | читает креды БД из `/etc/fusionpbx/config.conf`; генерирует пароль repmgr + sync-ключ; пишет cluster.conf (600); **печатает токен и подсказку «введите его на VM2 и VM3»** |
+| 3 | packages | `postgresql16-repmgr`, `haproxy`, `lsyncd` |
+| 4 | pg-prep | `CREATE ROLE repmgr REPLICATION LOGIN PASSWORD ...`; `CREATE DATABASE repmgr OWNER repmgr`; `CREATE EXTENSION repmgr`; pg_hba: записи для VM2/VM3 (метаданные, репликация, БД fusionpbx с обеих data-нод — точный список §14.3); `.pgpass` для postgres; reload |
+| 5 | wal-log-hints | `ALTER SYSTEM SET wal_log_hints = on` + рестарт `postgresql.service` (однократный рестарт одиночной ноды; нужен для `pg_rewind` при ремонте бывшей primary; наследуется клоном VM2) |
+| 6 | repmgr-conf | `/etc/repmgr/repmgr.conf` ноды 1 (§13.3) |
+| 7 | primary-register | `repmgr primary register` (+`--force` при повторах) |
+| 8 | agent | role-agent: скрипт + systemd-юнит (§9.2), enable+start |
+| 9 | haproxy | конфиг (§9.1), enable+start |
+| 10 | repoint-DSN | `config.conf` → `127.0.0.1:5433`; DSN FreeSWITCH (`vars.xml`/настройки из БД) → `127.0.0.1:5433`; перезапуск angie, php-fpm, freeswitch; smoke-тест: логин в UI проходит через 5433 |
+| 11 | **WAIT witness** | опрос `repmgr cluster show`/таблицы `repmgr.nodes` до появления ноды 3 (таймаут 15 мин) |
+| 12 | **WAIT standby** | опрос `pg_stat_replication` до `application_name = fpbx-ha-2` в состоянии streaming (таймаут 15 мин) |
+| 13 | sync-on | `ALTER SYSTEM SET synchronous_standby_names = 'fpbx-ha-2'`; reload; проверка `pg_stat_replication.sync_state = sync` |
+| 14 | lsyncd-start | конфиг VM1 (§10), enable+start (медиа-дерево VM1 — эталон) |
+| 15 | finalize | маркер `.installed`; итоговая сводка: `repmgr cluster show`, роли, токен ещё раз |
+
+Шаги 11–12 — точка «оператор идёт вводить токен на VM2/VM3»: VM1 стоит на
+WAIT и продолжится сама, как только сосед зарегистрируется. Если оператор не
+успел — ненулевой выход с подсказкой перезапустить команду (resume с шага 11).
+
+### 8.2 `--join` (VM2, standby)
+
+| # | Шаг | Детали |
+|---|-----|--------|
+| 1 | preflight | root; ALT; слой 1 установлен; **мажор PG = HA_PG_VERSION**; токен распакован; собственный IP найден среди нод → роль `standby`; маркер отсутствует (иначе → `--repair`); VM1:5432 достижим |
+| 2 | unpack | cluster.conf (600) + приватный sync-ключ (600); authorized_keys с ограничениями (§6.3); `/etc/hosts` — записи всех нод |
+| 3 | packages | `postgresql16-repmgr`, `haproxy`, `lsyncd` |
+| 4 | stop-local-pg | стоп `postgresql.service`; **громкое предупреждение: локальная БД fusionpbx будет заменена клоном с VM1** (интерактивное подтверждение / `--yes`) |
+| 5 | clone | `rm -rf /var/lib/pgsql/data/*` → `repmgr standby clone -h VM1 ...` (pg_basebackup; **WAIT: VM1 зарегистрирована как primary**, таймаут 10 мин) |
+| 6 | start+register | старт `postgresql.service` (поднимется в recovery) → `repmgr standby register --upstream-node-id=1`; в conninfo — `application_name=fpbx-ha-2` (для `synchronous_standby_names` с VM1, §16-в2) |
+| 7 | agent + haproxy | те же конфиги, что на VM1 (идентичны на всех data-нодах) |
+| 8 | repoint-DSN | как шаг 10 у `--init`; перезапуск сервисов; smoke-тест |
+| 9 | seed-media | rsync **от VM1 к себе** (pull): `rsync -a --delete -e "ssh -i sync_key" VM1:$HA_SYNC_DIR/ $HA_SYNC_DIR/` — локальная копия становится зеркальной до первого старта lsyncd (§10.2, ловушка `--delete`) |
+| 10 | lsyncd-start | конфиг VM2 (push → VM1, `delete=true`), enable+start |
+| 11 | finalize | маркер; сводка (`repmgr cluster show` уже видит 2/3) |
+
+### 8.3 `--join` (VM3, witness)
+
+| # | Шаг | Детали |
+|---|-----|--------|
+| 1 | preflight | root; ALT; **слой 1 НЕ требуется**; мажор PG совпадает; VM1:5432 достижим; маркер отсутствует |
+| 2 | unpack | cluster.conf (600), `/etc/hosts` |
+| 3 | packages | `postgresql16-repmgr` + `postgresql16-server` (без haproxy/lsyncd) |
+| 4 | initdb-tiny | отдельный кластер PG **только под метаданные**: `initdb --data-checksums`, старт; локальные `repmgr`-юзер/база; pg_hba: `repmgr` с VM1 и VM2 (standby читает метаданные witness при консенсусе failover — §11.3) |
+| 5 | repmgr-conf | `/etc/repmgr/repmgr.conf` ноды 3, `failover='manual'` (witness никогда не промоутится) |
+| 6 | witness-register | **WAIT: VM1 primary жива** → `repmgr witness register -h VM1` |
+| 7 | repmgrd | enable+start `repmgr.service` |
+| 8 | finalize | маркер; сводка |
+
+### 8.4 `--repair` (любая нода)
+
+Входное условие: `/etc/fusionpbx-ha/cluster.conf` присутствует локально
+(токен не нужен). Роль — из cluster.conf по IP.
+
+| Нода | Последовательность |
+|------|--------------------|
+| data (VM1 или VM2) | стоп lsyncd → стоп repmgrd → стоп PG → **ветка A** (PGDATA цела, нода была primary): `repmgr node rejoin --force-rewind` (pg_rewind; wal_log_hints включён шагом 5 у `--init`) → standby; **ветка B** (PGDATA мусор/с нуля, флаг `--force-clone` или диагностика): wipe → `repmgr standby clone` → register `--force`; далее: agent+haproxy идемпотентно, **seed-media (pull, §10.2) до старта lsyncd**, lsyncd start, маркер |
+| witness (VM3) | initdb-tiny идемпотентно → `repmgr witness register --force` → repmgrd |
+
+Особый случай — ремонт бывшей primary при живой новой primary: ветка A
+равно применима (`rejoin --force-rewind` вернёт её standby'ем).
+
+### 8.5 `--status` / `--doctor`
+
+Только чтение, без состояний/маркеров. `--status` — компактная сводка;
+`--doctor` — полный чек-лист с кодом выхода (для мониторинга):
+
+- нода: роль (repmgr), IP, время, NTP-синхронизация;
+- кластер: `repmgr cluster show` (все ноды видны?), события последних 24ч;
+- репликация: streaming? лаг байт/секунд, `sync_state` (sync/async);
+- точка входа: `127.0.0.1:5433` коннектится и ведёт **к primary**;
+- role-agent обоих бэкендов: код ответа;
+- lsyncd: сервис жив, ошибок в логе нет, последняя синхронизация;
+- носители: место на дисках, права на `$HA_SYNC_DIR`;
+- pg_hba: ожидаемые записи присутствуют.
+
+## 9. Роутинг к primary: haproxy + role-agent
+
+### 9.1 haproxy (конфиг идентичен на VM1 и VM2)
+
+```
+listen postgres_primary
+    bind 127.0.0.1:5433
+    mode tcp
+    option httpchk
+    http-check send meth GET uri /primary
+    default-server inter 3s fall 2 rise 1 check port 8008
+    server fpbx-ha-1 10.0.0.11:5432 check
+    server fpbx-ha-2 10.0.0.12:5432 check
+```
+
+Проверка — HTTP `GET /primary` на агенте (порт 8008) каждой data-ноды;
+бэкенд попадает в ротацию только если его локальная PG — primary.
+failover: агент новой primary отвечает 200, старой — 503 → оба haproxy
+переключаются за `inter×fall` ≈ 6–9 c.
+
+### 9.2 role-agent (python3 + psycopg2, ~40 строк)
+
+```python
+# /usr/lib/fusionpbx-ha/role-agent.py (референс)
+# 200 = локальная PG является primary, 503 = standby/недоступна
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        code = 503
+        if self.path == "/primary":
+            try:
+                c = psycopg2.connect(host="127.0.0.1", port=5432,
+                                     dbname=CONF.db_name, user=CONF.db_user,
+                                     password=CONF.db_password, connect_timeout=3)
+                cur = c.cursor(); cur.execute("SELECT pg_is_in_recovery()")
+                code = 503 if cur.fetchone()[0] else 200
+                c.close()
+            except Exception:
+                code = 503
+        self.send_response(code); self.end_headers()
+```
+
+systemd-юнит `fusionpbx-ha-agent.service`: простой однопоточный
+`http.server` на `0.0.0.0:8008` (нужен соседскому haproxy), креды — из
+`/etc/fusionpbx-ha/cluster.conf` (парсится тем же скриптом). Отдельный
+малый сервис вместо таймаутных pgsql-проверок в haproxy: отличает
+primary/standby за один HTTP-запрос и не зависит от PG-аутентификации
+сессий haproxy.
+
+## 10. Синхронизация медиа-файлов
+
+### 10.1 Периметр
+
+Синхронизируется **только** `/var/lib/freeswitch/storage` (записи
+разговоров, voicemail, факсы). Имена файлов содержат UUID вызова →
+write-once, без коллизий; каждая запись рождается ровно на одной ноде →
+встречные потоки не конфликтуют.
+
+**Не синхронизируются**: `/etc/freeswitch` (конфиг генерируется из БД),
+`/var/www/fusionpbx` (меняется только апгрейдом — там свой порядок, §17),
+логи, `/run`.
+
+### 10.2 Конфигурация lsyncd (VM2; на VM1 — зеркально)
+
+```lua
+settings { logfile = "/var/log/lsyncd/lsyncd.log",
+           statusFile = "/var/log/lsyncd/lsyncd.status",
+           statusInterval = 20, inotifyMode = "CloseWrite" }
+sync { default.rsync,
+       source = "/var/lib/freeswitch/storage",
+       target = "root@10.0.0.11:/var/lib/freeswitch/storage",
+       delay = 5, maxProcesses = 1,
+       rsync = { archive = true, compress = true, _extra = { "--delete" },
+                 rsh = "ssh -i /etc/fusionpbx-ha/sync_key -o StrictHostKeyChecking=accept-new" } }
+```
+
+Две ловушки закрываются процедурно:
+
+1. **Seed-before-sync** (ловушка `--delete`): rsync с `--delete` от пустой
+   (пересобранной) ноды сотрёт копию соседа. Поэтому в `--join`/`--repair`
+   медиа-дерево сначала **вытягивается** с соседа (pull с `--delete` —
+   удаления на этом шаге затрагивают только локальные устаревшие файлы, это
+   безопасно), и лишь затем стартует lsyncd.
+2. **Распространение удалений из UI**: оператор удалил запись на той ноде,
+   что обработала запрос; `--delete` в обе стороны доводит удаление до
+   соседа. Единственный опасный порядок — старт с пустого локального
+   дерева, закрыт п.1.
+
+## 11. Отказные сценарии, RTO/RPO
+
+### 11.1 Матрица
+
+| Событие | Что происходит | RTO |
+|---|---|---|
+| Падение VM2 (standby) | Сервис не прерывается: VM1 продолжает обслуживать. Авто-восстановления нет — ремонт VM2 по §8.4 | 0 (голос/веб); записи новых звонков — асинхронно до возврата standby |
+| Падение VM1 (primary) | repmgrd VM2 + witness фиксируют недоступность primary (консенсус) → promote VM2; агенты переключают haproxy; звонки на VM1 рвутся, телефоны перерегистрируются на VM2 | ≈ 30–45 c: детект (monitoring_interval 5 c × reconnect 3×5 c) + promote (~5 c) + haproxy (6–9 c) |
+| Сетевой раздел VM1 \| VM2 (VM3 достижима обеими) | witness достижим только с одной стороны → консенсус возможен только там; на изолированной стороне: **sync-репликация блокирует коммиты** (нет sync-standby) — расщепление записи исключено | недоступность части клиентов до склейки |
+| Падение VM3 (witness) | Кластер полностью работоспособен; авто-failover невозможен (нет третьего голоса) — деградация до ремонта | 0; ремонт — `--repair` на VM3 |
+| Двойной отказ | Запись замораживается по дизайну (см. §12.4) | до ремонта |
+
+### 11.2 RPO
+
+Синхронный коммит: подтверждённые транзакции есть на обеих копиях →
+**RPO = 0** для закоммиченных данных. Незакоммиченные на момент отказа
+транзакции (микросекунды окна) теряются — для АТС несущественно.
+
+### 11.3 Консенсус failover (роль witness)
+
+repmgrd standby при потере связи с primary опрашивает witness: если и
+witness подтверждает недоступность primary, выполняется promote. Witness
+не хранит пользовательских данных и никогда не промоутится — его единственная
+функция — третий голос, исключающий промоушен при «primary жива, но плохо
+связана с VM2». При недоступности witness авто-failover не выполняется
+(консервативная деградация — осознанное решение: отказ двух нод уже за
+рамками SLA одного отказа).
+
+## 12. Ремонт — сценарии и гарантии
+
+### 12.1 Standby (VM2) потеряна безвозвратно
+
+Пересоздать VM → слой 1 → `fusionpbx-ha.sh --join <токен>` (или `--repair`,
+если cluster.conf спасён из бэкапа). Всегда `--force-clone`-семантика:
+локальная база пустая/мусорная → клон с primary. Медиа — seed с VM1.
+
+### 12.2 Primary (VM1) потеряна
+
+Авто-failover уже повысил VM2 (см. §11.1). Пересоздать VM1 → слой 1 →
+`--join`. Кластер видит двух кандидатов в primary? Нет: `repmgr standby
+register` вводит VM1 как standby к действующей primary (VM2); далее
+штатный `repmgr switchover` при желании вернуть роль.
+
+### 12.3 Witness (VM3) потеряна
+
+Пересоздать → `--join` (preflight witness-ветки не требует слоя 1). Пока
+witness отсутствует, кластер работает, но авто-failover отключён — чинить
+быстро, `--doctor` об этом напоминает.
+
+### 12.4 Двойной отказ: заморозка и вывод из неё
+
+При двух потерянных нодах из трёх запись останавливается: это правильное
+поведение (продолжать писать мог бы только кластер без защиты от
+split-brain). Штатный вывод из заморозки — ремонт любой одной ноды (§12.1–
+12.3): кворум (2/3) восстанавливается, frozen-primary/standby
+доводятся `rejoin`/`register`. Аварийный ручной промоушен последней
+выжившей (мимо repmgr, `pg_ctl promote` при остановленных repmgrd) —
+документируется как break-glass: допустим только при полной уверенности,
+что остальные ноды никогда не вернутся со старыми данными, и с
+последующей пересборкой кластера с нуля.
+
+## 13. ALT-специфика (проверенные факты)
+
+Источники: листинги p10/p11 зеркала mirror.yandex.ru (2026-10-13) и разбор
+payload RPM `postgresql16-repmgr-5.5.0-alt5` (p11, x86_64).
+
+### 13.1 Слой 1 (из установщика)
+
+- пакет `postgresql16-server`; PGDATA `/var/lib/pgsql/data` (без номера
+  версии в пути); сервис `postgresql.service` (безверсионный);
+- мажор PG = 16 (`database_version=16` в `config.sh` слоя 1).
+
+### 13.2 Пакет `postgresql16-repmgr` (факты из RPM)
+
+| Элемент | Путь |
+|---|---|
+| конфиг | `/etc/repmgr/repmgr.conf` (каталог, не Debian-путь `/etc/repmgr.conf`) |
+| бинари | `/usr/bin/repmgr`, `/usr/bin/repmgrd` |
+| юнит демона | `/usr/lib/systemd/system/repmgr.service` — `ExecStart=/usr/bin/repmgrd -f ${REPMGR_CONF} --daemonize=false --no-pid-file`; `User=postgres`; `After=network.target postgresql.service` |
+| env | `/etc/sysconfig/repmgr`: `REPMGR_CONF`, `REPMGRD_OPTS` |
+| sudoers | `/etc/sudoers.d/repmgr`: postgres → NOPASSWD `systemctl start/stop/restart/reload/status postgresql` — **управление PG из repmgrd работает из коробки** |
+| extension | `/usr/share/pgsql/extension/repmgr*`, `/usr/lib64/pgsql/repmgr.so` |
+| логи | `/var/log/repmgr` (tmpfiles.d) |
+
+### 13.3 Референсные repmgr.conf (минимум)
+
+```ini
+# VM1 (primary)
+node_id=1
+node_name=fpbx-ha-1
+conninfo='host=10.0.0.11 user=repmgr dbname=repmgr password=... connect_timeout=5'
+data_directory='/var/lib/pgsql/data'
+pg_bindir='/usr/bin'
+failover='manual'                 # primary не промоутится
+monitoring_interval=5
+reconnect_attempts=3
+reconnect_interval=5
+service_start_command='sudo systemctl start postgresql'
+service_stop_command='sudo systemctl stop postgresql'
+service_restart_command='sudo systemctl restart postgresql'
+log_file='/var/log/repmgr/repmgrd.log'
+```
+
+```ini
+# VM2 (standby) — отличия
+node_id=2
+node_name=fpbx-ha-2
+conninfo='host=10.0.0.12 user=repmgr dbname=repmgr password=... application_name=fpbx-ha-2'
+failover='automatic'
+promote_command='/usr/bin/repmgr standby promote -f /etc/repmgr/repmgr.conf'
+follow_command='/usr/bin/repmgr standby follow -f /etc/repmgr/repmgr.conf --upstream-node-id=%n'
+priority=100
+```
+
+```ini
+# VM3 (witness) — отличия
+node_id=3
+node_name=fpbx-witness
+conninfo='host=10.0.0.13 user=repmgr dbname=repmgr password=...'
+failover='manual'
+```
+
+`application_name` в conninfo нужен, чтобы `synchronous_standby_names`
+на primary можно было задать именем (`fpbx-ha-2`), а не маской.
+
+### 13.4 Версии
+
+p11: repmgr 5.5.0-alt5 (PG13–17), haproxy 3.4.4, lsyncd 2.3.1, psycopg2
+2.9.5; p10: repmgr 5.4.1-alt4, haproxy 2.8.28, lsyncd 2.1.4, psycopg2 2.9.1.
+Синтаксис haproxy-конфига из §9.1 сверить под 2.8 (p10) при реализации.
+
+## 14. Безопасность
+
+1. **Токен** = root-эквивалент (пароль БД, repmgr, приватный sync-ключ).
+   Печать — только по команде; совет «стирайте из истории буфера обмена».
+2. **Sync-ключ**: ed25519, только для rsync медиа-дерева; `from=` по IP
+   data-нод; `command=rrsync` (если доступен); параметры
+   `no-pty,no-agent-forwarding,no-X11-forwarding,no-port-forwarding`.
+3. **pg_hba** (минимальный набор; метод — как в слое 1):
+
+```
+# на VM1 (primary; клонируется на VM2 автоматически)
+host repmgr      repmgr     10.0.0.12/32  md5   # метаданные: VM2
+host repmgr      repmgr     10.0.0.13/32  md5   # метаданные: VM3 (witness)
+host replication repmgr     10.0.0.12/32  md5   # потоковая репликация
+host fusionpbx   fusionpbx  10.0.0.11/32  md5   # haproxy/агент VM1 → VM2 и наоборот
+host fusionpbx   fusionpbx  10.0.0.12/32  md5
+```
+
+```
+# на VM3 (witness)
+host repmgr      repmgr     10.0.0.11/32  md5   # repmgrd VM1 читает witness
+host repmgr      repmgr     10.0.0.12/32  md5   # консенсус failover из VM2
+```
+
+4. **role-agent** отвечает без аутентификации только `/primary` → 200/503,
+   больше ничего не отдаёт и не принимает; listening на кластерном
+   интерфейсе (доступен data-нодам), в firewall — только от них.
+5. Права: cluster.conf и sync_key — 600/root; `/etc/fusionpbx-ha/` — 700.
+6. Сеть: кластерный трафик (5432/8008/22-sync) — в management-сегменте,
+   недоступном с клиентских сетей.
+
+## 15. План тестирования
+
+1. **Статика**: `sh -n`; shellcheck (если поставлен в CI); тесты
+   аргументов/конфликтов команд по образцу `test_arguments.sh` слоя 1.
+2. **Песочница state-machine** (по образцу `test_guard.sh`): шаги с
+   заглушками `systemctl/psql/repmgr/rsync/ssh`; проверяются: resume,
+   идемпотентность, отказы на середине, ветки `--repair`, seed-before-sync
+   (порядок вызовов rsync/lsyncd — мок-лог).
+3. **Стенд 3×LXC/VM (ALT p11)**, сценарии по порядку:
+   - полный цикл `--init` → `--join` witness → `--join` standby; проверка:
+     `repmgr cluster show` 3/3, sync_state=sync, `127.0.0.1:5433` → primary,
+     звонок записан, файл записи читается с обеих нод;
+   - пауза/стоп VM2: кластер жив; возврат `--repair`;
+   - жёсткий стоп VM1 (kill -9 postgres + poweroff): авто-promote VM2 ≤45 c,
+     новые звонки пишутся; возврат VM1 как standby (`rejoin --force-rewind`);
+   - партиция VM1|VM2 (iptables DROP): изолированная primary перестаёт
+     принимать коммиты (sync), дубль primary не возникает;
+   - перезагрузка всех трёх нод в разнобой: кластер сходится сам;
+   - двойной отказ → предсказуемая заморозка → ремонт одной ноды;
+   - `--doctor` до/после каждого сценария.
+4. **Приёмка**: прогон сценария «плановое выключение хоста Proxmox»
+   целиком (не только VM).
+
+## 16. Открытые вопросы (проверить при реализации)
+
+| # | Вопрос | Как закрывается |
+|---|--------|-----------------|
+| В1 | точный путь `rrsync` в пакете rsync ALT | `rpm -ql rsync \| grep rrsync`; нет → конфигурация без `command=` |
+| В2 | пробрасывает ли repmgr 5.5 `application_name` из conninfo в primary_conninfo (для точного `synchronous_standby_names`) | на стенде; иначе — `primary_conninfo` напрямую в repmgr.conf standby |
+| В3 | layout haproxy в ALT (главный cfg / conf.d) и точный синтаксис http-проверки для 2.8 (p10) | `rpm -qc haproxy` + стенд |
+| В4 | тянет ли `postgresql16-repmgr` `postgresql16-server` автоматически (для VM3 — важно) | `apt-get install --dry-run` |
+| В5 | поведение repmgrd при старте, если PG ещё не поднята (boot-race VM2) — ждёт ли бесконечно | стенд: перезагрузка в разнобой (сценарий 15.3) |
+| В6 | сохранение `--delete`-семантики lsyncd 2.1.4 (p10) против 2.3.1 (p11) | стенд на p10 либо фиксация минимальной версии p11 |
+| В7 | параметры lsyncd для больших каталогов записей (inotify-лимиты) | `sysctl fs.inotify.max_user_watches` в `--doctor` |
+
+## 17. Будущие расширения (вне v1)
+
+- **VIP-модуль** (keepalived, `track_script` по role-agent) — если появится
+  парк конечных точек, не умеющих два сервера;
+- **третья PG-реплика на VM3** (без FusionPBX) — устранение окна работы
+  «на последней копии» после первого отказа; добавляется без переделок
+  (`repmgr standby register` на VM3);
+- **процедура апгрейда** (minor-версии PG и FusionPBX: switchover →
+  апгрейд пассивной ноды → switchover обратно; web-дерево — rsync в паузе);
+- **ansible-обёртка**: playbook, вызывающий fusionpbx-ha.sh с `--config`
+  (интерфейс для этого заложен в v1);
+- интеграция сводки `--doctor` в существующий мониторинг установщика.
+
