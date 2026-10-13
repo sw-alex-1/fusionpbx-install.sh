@@ -1,8 +1,9 @@
 # Alt/ha — HA add-on for FusionPBX on ALT Linux (repmgr + witness)
 
-**Status: design phase.** No runnable code here yet — this directory hosts
-the design for `fusionpbx-ha.sh`. Implementation starts after the design
-review.
+**Status: implemented (v1), pending lab validation.** `fusionpbx-ha.sh`
+is complete and covered by a sandbox test suite (`tests/run-all.sh`,
+120 checks). The next gate is the 3-node ALT stand (DESIGN.md section 15.3)
+before production use.
 
 ## What this is
 
@@ -43,15 +44,18 @@ in **RUNBOOK.md** (written for "it's been months, nobody remembers anything").
 
 | File | Purpose |
 |------|---------|
-| `DESIGN.md` | Design document — architecture, CLI, state machine, step sequences, failover/repair analysis, test plan. Review target: **v0.2** |
+| `fusionpbx-ha.sh` | Layer-2 installer: `--init`, `--join`, `--repair`, `--status`, `--doctor`, `--print-token` |
+| `resources/ha-lib.sh` | Core library: state machine, token, cluster.conf, rendering, PG/sync helpers (sourced; also used by tests) |
+| `resources/` | Templates & units: `repmgr.conf.tpl`, `haproxy.cfg.tpl`, `lsyncd.conf.lua.tpl`, `promote.sh.tpl`, `role-agent.py`, `fusionpbx-ha-agent.service` |
+| `tests/` | Sandbox test suite (`run-all.sh`): lib/render/CLI/agent, layer-1 `test_guard.sh` style |
+| `DESIGN.md` | Design document — architecture, CLI, step sequences, failover/repair analysis. **v0.3** |
 | `RUNBOOK.md` | Operational manual (RU) — deploy, health checks, single/double failure, repair, upgrade, proxy. Self-sufficient per scenario |
-| `fusionpbx-ha.sh` | *(planned)* Layer-2 installer: `--init`, `--join`, `--repair`, `--status`, `--doctor`, `--print-token` |
-| `resources/` | *(planned)* Config templates: repmgr, haproxy, lsyncd, role-agent, systemd units |
-| `tests/` | *(planned)* Sandbox tests, same style as layer-1 `scripts/test_guard.sh` |
 
 ## Русский раздел
 
-**Статус: этап проектирования** (дизайн v0.2). Исполняемого кода пока нет.
+**Статус: реализовано (v1), ожидает стендовой проверки.** `fusionpbx-ha.sh`
+готов и покрыт песочным тестовым набором (`tests/run-all.sh`, 120 проверок);
+следующие ворота — стенд 3×ALT (DESIGN.md §15.3) перед продуктивом.
 
 Это надстройка (слой 2) над установщиком: слой 1 (`Alt/`) не изменяется и
 по-прежнему ставит одиночную ноду; `fusionpbx-ha.sh` превращает три
@@ -60,9 +64,11 @@ in **RUNBOOK.md** (written for "it's been months, nobody remembers anything").
 через witness, haproxy-маршрутизация к текущей primary и lsyncd-синк
 медиа-файлов. Все пакеты — из штатных репозиториев ALT p10/p11.
 
-Краткий план команд — в таблице Quick start выше. Рабочая инструкция на все
+Краткий план команд — в таблице Quick start выше; детали реализации и
+обоснования — в [DESIGN.md](DESIGN.md) (v0.3), рабочая инструкция на все
 остальные случаи (упала нода, кластер заморожен, ремонт пересобранной ноды,
 обновление ветки) — в [RUNBOOK.md](RUNBOOK.md): каждый сценарий самодостаточен
 и написан для ситуации «прошло много времени, никто ничего не помнит». Работа
 за корпоративным HTTP(S)-прокси — тем же флагом `--proxy host:port`, что и в
-слое 1; межнодовый трафик идёт напрямую (DESIGN.md §5.1).
+слое 1; межнодовый трафик идёт напрямую (DESIGN.md §5.1). Тесты:
+`Alt/ha/tests/run-all.sh` (без root, ничего не трогает в системе).
