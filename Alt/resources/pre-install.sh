@@ -66,6 +66,7 @@ pkg_install_required \
     git \
     ca-certificates \
     dialog \
+    sudo \
     nano \
     net-tools \
     unzip

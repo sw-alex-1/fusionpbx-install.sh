@@ -25,7 +25,7 @@ database_port=5432                          # port number
 database_backup=false                       # true or false
 
 # PHP Settings
-php_version=8.2                             # PHP version: 8.1, 8.2, 8.3
+php_version=8.3                             # PHP version: 8.1, 8.2, 8.3
 php_package_suffix=-fcgi                     # Alt Linux: -fcgi (NOT -fpm like Debian)
 php_fpm_service=php${php_version}-fpm         # systemd service name
 php_fpm_sock_dir=/var/run/php${php_version}-fpm  # socket directory
