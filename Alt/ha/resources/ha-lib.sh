@@ -671,9 +671,109 @@ EOSUDO
 }
 
 # -----------------------------------------------------------------------------
+# repmgr extension schema access (regression 0.3.3, stand feedback: 'init'
+# step 7 dies with "permission denied for schema repmgr" / "нет доступа к
+# схеме repmgr"). CREATE EXTENSION runs as the postgres SUPERUSER (local
+# socket, peer auth), so the schema and every object the extension created
+# belong to postgres. The repmgr role is a non-superuser BY DESIGN -> it
+# cannot even USE the schema, and the first metadata query of any
+# '* register' aborts. Fix, applied as superuser:
+#   - the schema + the extension objects are handed to the repmgr role
+#     (as if the role had created the extension itself)
+#   - DML grants for the existing objects + ALTER DEFAULT PRIVILEGES for
+#     objects a future 'ALTER EXTENSION UPDATE' may add (it runs as postgres)
+#   - best-effort role grants for non-superuser operation elsewhere:
+#       * pg_monitor - repmgrd polls pg_stat_replication on the primary
+#       * EXECUTE on the pg_rewind file functions - '--repair' runs
+#         pg_rewind as the repmgr role; these GRANTs are the documented
+#         PostgreSQL 13+ non-superuser recipe
+# Idempotent. Skipped on a standby (its metadata DB is a streaming copy of
+# the primary's: the grants arrive via replication, and ALTERs are refused
+# during recovery) and on a database without the extension yet.
+# -----------------------------------------------------------------------------
+ha_fix_repmgr_schema_access() {
+    if [ "$(pg_runuser_psql -tAc "SELECT pg_is_in_recovery()" | tr -d ' \r')" = "t" ]; then
+        verbose "  standby local DB - repmgr schema grants arrive via replication (nothing to do)"
+        return 0
+    fi
+    if ! pg_runuser_psql -d "$HA_REPMGR_DB" -tAc "SELECT 1 FROM pg_extension WHERE extname='repmgr'" | grep -q 1; then
+        return 0    # no extension in this database yet - nothing to fix
+    fi
+
+    # NOTE: unquoted heredoc on purpose - $HA_REPMGR_USER must expand (it
+    # is a fixed alphanumeric constant), the DO dollar-tags are escaped
+    _hfsa_sql="$(mktemp "${TMPDIR:-/tmp}/fpbx-ha-schema.XXXXXX")"
+    cat >"$_hfsa_sql" <<HAFIX
+-- fusionpbx-ha: repmgr extension ownership + grants (idempotent)
+ALTER SCHEMA repmgr OWNER TO $HA_REPMGR_USER;
+GRANT USAGE, CREATE ON SCHEMA repmgr TO $HA_REPMGR_USER;
+GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA repmgr TO $HA_REPMGR_USER;
+GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA repmgr TO $HA_REPMGR_USER;
+GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA repmgr TO $HA_REPMGR_USER;
+ALTER DEFAULT PRIVILEGES IN SCHEMA repmgr GRANT ALL PRIVILEGES ON TABLES TO $HA_REPMGR_USER;
+ALTER DEFAULT PRIVILEGES IN SCHEMA repmgr GRANT ALL PRIVILEGES ON SEQUENCES TO $HA_REPMGR_USER;
+ALTER DEFAULT PRIVILEGES IN SCHEMA repmgr GRANT EXECUTE ON FUNCTIONS TO $HA_REPMGR_USER;
+-- transfer the objects the extension already created (postgres -> repmgr);
+-- per-object tolerance: the GRANTs above already cover DML, ownership is
+-- belt-and-braces for the DDL paths
+DO \$hfx\$
+DECLARE r RECORD;
+BEGIN
+    FOR r IN
+        SELECT c.relname, c.relkind
+          FROM pg_class c
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = 'repmgr'
+           AND c.relkind IN ('r', 'p', 'v', 'm', 'S')
+    LOOP
+        BEGIN
+            IF r.relkind = 'S' THEN
+                EXECUTE format('ALTER SEQUENCE repmgr.%I OWNER TO %I', r.relname, '$HA_REPMGR_USER');
+            ELSE
+                EXECUTE format('ALTER TABLE repmgr.%I OWNER TO %I', r.relname, '$HA_REPMGR_USER');
+            END IF;
+        EXCEPTION WHEN OTHERS THEN
+            NULL;
+        END;
+    END LOOP;
+END
+\$hfx\$;
+HAFIX
+    chmod 644 "$_hfsa_sql"    # psql runs as the postgres OS user
+    if ! pg_runuser_psql -d "$HA_REPMGR_DB" -v ON_ERROR_STOP=1 -f "$_hfsa_sql" >/dev/null; then
+        die "cannot apply the repmgr extension grants in $HA_REPMGR_DB
+The generated SQL is kept at $_hfsa_sql - inspect the error with:
+  runuser -u postgres -- psql -d $HA_REPMGR_DB -v ON_ERROR_STOP=1 -f $_hfsa_sql"
+    fi
+    rm -f "$_hfsa_sql"
+
+    # best-effort role grants: silent on purpose (a changed signature in a
+    # future PostgreSQL major must not block a registration)
+    _hfsa_opt="$(mktemp "${TMPDIR:-/tmp}/fpbx-ha-schema-opt.XXXXXX")"
+    cat >"$_hfsa_opt" <<HAFIX
+GRANT pg_monitor TO $HA_REPMGR_USER;
+GRANT EXECUTE ON FUNCTION pg_catalog.pg_read_file(text, bigint, bigint) TO $HA_REPMGR_USER;
+GRANT EXECUTE ON FUNCTION pg_catalog.pg_read_binary_file(text) TO $HA_REPMGR_USER;
+GRANT EXECUTE ON FUNCTION pg_catalog.pg_read_binary_file(text, bigint, bigint) TO $HA_REPMGR_USER;
+GRANT EXECUTE ON FUNCTION pg_catalog.pg_stat_file(text) TO $HA_REPMGR_USER;
+GRANT EXECUTE ON FUNCTION pg_catalog.pg_stat_file(text, boolean) TO $HA_REPMGR_USER;
+GRANT EXECUTE ON FUNCTION pg_catalog.pg_ls_waldir() TO $HA_REPMGR_USER;
+GRANT EXECUTE ON FUNCTION pg_catalog.pg_ls_archivepg_wal() TO $HA_REPMGR_USER;
+HAFIX
+    chmod 644 "$_hfsa_opt"
+    pg_runuser_psql -d "$HA_REPMGR_DB" -f "$_hfsa_opt" >/dev/null || true
+    rm -f "$_hfsa_opt"
+
+    verbose "  repmgr extension schema: ownership + grants handed to the $HA_REPMGR_USER role"
+    verbose "  repmgr role: pg_monitor + pg_rewind EXECUTE grants (non-superuser operation)"
+}
+
+# -----------------------------------------------------------------------------
 # Self-healing preamble for every '*register' step (DESIGN.md 7: a re-run of
 # the SAME command must fix AND continue). Steps 4/6 may already be recorded
 # as completed by an OLDER script version, so the register steps re-apply:
+#   - the repmgr extension schema access (older versions left the schema
+#     owned by postgres - regression 0.3.3)
 #   - the pg_hba managed block (older versions wrote an incomplete set)
 #   - listen_addresses (older versions never set it)
 #   - repmgr.conf when it differs from the current template (legacy keys)
@@ -682,6 +782,10 @@ EOSUDO
 # -----------------------------------------------------------------------------
 ha_register_prelude() {
     _hrp_role="$1"    # primary | standby | witness
+    # the metadata DB must be usable by the repmgr role BEFORE any register:
+    # without this the very first metadata query aborts with
+    # "permission denied for schema repmgr" (regression 0.3.3)
+    ha_fix_repmgr_schema_access
     case "$_hrp_role" in
         witness) ha_write_pg_hba witness ;;
         *)       ha_write_pg_hba data; ha_install_sudoers; ha_install_promote_sh ;;

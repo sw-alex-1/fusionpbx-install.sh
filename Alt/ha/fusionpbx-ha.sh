@@ -281,15 +281,22 @@ init_step_4_pg_prep() {
     fi
     pg_runuser_psql -d "$HA_REPMGR_DB" -c "CREATE EXTENSION IF NOT EXISTS repmgr;" >/dev/null \
         || die "cannot create the repmgr extension in $HA_REPMGR_DB"
+    # the extension is created by the postgres superuser, so the schema
+    # belongs to postgres - hand it to the repmgr role together with the
+    # DML grants, otherwise 'repmgr primary register' (step 7) dies with
+    # "permission denied for schema repmgr" (regression 0.3.3)
+    ha_fix_repmgr_schema_access
     verbose "  extension ready: repmgr"
 
     ha_write_pg_hba data
     systemctl reload "$HA_PG_SERVICE" 2>/dev/null || pg_runuser_psql -c "SELECT pg_reload_conf();" >/dev/null
 
-    if ! pg_psql_superuser 127.0.0.1 -d "$HA_REPMGR_DB" -tAc "SELECT 1" >/dev/null 2>&1; then
-        PGPASSWORD="$HA_REPMGR_PASSWORD" psql -h 127.0.0.1 -p "$HA_PG_PORT" -U "$HA_REPMGR_USER" -d "$HA_REPMGR_DB" -tAc "SELECT 1" >/dev/null 2>&1 \
-            || warn "cannot connect as $HA_REPMGR_USER via TCP - check pg_hba (the clone on node 2 will fail)"
-    fi
+    # the register path as a whole: the repmgr ROLE must be able to READ
+    # the metadata schema over TCP - this catches both pg_hba gaps and
+    # missing schema grants (a plain "SELECT 1" passed while register
+    # still died - regression 0.3.3)
+    PGPASSWORD="$HA_REPMGR_PASSWORD" psql -h 127.0.0.1 -p "$HA_PG_PORT" -U "$HA_REPMGR_USER" -d "$HA_REPMGR_DB" -tAc "SELECT 1 FROM repmgr.nodes LIMIT 1" >/dev/null 2>&1 \
+        || warn "cannot read repmgr.nodes as $HA_REPMGR_USER on 127.0.0.1:$HA_PG_PORT (pg_hba or schema grants) - 'repmgr primary register' will fail"
 }
 
 init_step_5_wal_log_hints() {
@@ -681,6 +688,9 @@ wit_step_4_initdb_tiny() {
     fi
     pg_runuser_psql -d "$HA_REPMGR_DB" -c "CREATE EXTENSION IF NOT EXISTS repmgr;" >/dev/null \
         || die "cannot create the repmgr extension"
+    # the witness's own repmgrd DMLs its LOCAL metadata DB during failover
+    # elections - it needs the same schema grants as the data nodes
+    ha_fix_repmgr_schema_access
     ha_write_pg_hba witness
     systemctl reload "$HA_PG_SERVICE" 2>/dev/null || pg_runuser_psql -c "SELECT pg_reload_conf();" >/dev/null
     verbose "  witness metadata database ready: $HA_REPMGR_DB"

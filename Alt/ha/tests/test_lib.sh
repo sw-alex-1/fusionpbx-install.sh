@@ -40,6 +40,58 @@ echo "2: eth0    inet 10.0.0.11/24 brd 10.0.0.255 scope global eth0"
 EOF
 chmod +x "$WORK/fakebin/ssh-keygen" "$WORK/fakebin/ip"
 
+# stub psql (schema-grant tests): query-aware answers; every -f FILE
+# invocation is copied to $HA_TEST_CAPTURE for content assertions
+# (PSQL_F_RC: failure exit code for -f calls only)
+cat > "$WORK/fakebin/psql" <<'EOF'
+#!/bin/sh
+_orig="$*"
+_q=""; _f=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -tAc|-c) _q="$2"; shift 2 ;;
+        -f) _f="$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+if [ -n "$_f" ]; then
+    _cap="${HA_TEST_CAPTURE:-}"
+    if [ -n "$_cap" ] && [ -d "$_cap" ]; then
+        _n=0
+        [ -f "$_cap/count" ] && _n=$(cat "$_cap/count" 2>/dev/null)
+        _n=$((_n + 1))
+        echo "$_n" > "$_cap/count"
+        cp "$_f" "$_cap/$_n.sql"
+        printf '%s\n' "$_orig" > "$_cap/$_n.args"
+    fi
+    [ "${PSQL_F_RC:-0}" != "0" ] && exit "${PSQL_F_RC}"
+fi
+case "$_q" in
+    *pg_is_in_recovery*) echo "${FIX_RECOVERY:-f}" ;;
+    *pg_extension*) echo "${FIX_EXT:-1}" ;;
+    *listen_addresses*) echo "${FIX_LISTEN:-*}" ;;
+    *"SELECT 1"*) echo 1 ;;
+    *) : ;;
+esac
+exit 0
+EOF
+
+# stub runuser: strip "-u user" / "--" and exec (keeps psql in the sandbox)
+cat > "$WORK/fakebin/runuser" <<'EOF'
+#!/bin/sh
+[ "$1" = "-u" ] && shift 2
+[ "$1" = "--" ] && shift
+exec "$@"
+EOF
+
+# stub systemctl: everything succeeds (register prelude reload paths)
+cat > "$WORK/fakebin/systemctl" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+
+chmod +x "$WORK/fakebin/psql" "$WORK/fakebin/runuser" "$WORK/fakebin/systemctl"
+
 PASS=0
 FAIL=0
 
@@ -258,6 +310,79 @@ lib_run 'HA_L1_CONF="$WORK/l1.conf"; ha_read_layer1_conf && echo "$HA_L1_DB_USER
 sed -i 's/^database.0.password = .*/database.0.password = bad pass!/' "$WORK/l1.conf"
 lib_run 'HA_L1_CONF="$WORK/l1.conf"; ha_read_layer1_conf' >/dev/null 2>&1
 [ $? != 0 ]; report "layer-1 password charset validated" $?
+
+# ---------------------------------------------------------------------------
+echo "== ha_fix_repmgr_schema_access (regression 0.3.3) =="
+# the extension is created by the postgres SUPERUSER, so the schema belongs
+# to postgres; the repmgr role needs ownership + grants for any '* register'
+export HA_TEST_CAPTURE="$WORK/captured"
+fixcap_reset() { rm -rf "$HA_TEST_CAPTURE"; mkdir -p "$HA_TEST_CAPTURE"; }
+
+# primary with the extension: two SQL files (hard grants + best-effort)
+fixcap_reset
+lib_run 'ha_load_cluster_conf >/dev/null; export FIX_RECOVERY=f FIX_EXT=1; ha_fix_repmgr_schema_access'
+report "primary: exits 0" $? "$OUT"
+[ -s "$HA_TEST_CAPTURE/1.sql" ] && [ -s "$HA_TEST_CAPTURE/2.sql" ]
+report "primary: both SQL files generated" $?
+grep -q "ALTER SCHEMA repmgr OWNER TO repmgr;" "$HA_TEST_CAPTURE/1.sql" 2>/dev/null &&
+grep -q "GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA repmgr TO repmgr;" "$HA_TEST_CAPTURE/1.sql" &&
+grep -q "ALTER DEFAULT PRIVILEGES IN SCHEMA repmgr GRANT ALL PRIVILEGES ON TABLES TO repmgr;" "$HA_TEST_CAPTURE/1.sql"
+report "primary: schema ownership + DML grants + default privileges" $?
+grep -q "ALTER SEQUENCE repmgr.%I OWNER TO %I" "$HA_TEST_CAPTURE/1.sql" 2>/dev/null &&
+grep -q "ALTER TABLE repmgr.%I OWNER TO %I" "$HA_TEST_CAPTURE/1.sql" &&
+grep -q "EXCEPTION WHEN OTHERS THEN" "$HA_TEST_CAPTURE/1.sql"
+report "primary: per-object ownership transfer (tolerant DO block)" $?
+grep -qF 'DO $hfx$' "$HA_TEST_CAPTURE/1.sql" 2>/dev/null &&
+grep -qF '$hfx$;' "$HA_TEST_CAPTURE/1.sql" 2>/dev/null
+report "primary: DO dollar-tags survive the heredoc" $?
+grep -q "GRANT pg_monitor TO repmgr;" "$HA_TEST_CAPTURE/2.sql" 2>/dev/null &&
+grep -q "pg_catalog.pg_ls_archivepg_wal" "$HA_TEST_CAPTURE/2.sql" &&
+grep -q "pg_catalog.pg_read_binary_file(text, bigint, bigint)" "$HA_TEST_CAPTURE/2.sql"
+report "primary: pg_monitor + pg_rewind EXECUTE grants" $?
+grep -qF '$HA_' "$HA_TEST_CAPTURE/1.sql" 2>/dev/null && _e=found || _e=ok
+grep -qF '$HA_' "$HA_TEST_CAPTURE/2.sql" 2>/dev/null && _e=found
+report "primary: no unexpanded shell variables in the SQL" "$_e"
+grep -q "ON_ERROR_STOP" "$HA_TEST_CAPTURE/1.args" 2>/dev/null
+report "primary: hard block runs with ON_ERROR_STOP" $?
+grep -q "ON_ERROR_STOP" "$HA_TEST_CAPTURE/2.args" 2>/dev/null && _o=bad || _o=ok
+report "primary: best-effort block without ON_ERROR_STOP" "$_o"
+echo "$OUT" | grep -q "ownership + grants handed"
+report "primary: verbose summary" $?
+
+# standby: the local DB is a streaming copy of the primary - no-op skip
+fixcap_reset
+lib_run 'ha_load_cluster_conf >/dev/null; export FIX_RECOVERY=t FIX_EXT=1; ha_fix_repmgr_schema_access'
+report "standby: exits 0 (skip)" $? "$OUT"
+[ ! -e "$HA_TEST_CAPTURE/count" ]
+report "standby: no SQL generated" $?
+echo "$OUT" | grep -q "via replication"
+report "standby: skip message" $?
+
+# database without the extension yet: silent no-op
+fixcap_reset
+lib_run 'ha_load_cluster_conf >/dev/null; export FIX_RECOVERY=f FIX_EXT=0; ha_fix_repmgr_schema_access'
+report "no-extension: exits 0 (skip)" $? "$OUT"
+[ ! -e "$HA_TEST_CAPTURE/count" ] && ! echo "$OUT" | grep -q "ownership + grants"
+report "no-extension: silent no-op" $?
+
+# the hard block fails -> die, and the message points at the kept SQL file
+fixcap_reset
+lib_run 'ha_load_cluster_conf >/dev/null; export FIX_RECOVERY=f FIX_EXT=1 PSQL_F_RC=3; ha_fix_repmgr_schema_access' >/dev/null 2>&1
+[ $? != 0 ]; report "psql failure is fatal" $?
+echo "$OUT" | grep -q "cannot apply the repmgr extension grants"
+report "die message names the kept SQL file" $? "$OUT"
+
+# the register prelude must run the fix BEFORE anything else - this is the
+# wiring that unblocks a resume from a state file written by an old version
+fixcap_reset
+: > "$WORK/pgdata/pg_hba.conf"
+mkdir -p "$WORK/lib" "$WORK/sudoers"
+lib_run 'ha_load_cluster_conf >/dev/null; ha_detect_role >/dev/null;
+    HA_REPMGR_CONF="$WORK/etc/repmgr.conf" HA_LIB_DIR="$WORK/lib" HA_PROMOTE_SH="$WORK/lib/promote.sh" HA_SUDOERS_DIR="$WORK/sudoers"
+    ha_register_prelude primary'
+report "prelude: exits 0" $? "$OUT"
+[ -s "$HA_TEST_CAPTURE/1.sql" ] && grep -q "ALTER SCHEMA repmgr OWNER TO repmgr;" "$HA_TEST_CAPTURE/1.sql" 2>/dev/null
+report "prelude: schema fix executed (register self-heal)" $?
 
 # ---------------------------------------------------------------------------
 echo
