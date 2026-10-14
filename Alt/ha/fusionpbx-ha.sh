@@ -90,6 +90,12 @@ done
 [ "$HA_FORCE_RUN" = "1" ] && export HA_FORCE=1
 [ "$HA_VERBOSE" = "1" ] && set -x
 
+# --proxy format must be valid before ANY command runs: the layer-1 proxy.sh
+# writes apt/git/wget/curl configs unconditionally, and a typo must not get
+# that far (DESIGN.md 5.1)
+proxy_server_valid \
+    || die "--proxy expects host:port (e.g. 192.168.0.1:8080), got: '$PROXY_SERVER'"
+
 ha_print_help() {
     cat <<'HELP'
 fusionpbx-ha.sh - FusionPBX HA cluster add-on for ALT Linux
@@ -217,14 +223,18 @@ replaced with a clone of THIS one."
 init_step_2_config_gen() {
     if [ -f "$HA_CLUSTER_CONF" ] && [ "${HA_FORCE:-0}" != "1" ]; then
         verbose "  existing $HA_CLUSTER_CONF kept (resume/repair) - the token stays unchanged"
-        # shellcheck disable=SC1090
-        . "$HA_CLUSTER_CONF"
     elif [ -f "$HA_CLUSTER_CONF" ] && [ "${HA_FORCE:-0}" = "1" ]; then
         warn "--force: generating a NEW cluster.conf (new passwords, new token!)"
         ha_generate_cluster_conf
     else
         ha_generate_cluster_conf
     fi
+    # The sequence runner re-sources cluster.conf for the FOLLOWING steps
+    # only - THIS step (hosts block, no_proxy, token) needs the node list and
+    # the ports right now; on a fresh node they did not exist anywhere before
+    # this point (regression 0.3.1)
+    # shellcheck disable=SC1090
+    . "$HA_CLUSTER_CONF"
     ha_write_etc_hosts_block
     ha_apply_no_proxy
 
@@ -1122,6 +1132,27 @@ cmd_init() {
     done
     [ -n "$HA_INIT_NODE1_IP" ] || die "cannot determine this node's cluster IP (ip -o -4 addr shows no address outside node2/node3)"
     [ "$_isp_multi" = "0" ] || warn "multiple local addresses found - using $HA_INIT_NODE1_IP as the node 1 address"
+
+    # More cross-step state for the step subshells (DESIGN.md 7):
+    # (a) step 2 bakes the layer-1 database credentials into cluster.conf,
+    #     and a subshell cannot hand them back - read config.conf HERE
+    #     (step 1 re-validates layer 1 and reports inside its own banner)
+    ha_read_layer1_conf || true
+    # (b) a previous --init may have already written cluster.conf (resume):
+    #     load it BEFORE the sequence so step 1 uses the authoritative
+    #     values instead of the built-in defaults. Without --force the node
+    #     set can no longer change - the token was already handed out
+    if [ -f "$HA_CLUSTER_CONF" ]; then
+        ha_load_cluster_conf
+        if [ "${HA_FORCE:-0}" != "1" ]; then
+            if [ "$HA_INIT_NODE2_IP" != "$HA_NODE2_IP" ] || [ "$HA_INIT_NODE3_IP" != "$HA_NODE3_IP" ]; then
+                warn "--node2/--node3 differ from the existing cluster.conf - the cluster.conf values win"
+                warn "  node2: $HA_NODE2_IP   witness: $HA_NODE3_IP (the token was issued for these)"
+            fi
+            HA_INIT_NODE2_IP="$HA_NODE2_IP"
+            HA_INIT_NODE3_IP="$HA_NODE3_IP"
+        fi
+    fi
 
     ha_run_sequence "init" \
         init_step_1_preflight \

@@ -46,6 +46,19 @@ HA_REPMGRD_SERVICE="${HA_REPMGRD_SERVICE:-repmgr}"
 HA_HAPROXY_SERVICE="${HA_HAPROXY_SERVICE:-haproxy}"
 HA_LSYNCD_SERVICE="${HA_LSYNCD_SERVICE:-lsyncd}"
 
+# Cluster value defaults: they carry the FIRST steps of a fresh --init, which
+# run BEFORE cluster.conf exists (it is generated in step 2). cluster.conf
+# holds the authoritative values - sourcing it overrides these - so they MUST
+# mirror ha_generate_cluster_conf exactly (see also the unset-then-source in
+# ha_load_cluster_conf, which keeps validation honest).
+HA_PG_PORT="${HA_PG_PORT:-5432}"
+HA_HAPROXY_PORT="${HA_HAPROXY_PORT:-5433}"
+HA_AGENT_PORT="${HA_AGENT_PORT:-8008}"
+
+# /etc/hosts receives a managed block with the cluster node names
+# (HA_HOSTS_FILE is overridable so the test suite never touches /etc)
+HA_HOSTS_FILE="${HA_HOSTS_FILE:-/etc/hosts}"
+
 # managed-block markers (see ha_block_* below)
 HA_BLOCK_BEGIN="# BEGIN fusionpbx-ha (managed)"
 HA_BLOCK_END="# END fusionpbx-ha (managed)"
@@ -239,6 +252,18 @@ This node is not part of an HA cluster yet.
   - first node (VM1):  fusionpbx-ha.sh --init --node2 IP --node3 IP
   - other nodes:       fusionpbx-ha.sh --join TOKEN
   - status/diagnosis require an initialized node"
+
+    # Validation must see ONLY what cluster.conf itself provides: a truncated
+    # file has to fail even when an inherited default (the port constants
+    # above) or a stale value from a previously sourced conf would mask the
+    # hole - so drop every variable the file is expected to set, then source.
+    unset HA_CLUSTER_NAME HA_PG_VERSION HA_PG_PORT HA_DB_NAME HA_DB_USER \
+          HA_DB_PASSWORD HA_REPMGR_USER HA_REPMGR_PASSWORD HA_REPMGR_DB \
+          HA_HAPROXY_PORT HA_AGENT_PORT HA_SYNC_DIR HA_SYNC_DELAY \
+          HA_SYNC_PRIVATE_KEY_B64 HA_SYNC_PUBLIC_KEY \
+          HA_NODE1_NAME HA_NODE1_IP HA_NODE1_ROLE \
+          HA_NODE2_NAME HA_NODE2_IP HA_NODE2_ROLE \
+          HA_NODE3_NAME HA_NODE3_IP HA_NODE3_ROLE
 
     # shellcheck disable=SC1090
     . "$HA_CLUSTER_CONF"
@@ -635,12 +660,12 @@ ha_agent_code() {
 # =============================================================================
 
 ha_write_etc_hosts_block() {
-    [ -f /etc/hosts ] || die "/etc/hosts not found"
+    [ -f "$HA_HOSTS_FILE" ] || die "$HA_HOSTS_FILE not found"
     _heh_content="$(ha_node_ip 1) $(ha_node_name 1)
 $(ha_node_ip 2) $(ha_node_name 2)
 $(ha_node_ip 3) $(ha_node_name 3)"
-    ha_block_set /etc/hosts "$_heh_content"
-    verbose "  /etc/hosts: cluster names added"
+    ha_block_set "$HA_HOSTS_FILE" "$_heh_content"
+    verbose "  $HA_HOSTS_FILE: cluster names added"
 }
 
 ha_write_authorized_keys() {
@@ -884,6 +909,16 @@ Hint: check the standby conninfo application_name (design question B2)"
 # Proxy support (DESIGN.md 5.1): reuse the layer-1 proxy.sh, then keep
 # cluster-internal traffic away from the proxy.
 # =============================================================================
+
+# --proxy format check (host:port, layer-1 convention). MUST run before
+# ha_apply_proxy: the layer-1 proxy.sh writes apt/git/wget/curl configs
+# unconditionally, so a typo in --proxy must not get that far.
+proxy_server_valid() {
+    [ -n "$PROXY_SERVER" ] || return 0
+    echo "$PROXY_SERVER" | grep -Eq '^[A-Za-z0-9._-]+:[0-9]{1,5}$' || return 1
+    _psv_port="${PROXY_SERVER##*:}"
+    [ "$_psv_port" -le 65535 ] 2>/dev/null
+}
 
 ha_apply_proxy() {
     [ -n "$PROXY_SERVER" ] || return 0

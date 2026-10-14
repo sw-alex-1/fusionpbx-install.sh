@@ -30,6 +30,7 @@ mkdir -p "$FB" "$WORK/etc" "$WORK/pgdata" "$WORK/storage/recordings" \
          "$WORK/lib" "$WORK/haproxy.d"
 echo "16" > "$WORK/pgdata/PG_VERSION"
 : > "$WORK/lsyncd.log"
+: > "$WORK/hosts-cli"      # /etc/hosts sandbox for any step that reaches it
 
 cat > "$FB/systemctl" <<'EOF'
 #!/bin/sh
@@ -119,7 +120,47 @@ cat > "$FB/pg_isready" <<'EOF'
 exit "${PG_ISREADY_RC:-0}"
 EOF
 
-for _fb in systemctl timedatectl psql runuser repmgr curl ip pg_isready; do
+# stub ssh-keygen: fake key pair, no container dependency (test_lib.sh style)
+cat > "$FB/ssh-keygen" <<'EOF'
+#!/bin/sh
+_key=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -f) _key="$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+[ -n "$_key" ] || exit 1
+echo "FAKE-PRIVATE-KEY-CONTENT" > "$_key"
+echo "ssh-ed25519 AAAAFAKEPUBLICKEY fusionpbx-ha-sync" > "${_key}.pub"
+exit 0
+EOF
+
+# ss: no listeners (init preflight port checks are always free)
+cat > "$FB/ss" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+
+# ping: everything answers instantly (peer probes in init step 1)
+cat > "$FB/ping" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+
+# rpm: nothing is installed; apt-get: no repository -> step 3 (packages)
+# fails FAST and deterministically in the sandbox
+cat > "$FB/rpm" <<'EOF'
+#!/bin/sh
+exit 1
+EOF
+cat > "$FB/apt-get" <<'EOF'
+#!/bin/sh
+echo "apt-get: stub - no repository in the test sandbox" >&2
+exit 100
+EOF
+
+for _fb in systemctl timedatectl psql runuser repmgr curl ip pg_isready ssh-keygen ss ping rpm apt-get; do
     chmod +x "$FB/$_fb"
 done
 
@@ -167,6 +208,7 @@ ha_cli() {
         export HA_LIB_DIR="$WORK/lib"
         export HA_PROMOTE_SH="$WORK/lib/promote.sh"
         export HA_HAPROXY_MAIN="$WORK/haproxy.d/main.cfg"
+        export HA_HOSTS_FILE="$WORK/hosts-cli"
         # default role-agent answers: node1 primary, node2 standby
         export CURL_CODES="${CURL_CODES:-10.0.0.11=200,10.0.0.12=503}"
         export PATH="$FB:$PATH"
@@ -249,6 +291,85 @@ report "--init without layer 1: banner + resume hint" "$?" "$(grep -m1 'layer 1'
 # re-run must resume, not restart - the state file exists
 [ -f "$WORK/etc/.installer-state" ] && grep -q "^command=init$" "$WORK/etc/.installer-state"
 report "state file recorded after failed init" $?
+
+# ---------------------------------------------------------------------------
+echo "== --init fresh node: steps 1-2 WITHOUT an existing cluster.conf =="
+# regression (DESIGN.md changelog 0.3.1): a fresh --init crashed in step 1
+# with "HA_HAPROXY_PORT: unbound variable" - the ports live in cluster.conf,
+# which is generated in step 2; the same applied to the layer-1 DB
+# credentials (read in the step-1 subshell, lost for step 2) and to the node
+# list of the hosts block
+cat > "$WORK/l1.conf" <<'EOF'
+; layer-1 /etc/fusionpbx/config.conf fixture (INI)
+[database]
+database.0.host = 127.0.0.1
+database.0.port = 5432
+database.0.name = fusionpbx
+database.0.username = fusionpbx
+database.0.password = l1pass123
+EOF
+rm -rf "$WORK/etc-fresh"; mkdir -p "$WORK/etc-fresh"
+: > "$WORK/hosts"
+
+ha_init_fresh() {
+    (
+        export HA_SANDBOX=1 HA_NO_COLOR=1
+        export HA_ETC_DIR="$WORK/etc-fresh" HA_RES_DIR="$REPO/Alt/ha/resources"
+        export HA_L1_CONF="$WORK/l1.conf" HA_HOSTS_FILE="$WORK/hosts"
+        export HA_PGDATA_DEFAULT="$WORK/pgdata"
+        export PATH="$FB:$PATH"
+        "$SCRIPT" --init --node2 "${1:-10.0.0.12}" --node3 "${2:-10.0.0.13}" --yes
+    )
+}
+
+ha_init_fresh > "$WORK/out.log" 2>&1
+# step 3 (packages) is EXPECTED to fail in the sandbox (stubbed apt-get);
+# the regression under test is that steps 1-2 complete cleanly before it
+grep -q "STEP 3/15 (init_step_3_packages) FAILED" "$WORK/out.log" \
+  && ! grep -Eqi 'unbound|не заданы' "$WORK/out.log"
+report "fresh --init: steps 1-2 pass, no unbound variable" "$?" "$(grep -m1 -Ei 'unbound|не заданы' "$WORK/out.log")"
+
+[ -f "$WORK/etc-fresh/cluster.conf" ] \
+  && grep -q '^HA_HAPROXY_PORT="5433"$' "$WORK/etc-fresh/cluster.conf" \
+  && grep -q '^HA_AGENT_PORT="8008"$' "$WORK/etc-fresh/cluster.conf" \
+  && grep -q 'HA_NODE2_IP="10.0.0.12";' "$WORK/etc-fresh/cluster.conf" \
+  && grep -q '^HA_DB_PASSWORD="l1pass123"$' "$WORK/etc-fresh/cluster.conf"
+report "cluster.conf generated with ports, nodes and layer-1 credentials" $?
+
+grep -q "BEGIN fusionpbx-ha (managed)" "$WORK/hosts" \
+  && grep -q "^10.0.0.11 fpbx-ha-1$" "$WORK/hosts" \
+  && grep -q "^10.0.0.12 fpbx-ha-2$" "$WORK/hosts" \
+  && grep -q "^10.0.0.13 fpbx-witness$" "$WORK/hosts"
+report "/etc/hosts managed block written with all three nodes" $?
+
+_tok1="$(grep -E '^[A-Za-z0-9+/=]{100,}$' "$WORK/out.log" | head -1)"
+[ -n "$_tok1" ]
+report "join token printed during --init" "$?" "${_tok1:0:16}..."
+printf '%s' "$_tok1" | base64 -d 2>/dev/null | gunzip -c > "$WORK/unpacked.conf" 2>/dev/null
+cmp -s "$WORK/unpacked.conf" "$WORK/etc-fresh/cluster.conf"
+report "printed token unpacks to the generated cluster.conf" $?
+
+echo "== --init resume: completed steps are skipped =="
+ha_init_fresh > "$WORK/out.log" 2>&1
+grep -q "resuming from the state file" "$WORK/out.log" \
+  && [ "$(grep -c "already done, skipping" "$WORK/out.log")" = "2" ] \
+  && grep -q "STEP 3/15 (init_step_3_packages) FAILED" "$WORK/out.log" \
+  && ! grep -q "STEP 1/15" "$WORK/out.log" \
+  && ! grep -q "STEP 2/15" "$WORK/out.log"
+report "resume: steps 1-2 skipped, fails at 3 only" "$?"
+
+echo "== --init resume with different --node2: cluster.conf wins =="
+rm -f "$WORK/etc-fresh/.installer-state"
+ha_init_fresh 10.0.0.99 > "$WORK/out.log" 2>&1
+grep -q "the cluster.conf values win" "$WORK/out.log" \
+  && grep -q "existing $WORK/etc-fresh/cluster.conf kept" "$WORK/out.log" \
+  && ! grep -q "STEP 1/15" "$WORK/out.log" && ! grep -q "STEP 2/15" "$WORK/out.log"
+report "--node2 mismatch: warning + existing conf kept, steps 1-2 fine" "$?"
+_tok2="$(grep -E '^[A-Za-z0-9+/=]{100,}$' "$WORK/out.log" | head -1)"
+[ "$_tok1" = "$_tok2" ]
+report "token unchanged on resume (no re-generation)" "$?"
+! grep -q "^10.0.0.99 " "$WORK/hosts"
+report "hosts block not polluted with the rejected address" "$?"
 
 # ---------------------------------------------------------------------------
 echo "== --status (healthy fixture) =="
@@ -334,8 +455,8 @@ ha_cli --doctor --proxy 192.0.2.1:8080 > "$WORK/out.log" 2>&1; _rc=$?
 report "--proxy accepted alongside a read-only command" "$?"
 
 ha_cli --init --node2 10.0.0.12 --node3 10.0.0.13 --proxy bad-format > "$WORK/out.log" 2>&1; _rc=$?
-[ "$_rc" != "0" ]
-report "--proxy without host:port rejected" "$?"
+[ "$_rc" != "0" ] && grep -q -- "--proxy expects host:port" "$WORK/out.log"
+report "--proxy without host:port rejected before any step runs" "$?"
 
 # ---------------------------------------------------------------------------
 echo
