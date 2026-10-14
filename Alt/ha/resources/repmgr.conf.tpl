@@ -3,6 +3,11 @@
 # fusionpbx-ha.sh --repair run.
 # Layout facts verified against ALT RPM postgresql16-repmgr 5.5.0-alt5:
 #   config: /etc/repmgr/repmgr.conf, daemon: repmgr.service (User=postgres)
+# repmgr 5.x parameter reference (invalid names are only WARNINGS in the
+# log, but a silently ignored monitor interval changes the failover RTO):
+#   monitor_interval_secs = repmgrd upstream poll (NOT monitoring_interval)
+#   no service_promote_command: repmgr 5.3+ "smart promote" uses
+#   pg_promote() as user postgres - a systemd reload would NOT promote.
 node_id=@@NODE_ID@@
 node_name=@@NODE_NAME@@
 conninfo='host=@@NODE_IP@@ port=@@PG_PORT@@ user=@@REPMGR_USER@@ dbname=@@REPMGR_DB@@ password=@@REPMGR_PASSWORD@@ connect_timeout=5@@CONNINFO_EXTRA@@'
@@ -11,15 +16,16 @@ pg_bindir='/usr/bin'
 replication_type=physical
 log_file='/var/log/repmgr/repmgrd.log'
 log_level=INFO
-monitoring_interval=5
+monitor_interval_secs=5
 reconnect_attempts=3
 reconnect_interval=5
 failover=@@FAILOVER_MODE@@
 priority=100
+# used by repmgr/repmgrd for edge paths (node rejoin, clone stop);
+# ha_install_sudoers() makes them work for User=postgres
 service_start_command='sudo systemctl start postgresql'
 service_stop_command='sudo systemctl stop postgresql'
 service_restart_command='sudo systemctl restart postgresql'
 service_reload_command='sudo systemctl reload postgresql'
-service_promote_command='sudo systemctl reload postgresql'
 @@PROMOTE_LINE@@
 @@FOLLOW_LINE@@

@@ -257,7 +257,7 @@ init_step_2_config_gen() {
 }
 
 init_step_3_packages() {
-    pkg_install_required "postgresql${HA_PG_VERSION}-repmgr" haproxy lsyncd \
+    pkg_install_required "postgresql${HA_PG_VERSION}-repmgr" haproxy lsyncd sudo \
         python3 python3-module-psycopg2 openssh-clients rsync curl
 }
 
@@ -293,15 +293,35 @@ init_step_4_pg_prep() {
 }
 
 init_step_5_wal_log_hints() {
-    _iwl_current="$(pg_runuser_psql -tAc "SHOW wal_log_hints" | tr -d ' \r')"
-    if [ "$_iwl_current" = "on" ]; then
-        verbose "  wal_log_hints is already on (pg_rewind support) - skipping the restart"
+    _iwl_need_restart=0
+
+    if [ "$(pg_runuser_psql -tAc "SHOW wal_log_hints" | tr -d ' \r')" = "on" ]; then
+        verbose "  wal_log_hints is already on (pg_rewind support)"
+    else
+        verbose "  enabling wal_log_hints (required by pg_rewind when a former"
+        verbose "  primary is repaired after a failover)"
+        pg_runuser_psql -c "ALTER SYSTEM SET wal_log_hints = on;" >/dev/null \
+            || die "cannot set wal_log_hints"
+        _iwl_need_restart=1
+    fi
+
+    # listen_addresses joins the same restart: repmgr, the peer haproxy and
+    # the witness connect to THIS node's IP, but layer 1 leaves PostgreSQL
+    # loopback-only (regression 0.3.2)
+    if ha_pg_listen_ok; then
+        verbose "  listen_addresses already serves $(ha_node_ip "$HA_NODE_ID")"
+    else
+        verbose "  setting listen_addresses = '*' (repmgr + haproxy need the node IP)"
+        pg_runuser_psql -c "ALTER SYSTEM SET listen_addresses = '*';" >/dev/null \
+            || die "cannot set listen_addresses"
+        _iwl_need_restart=1
+    fi
+
+    if [ "$_iwl_need_restart" = "0" ]; then
+        verbose "  nothing to apply - no PostgreSQL restart"
         return 0
     fi
-    verbose "  enabling wal_log_hints (required by pg_rewind when a former"
-    verbose "  primary is repaired after a failover) - ONE PostgreSQL restart"
-    pg_runuser_psql -c "ALTER SYSTEM SET wal_log_hints = on;" >/dev/null \
-        || die "cannot set wal_log_hints"
+    verbose "  - ONE PostgreSQL restart for the settings above"
     systemctl restart "$HA_PG_SERVICE" || die "PostgreSQL restart failed"
     _iwl_try=0
     while [ "$_iwl_try" -lt 30 ]; do
@@ -312,16 +332,21 @@ init_step_5_wal_log_hints() {
     pg_runuser_psql -tAc "SELECT 1" >/dev/null 2>&1 || die "PostgreSQL did not come back after the restart"
     [ "$(pg_runuser_psql -tAc "SHOW wal_log_hints" | tr -d ' \r')" = "on" ] \
         || die "wal_log_hints did not stick - aborting before anything depends on it"
-    verbose "  wal_log_hints = on, PostgreSQL is back"
+    ha_pg_listen_ok || die "listen_addresses did not take effect"
+    verbose "  wal_log_hints = on, listen_addresses = '*', PostgreSQL is back"
 }
 
 init_step_6_repmgr_conf() {
     ha_render_repmgr_conf primary
     ha_install_promote_sh
+    ha_install_sudoers
     verbose "  repmgr configuration written: $HA_REPMGR_CONF (role: primary)"
 }
 
 init_step_7_primary_register() {
+    # Self-healing for runs resumed from a state file written by an older
+    # script version (pg_hba set / listen_addresses / repmgr.conf keys)
+    ha_register_prelude primary
     _ipr_out="$(repmgr_cmd primary register --force)"
     if [ $? -ne 0 ]; then
         echo "$_ipr_out"
@@ -444,6 +469,13 @@ join_step_2_unpack() {
         rm -f "${HA_SYNC_KEY}.pub" 2>/dev/null
         ha_write_authorized_keys
         ha_write_pgpass data
+        # repmgr.conf + promote.sh MUST exist BEFORE join_step_5_clone: it
+        # runs 'repmgr standby clone' which reads the configuration file
+        # (regression 0.3.2 - the clone failed without these)
+        ha_render_repmgr_conf standby
+        ha_install_promote_sh
+        ha_install_sudoers
+        verbose "  repmgr configuration written: $HA_REPMGR_CONF (role: standby)"
     else
         ha_write_pgpass witness
     fi
@@ -456,7 +488,7 @@ join_step_3_packages() {
     if [ "$HA_NODE_ID" = "3" ]; then
         pkg_install_required "postgresql${HA_PG_VERSION}-repmgr" "postgresql${HA_PG_VERSION}-server" curl
     else
-        pkg_install_required "postgresql${HA_PG_VERSION}-repmgr" haproxy lsyncd \
+        pkg_install_required "postgresql${HA_PG_VERSION}-repmgr" haproxy lsyncd sudo \
             python3 python3-module-psycopg2 openssh-clients rsync curl
     fi
 }
@@ -518,6 +550,10 @@ join_step_6_start_register() {
 
     _jsr_recovery="$(pg_runuser_psql -tAc "SELECT pg_is_in_recovery()" | tr -d ' \r')"
     [ "$_jsr_recovery" = "t" ] || die "the cloned PostgreSQL did not come up in recovery mode - refusing to continue"
+
+    # self-healing preamble (idempotent; the clone normally inherits a
+    # correct pg_hba/listen_addresses from the primary)
+    ha_register_prelude standby
 
     _jsr_out="$(repmgr_cmd standby register --upstream-node-id="$(ha_peer_id)" --force)"
     if [ $? -ne 0 ]; then
@@ -631,6 +667,10 @@ wit_step_4_initdb_tiny() {
     pg_runuser_psql -tAc "SELECT 1" >/dev/null 2>&1 \
         || svc_enable_start "$HA_PG_SERVICE"
 
+    # the witness's own repmgrd (conninfo host = THIS IP) and the failover
+    # consensus of the data nodes both connect to the witness node IP
+    ha_ensure_pg_listen
+
     if ! pg_runuser_psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='$HA_REPMGR_USER'" | grep -q 1; then
         pg_runuser_psql -c "SET password_encryption = 'md5'; CREATE ROLE $HA_REPMGR_USER LOGIN PASSWORD '$HA_REPMGR_PASSWORD';" \
             || die "cannot create the repmgr role on the witness"
@@ -663,6 +703,8 @@ wit_find_primary_ip() {
 }
 
 wit_step_6_witness_register() {
+    # self-healing preamble (idempotent)
+    ha_register_prelude witness
     _wfr_ip="$(wit_find_primary_ip)"
     [ -n "$_wfr_ip" ] || die "no primary found ($(ha_node_ip 1) and $(ha_node_ip 2) role-agents do not answer 200)
 The witness registers against a running primary - complete --init on the primary first."
@@ -719,6 +761,12 @@ rep_step_2_stop_services() {
 }
 
 rep_step_3_rejoin_or_clone() {
+    # repmgr.conf + promote.sh first: 'repmgr standby clone/register' and
+    # 'repmgr node rejoin' below all read the configuration file, which may
+    # be missing on a rebuilt node with a restored cluster.conf (12.1)
+    ha_render_repmgr_conf standby
+    ha_install_promote_sh
+    ha_install_sudoers
     _r3c_pgdata="$(ha_pg_data_dir)"
     if [ "$HA_FORCE_CLONE" = "true" ] || [ ! -f "$_r3c_pgdata/PG_VERSION" ]; then
         _r3c_mode="clone"
@@ -771,6 +819,9 @@ If the local PGDATA is damaged beyond rewind, re-run with: --repair --force-clon
 }
 
 rep_step_4_services() {
+    # self-healing preamble: refresh pg_hba, listen_addresses, sudoers and
+    # re-render repmgr.conf if the on-disk copy differs from the template
+    ha_register_prelude standby
     ha_render_repmgr_conf standby
     ha_install_promote_sh
     ha_install_agent
@@ -824,6 +875,8 @@ prp_step_2_degrade() {
 }
 
 prp_step_3_services() {
+    # self-healing preamble on the surviving primary (idempotent)
+    ha_register_prelude primary
     ha_render_repmgr_conf primary
     ha_install_promote_sh
     ha_install_agent

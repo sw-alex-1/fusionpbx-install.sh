@@ -10,15 +10,31 @@
 # a stale name (itself-before-promotion) and FREEZE every write commit.
 #
 # Runs as user postgres from repmgrd; local psql goes through peer auth.
+#
+# HOW (changelog 0.3.2): ALTER SYSTEM cannot run during recovery, so the
+# value is cleared by editing postgresql.auto.conf + SIGHUP (the pattern
+# recommended by repmgr for synchronous replication). The reloaded empty
+# value becomes effective the moment the node is promoted.
 
 REPMGR_CONF="${REPMGR_CONF:-/etc/repmgr/repmgr.conf}"
 
-if psql -q -c "ALTER SYSTEM SET synchronous_standby_names = '';" >/dev/null 2>&1; then
-    psql -q -c "SELECT pg_reload_conf();" >/dev/null 2>&1
-    echo "fusionpbx-ha promote.sh: synchronous_standby_names cleared before promote" >&2
+_psh_datadir="$(psql -tAc "SHOW data_directory" 2>/dev/null | tr -d ' \r')"
+_psh_auto="${_psh_datadir:-}/postgresql.auto.conf"
+
+if [ -n "$_psh_datadir" ] && [ -f "$_psh_auto" ]; then
+    _psh_ssn="$(psql -tAc "SHOW synchronous_standby_names" 2>/dev/null | tr -d ' \r')"
+    if [ -n "$_psh_ssn" ]; then
+        if grep -q "^[[:space:]]*synchronous_standby_names" "$_psh_auto" 2>/dev/null; then
+            sed -i "s|^[[:space:]]*synchronous_standby_names[[:space:]]*=.*|synchronous_standby_names = ''|" "$_psh_auto" 2>/dev/null
+        else
+            echo "synchronous_standby_names = ''" >> "$_psh_auto"
+        fi
+        psql -q -c "SELECT pg_reload_conf();" >/dev/null 2>&1
+        echo "fusionpbx-ha promote.sh: synchronous_standby_names='$_psh_ssn' cleared before promote" >&2
+    fi
 else
     # Never block the failover itself - promote anyway, loudly.
-    echo "fusionpbx-ha promote.sh: WARNING: could not clear synchronous_standby_names (writes may stall until repaired)" >&2
+    echo "fusionpbx-ha promote.sh: WARNING: cannot locate postgresql.auto.conf (writes may stall until repaired)" >&2
 fi
 
 exec /usr/bin/repmgr standby promote -f "$REPMGR_CONF"

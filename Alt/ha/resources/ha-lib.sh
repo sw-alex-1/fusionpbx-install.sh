@@ -592,6 +592,118 @@ ha_local_role_code() {
 
 ha_local_is_primary() { ha_local_role_code; [ $? -eq 0 ]; }
 
+# -----------------------------------------------------------------------------
+# listen_addresses (regression 0.3.2): layer 1 leaves PostgreSQL loopback-only
+# ('localhost'), but the cluster needs the node IP - repmgr register/repmgrd
+# conninfo, the PEER haproxy backend (it connects to the node IPs, not to
+# 127.0.0.1), the witness and the failover consensus all arrive via the node
+# IP. '*' is safe: the pg_hba managed block above gates every connection.
+# -----------------------------------------------------------------------------
+
+# 0 = listen_addresses already serves this node's cluster IP
+ha_pg_listen_ok() {
+    _hplo_cur="$(pg_runuser_psql -tAc "SHOW listen_addresses" 2>/dev/null | tr -d ' \r')"
+    [ "$_hplo_cur" = "*" ] && return 0
+    echo ",$_hplo_cur," | grep -q ",$(ha_node_ip "${HA_NODE_ID:-1}"),"
+}
+
+# Ensure it; idempotent, restarts PostgreSQL ONCE only when a change is needed.
+ha_ensure_pg_listen() {
+    ha_pg_listen_ok && return 0
+    verbose "  PostgreSQL listens on '$(pg_runuser_psql -tAc "SHOW listen_addresses" 2>/dev/null | tr -d ' \r')' only -"
+    verbose "  the cluster reaches this node via $(ha_node_ip "${HA_NODE_ID:-1}"):$HA_PG_PORT (repmgr, peer haproxy, witness)"
+    if pg_runuser_psql -tAc "SELECT pg_is_in_recovery()" 2>/dev/null | grep -q t; then
+        # ALTER SYSTEM is refused during recovery - edit postgresql.auto.conf
+        # directly instead (the standby file-writes are fine, it is not read-only)
+        _hepl_auto="$(ha_pg_data_dir)/postgresql.auto.conf"
+        touch "$_hepl_auto" 2>/dev/null || die "cannot write $_hepl_auto"
+        chown postgres:postgres "$_hepl_auto" 2>/dev/null || true
+        sed -i '/^[[:space:]]*listen_addresses[[:space:]]*=/d' "$_hepl_auto" 2>/dev/null
+        echo "listen_addresses = '*'" >> "$_hepl_auto"
+    else
+        pg_runuser_psql -c "ALTER SYSTEM SET listen_addresses = '*';" >/dev/null \
+            || die "cannot set listen_addresses"
+    fi
+    verbose "  listen_addresses = '*' - ONE PostgreSQL restart"
+    systemctl restart "$HA_PG_SERVICE" || die "PostgreSQL restart failed"
+    _hepl_try=0
+    while [ "$_hepl_try" -lt 30 ]; do
+        pg_runuser_psql -tAc "SELECT 1" >/dev/null 2>&1 && break
+        sleep 1
+        _hepl_try=$((_hepl_try + 1))
+    done
+    pg_runuser_psql -tAc "SELECT 1" >/dev/null 2>&1 || die "PostgreSQL did not come back after the listen_addresses restart"
+    ha_pg_listen_ok || die "listen_addresses = '*' did not take effect"
+    verbose "  PostgreSQL now accepts connections on $(ha_node_ip "${HA_NODE_ID:-1}"):$HA_PG_PORT"
+}
+
+# -----------------------------------------------------------------------------
+# sudoers drop-in: repmgr.service runs as User=postgres, but the service_*_command
+# lines in repmgr.conf need systemctl (root). Tight NOPASSWD allowlist for the
+# PostgreSQL service only (DESIGN.md 13.2; the repmgr RPM may ship its own
+# /etc/sudoers.d/repmgr - ours is a belt-and-braces duplicate, they coexist).
+# -----------------------------------------------------------------------------
+ha_install_sudoers() {
+    _hisd_dir="${HA_SUDOERS_DIR:-/etc/sudoers.d}"
+    if ! cmd_exists sudo; then
+        verbose "  sudo not found - skipping the sudoers drop-in (repmgr service commands stay dormant)"
+        return 0
+    fi
+    mkdir -p "$_hisd_dir" 2>/dev/null || { warn "cannot create $_hisd_dir - repmgr service commands stay dormant"; return 0; }
+    _hisd_file="$_hisd_dir/fusionpbx-ha"
+    cat > "$_hisd_file" <<'EOSUDO'
+# fusionpbx-ha: managed file - repmgrd (User=postgres) controls the local
+# PostgreSQL service (repmgr node rejoin / clone edge paths).
+Cmnd_Alias FUSIONPBX_HA_PGCTL = /usr/bin/systemctl start postgresql, \
+    /usr/bin/systemctl stop postgresql, /usr/bin/systemctl restart postgresql, \
+    /usr/bin/systemctl reload postgresql, /usr/bin/systemctl status postgresql
+postgres ALL=(root) NOPASSWD: FUSIONPBX_HA_PGCTL
+EOSUDO
+    chmod 440 "$_hisd_file" 2>/dev/null || true
+    if cmd_exists visudo; then
+        if ! visudo -c -f "$_hisd_file" >/dev/null 2>&1; then
+            rm -f "$_hisd_file"
+            warn "sudoers drop-in failed validation (visudo) - removed; repmgr service commands stay dormant"
+            return 0
+        fi
+    fi
+    verbose "  sudoers drop-in installed: $_hisd_file (repmgrd may control postgresql)"
+}
+
+# -----------------------------------------------------------------------------
+# Self-healing preamble for every '*register' step (DESIGN.md 7: a re-run of
+# the SAME command must fix AND continue). Steps 4/6 may already be recorded
+# as completed by an OLDER script version, so the register steps re-apply:
+#   - the pg_hba managed block (older versions wrote an incomplete set)
+#   - listen_addresses (older versions never set it)
+#   - repmgr.conf when it differs from the current template (legacy keys)
+#   - the sudoers drop-in and promote.sh (data nodes only)
+# Everything here is idempotent and a no-op on a healthy current-version node.
+# -----------------------------------------------------------------------------
+ha_register_prelude() {
+    _hrp_role="$1"    # primary | standby | witness
+    case "$_hrp_role" in
+        witness) ha_write_pg_hba witness ;;
+        *)       ha_write_pg_hba data; ha_install_sudoers; ha_install_promote_sh ;;
+    esac
+    systemctl reload "$HA_PG_SERVICE" 2>/dev/null \
+        || pg_runuser_psql -c "SELECT pg_reload_conf();" >/dev/null 2>&1 || true
+    ha_ensure_pg_listen
+
+    _hrp_tmp="$(mktemp "${TMPDIR:-/tmp}/fpbx-ha-repmgr.XXXXXX")"
+    ( HA_REPMGR_CONF="$_hrp_tmp" ha_render_repmgr_conf "$_hrp_role" ) >/dev/null 2>&1 || true
+    if [ -s "$_hrp_tmp" ]; then
+        if ! cmp -s "$_hrp_tmp" "$HA_REPMGR_CONF" 2>/dev/null; then
+            install -m 0640 "$_hrp_tmp" "$HA_REPMGR_CONF" || { rm -f "$_hrp_tmp"; die "cannot update $HA_REPMGR_CONF"; }
+            chown root:postgres "$HA_REPMGR_CONF" 2>/dev/null || true
+            verbose "  $HA_REPMGR_CONF re-rendered (on-disk copy was written by an older script version)"
+        fi
+    else
+        warn "could not render a reference repmgr.conf - keeping the on-disk copy"
+    fi
+    rm -f "$_hrp_tmp"
+}
+
 # .pgpass for the postgres system user (repmgr + superuser + app credentials
 # on the data nodes; repmgr only on the witness)
 ha_write_pgpass() {
@@ -618,16 +730,28 @@ ha_write_pgpass() {
 
 # pg_hba.conf managed block (DESIGN.md 14.3 + postgres-user lines for remote
 # synchronous_standby_names management). Idempotent via managed markers.
+#
+# The block must be SYMMETRIC for node 1 and node 2: pg_hba.conf lives inside
+# PGDATA, so the standby's clone inherits node 1's file verbatim - and after
+# a failover the roles swap (a repaired node 1 streams from node 2, node 1's
+# repmgrd registers through its own IP). Self-access lines (the node's own IP)
+# are required because 'repmgr primary register', repmgrd (conninfo carries
+# the node IP) and the local haproxy all connect to the node IP, not to
+# 127.0.0.1 - the source address of such loopback-via-IP connections is the
+# node IP itself (regression 0.3.2).
 ha_write_pg_hba() {
     _hph_hba="$(ha_pg_data_dir)/pg_hba.conf"
     [ -f "$_hph_hba" ] || die "pg_hba.conf not found at $_hph_hba (is PostgreSQL initialized?)"
     _hph_role="${1:-data}"
     if [ "$_hph_role" = "witness" ]; then
         _hph_content="host repmgr  repmgr  $(ha_node_ip 1)/32  md5
-host repmgr  repmgr  $(ha_node_ip 2)/32  md5"
+host repmgr  repmgr  $(ha_node_ip 2)/32  md5
+host repmgr  repmgr  $(ha_node_ip 3)/32  md5"
     else
-        _hph_content="host repmgr       repmgr     $(ha_node_ip 2)/32  md5
+        _hph_content="host repmgr       repmgr     $(ha_node_ip 1)/32  md5
+host repmgr       repmgr     $(ha_node_ip 2)/32  md5
 host repmgr       repmgr     $(ha_node_ip 3)/32  md5
+host replication  repmgr     $(ha_node_ip 1)/32  md5
 host replication  repmgr     $(ha_node_ip 2)/32  md5
 host fusionpbx    fusionpbx  $(ha_node_ip 1)/32  md5
 host fusionpbx    fusionpbx  $(ha_node_ip 2)/32  md5
