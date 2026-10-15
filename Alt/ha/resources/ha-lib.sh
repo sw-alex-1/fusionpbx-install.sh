@@ -112,13 +112,17 @@ die() {
 cmd_exists() { command -v "$1" >/dev/null 2>&1; }
 
 # Confirm an action; HA_AUTO_YES (--yes) bypasses.
-# Usage: confirm "question" [y|n]  (default answer when Enter is pressed)
+# Usage: confirm "question" [y]  (optional default answer for a bare Enter;
+# with NO default a bare Enter declines - every call site is a
+# destructive-action prompt, so declining is the safe side. The argument
+# must stay optional: an unguarded $2 aborts under set -u, which is exactly
+# what happened on the real bench at join step 4 - regression 0.3.8)
 confirm() {
     if [ "${HA_AUTO_YES:-0}" = "1" ]; then
         verbose "$1 - assumed YES (--yes)"
         return 0
     fi
-    _cf_default="$2"
+    _cf_default="${2:-}"
     printf '%s' "$1 "
     read -r _cf_answer
     case "$_cf_answer" in

@@ -11,6 +11,7 @@ set -u
 REPO="$(cd "$(dirname "$0")/../../.." && pwd)"
 LIB="$REPO/Alt/ha/resources/ha-lib.sh"
 RES="$REPO/Alt/ha/resources"
+CLI="$REPO/Alt/ha/fusionpbx-ha.sh"
 WORK=$(mktemp -d /tmp/ha-lib-test.XXXXXX)
 trap 'rm -rf "$WORK"' EXIT
 
@@ -229,6 +230,39 @@ lib_run 'valid_ip not-an-ip || echo bad'
 [ "$OUT" = "bad" ]; report "hostname rejected" $?
 lib_run 'valid_ip 999.1.1.1 || echo bad'
 [ "$OUT" = "bad" ]; report "999.1.1.1 rejected" $?
+
+# ---------------------------------------------------------------------------
+echo "== confirm (regression 0.3.8: unbound \$2 under set -u) =="
+# the real bench: join step 4 died with 'ha-lib.sh: line 121: $2: unbound
+# variable' - every call site passes ONE argument; the default-answer
+# feature had never been exercised until the first destructive prompt
+printf '' | lib_run 'confirm "Type YES:"'
+_cf_rc=$?
+if [ "$_cf_rc" != 0 ] && ! printf '%s' "$OUT" | grep -q unbound; then _cu=ok; else _cu=bad; fi
+report "1-arg call survives set -u; bare Enter declines" "$_cu" "$OUT (rc=$_cf_rc)"
+
+printf 'yes\n' | lib_run 'confirm "Type YES:"'
+report "typed yes accepts" $?
+printf 'no\n' | lib_run 'confirm "Type YES:"'
+[ $? != 0 ]; report "typed no declines" $?
+printf '\n' | lib_run 'confirm "Continue?:" y'
+report "bare Enter honors the explicit default (y)" $?
+lib_run 'HA_AUTO_YES=1 confirm "Type YES:"'
+report "--yes auto-accepts" $?
+echo "$OUT" | grep -q "assumed YES (--yes)"
+report "--yes prints the assumption" $?
+
+# ---------------------------------------------------------------------------
+echo "== init node waits (HA_WAIT_NODES, 0.3.8) =="
+# source contract: both node waits honor the env override instead of a
+# hardcoded 900s (a slow bench exports the variable, not a local edit
+# that would collide with git pull)
+_w11="$(sed -n '/^init_step_11_wait_witness()/,/^}/p' "$CLI")"
+echo "$_w11" | grep -q 'HA_WAIT_NODES:-900'
+report "wait witness: HA_WAIT_NODES overrides the 900s default" $?
+_w12="$(sed -n '/^init_step_12_wait_standby()/,/^}/p' "$CLI")"
+echo "$_w12" | grep -q 'HA_WAIT_NODES:-900'
+report "wait standby: HA_WAIT_NODES overrides the 900s default" $?
 
 # ---------------------------------------------------------------------------
 echo "== cluster.conf generation + loading =="
@@ -520,7 +554,6 @@ report "missing home dir: nothing created on the way" $?
 
 # ordering contract on the CLI source: the witness unpack step must not
 # write .pgpass (the packages step comes later); the register prelude must
-CLI="$REPO/Alt/ha/fusionpbx-ha.sh"
 _wit2="$(sed -n '/^wit_step_2_unpack()/,/^}/p' "$CLI")"
 if echo "$_wit2" | grep -q 'ha_write_pgpass'; then _pw2=bad; else _pw2=ok; fi
 report "wit unpack step: no .pgpass write before the packages step" "$_pw2"

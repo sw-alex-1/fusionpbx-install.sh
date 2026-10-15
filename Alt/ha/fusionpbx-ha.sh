@@ -383,8 +383,12 @@ init_step_11_wait_witness() {
     # rules were only added to step 5 by 0.3.6, a resume from step 11
     # would never re-run it (regression 0.3.6)
     ha_ensure_cluster_firewall
-    ha_wait "witness node registration (run --join on $HA_INIT_NODE3_IP)" 9000 init_poll_witness_registered \
-        || die "the witness did not join within 15 minutes"
+    # HA_WAIT_NODES (seconds) overrides both node waits - a slow bench
+    # exports it once instead of editing the script (0.3.8)
+    ha_wait "witness node registration (run --join on $HA_INIT_NODE3_IP)" "${HA_WAIT_NODES:-900}" init_poll_witness_registered \
+        || die "the witness did not join within ${HA_WAIT_NODES:-900}s
+(re-run this SAME command - it resumes from this step;
+export HA_WAIT_NODES=<seconds> to wait longer)"
 }
 
 init_poll_standby_streaming() {
@@ -396,8 +400,10 @@ init_poll_standby_streaming() {
 init_step_12_wait_standby() {
     # same self-heal as step 11 (regression 0.3.6)
     ha_ensure_cluster_firewall
-    ha_wait "streaming standby $(ha_node_name 2) (run --join on $HA_INIT_NODE2_IP)" 9000 init_poll_standby_streaming \
-        || die "the standby did not start streaming within 15 minutes"
+    ha_wait "streaming standby $(ha_node_name 2) (run --join on $HA_INIT_NODE2_IP)" "${HA_WAIT_NODES:-900}" init_poll_standby_streaming \
+        || die "the standby did not start streaming within ${HA_WAIT_NODES:-900}s
+(re-run this SAME command - it resumes from this step;
+export HA_WAIT_NODES=<seconds> to wait longer)"
 }
 
 init_step_13_sync_on() {
