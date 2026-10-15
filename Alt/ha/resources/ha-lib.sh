@@ -28,6 +28,10 @@ HA_LIB_DIR="${HA_LIB_DIR:-/usr/lib/fusionpbx-ha}"
 HA_AGENT_SCRIPT="$HA_LIB_DIR/role-agent.py"
 HA_PROMOTE_SH="$HA_LIB_DIR/promote.sh"
 HA_AGENT_UNIT_NAME="fusionpbx-ha-agent"
+# overridable for the test sandbox (the HA_SUDOERS_DIR pattern)
+HA_SYSTEMD_DIR="${HA_SYSTEMD_DIR:-/etc/systemd/system}"
+# how long ha_install_agent waits for the agent socket after enable+start
+HA_AGENT_WAIT="${HA_AGENT_WAIT:-30}"
 
 HA_REPMGR_CONF="${HA_REPMGR_CONF:-/etc/repmgr/repmgr.conf}"
 HA_HAPROXY_CONF_D="${HA_HAPROXY_CONF_D:-/etc/haproxy/conf.d}"
@@ -890,8 +894,12 @@ repmgr_cmd() {
 # role-agent probe: 200 = node is primary, 503 = standby/down, 000 = unreachable
 ha_agent_code() {
     _hac_ip="$1"
-    curl --noproxy '*' -s -o /dev/null -w '%{http_code}' --max-time 3 \
-        "http://${_hac_ip}:${HA_AGENT_PORT}/primary" 2>/dev/null || echo 000
+    _hac_code="$(curl --noproxy '*' -s -o /dev/null -w '%{http_code}' --max-time 3 \
+        "http://${_hac_ip}:${HA_AGENT_PORT}/primary" 2>/dev/null)"
+    # '-w %{http_code}' already prints 000 when curl fails; the old
+    # '|| echo 000' appended a SECOND one (000\n000 -> '000000' in messages)
+    [ -n "$_hac_code" ] || _hac_code=000
+    echo "$_hac_code"
 }
 
 # =============================================================================
@@ -975,19 +983,33 @@ ha_render_lsyncd_conf() {
     verbose "  lsyncd configuration written: $HA_LSYNCD_CONF (peer: $_hlc_peer_ip)"
 }
 
+# 0 = the local role-agent answers (200 primary / 503 standby)
+ha_agent_ready() {
+    case "$(ha_agent_code 127.0.0.1)" in
+        200|503) return 0 ;;
+    esac
+    return 1
+}
+
 ha_install_agent() {
     mkdir -p "$HA_LIB_DIR" 2>/dev/null || die "cannot create $HA_LIB_DIR"
     install -m 0755 "$HA_RES_DIR/role-agent.py" "$HA_AGENT_SCRIPT" || die "cannot install role-agent.py"
     install -m 0755 "$HA_RES_DIR/fusionpbx-ha-agent.service" \
-        "/etc/systemd/system/${HA_AGENT_UNIT_NAME}.service" \
+        "$HA_SYSTEMD_DIR/${HA_AGENT_UNIT_NAME}.service" \
         || die "cannot install the agent systemd unit"
     systemctl daemon-reload 2>/dev/null || true
     svc_enable_start "$HA_AGENT_UNIT_NAME"
-    _hia_code="$(ha_agent_code 127.0.0.1)"
-    case "$_hia_code" in
-        200|503) verbose "  role-agent is answering (HTTP $_hia_code)" ;;
-        *) die "role-agent is not answering on 127.0.0.1:$HA_AGENT_PORT (code: $_hia_code)" ;;
-    esac
+    # The unit is Type=simple: systemd counts it started the moment python3
+    # is exec'd, but the socket appears only after the interpreter imports
+    # its modules - a second or two on a modest VM. The single immediate
+    # probe lost that race on the real bench (regression 0.3.5); wait for
+    # the socket instead (fast 1s polls, HA_AGENT_WAIT overrides).
+    if ! ha_wait "the role-agent socket on 127.0.0.1:$HA_AGENT_PORT" \
+            "$HA_AGENT_WAIT" ha_agent_ready 1; then
+        die "role-agent is not answering on 127.0.0.1:$HA_AGENT_PORT (code: $(ha_agent_code 127.0.0.1))
+inspect the unit:  systemctl status $HA_AGENT_UNIT_NAME -n 30 --no-pager"
+    fi
+    verbose "  role-agent is answering (HTTP $(ha_agent_code 127.0.0.1))"
 }
 
 ha_install_promote_sh() {
@@ -1192,8 +1214,8 @@ ha_wait() {
     _hw_desc="$1"
     _hw_timeout="$2"
     _hw_fn="$3"
+    _hw_step="${4:-10}"
     _hw_elapsed=0
-    _hw_step=10
     verbose "  waiting for $_hw_desc (timeout: ${_hw_timeout}s, poll: ${_hw_step}s)..."
     while [ "$_hw_elapsed" -lt "$_hw_timeout" ]; do
         if "$_hw_fn"; then

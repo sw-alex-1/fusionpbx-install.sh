@@ -95,7 +95,26 @@ cat > "$WORK/fakebin/systemctl" <<'EOF'
 exit 0
 EOF
 
-chmod +x "$WORK/fakebin/psql" "$WORK/fakebin/runuser" "$WORK/fakebin/systemctl"
+# stub curl (agent-wait tests): AGENT_CURL_FAIL=1 -> every call fails
+# (exit 1, no output - like curl without -w output); otherwise the first
+# AGENT_FAIL_FIRST calls fail (counted via $AGENT_CALLS_FILE), then
+# AGENT_CODE (default 200) is printed - like '-w %{http_code}'
+cat > "$WORK/fakebin/curl" <<'EOF'
+#!/bin/sh
+if [ "${AGENT_CURL_FAIL:-0}" = "1" ]; then
+    exit 1
+fi
+_cf="${AGENT_CALLS_FILE:-}"
+if [ -n "$_cf" ]; then
+    _n="$(cat "$_cf" 2>/dev/null || echo 0)"
+    _n=$((_n + 1))
+    echo "$_n" > "$_cf"
+    [ "$_n" -le "${AGENT_FAIL_FIRST:-0}" ] && exit 1
+fi
+printf '%s' "${AGENT_CODE:-200}"
+EOF
+
+chmod +x "$WORK/fakebin/psql" "$WORK/fakebin/runuser" "$WORK/fakebin/systemctl" "$WORK/fakebin/curl"
 
 PASS=0
 FAIL=0
@@ -400,6 +419,45 @@ lib_run 'ha_load_cluster_conf >/dev/null; ha_detect_role >/dev/null;
 report "prelude: exits 0" $? "$OUT"
 [ -s "$HA_TEST_CAPTURE/1.sql" ] && grep -q "ALTER SCHEMA repmgr OWNER TO repmgr;" "$HA_TEST_CAPTURE/1.sql" 2>/dev/null
 report "prelude: schema fix executed (register self-heal)" $?
+
+# ---------------------------------------------------------------------------
+echo "== role-agent install/wait (regression 0.3.5) =="
+# failing curl -> exactly ONE '000' (the old '|| echo 000' printed two:
+# '000\n000' -> '000000' in the step-8 FATAL message on the real bench)
+lib_run 'export AGENT_CURL_FAIL=1; c=$(ha_agent_code 127.0.0.1); echo "[$c]"'
+[ "$OUT" = "[000]" ]; report "agent probe: single 000 on unreachable (no 000000)" $? "$OUT"
+
+lib_run 'c=$(ha_agent_code 127.0.0.1); echo "[$c]"'
+[ "$OUT" = "[200]" ]; report "agent probe: HTTP code passthrough" $? "$OUT"
+
+# the socket appears LATE (2 failed polls) - the installer must WAIT,
+# not die on the first probe (the Type=simple race)
+mkdir -p "$WORK/systemd" "$WORK/agentlib"
+rm -f "$WORK/agent.calls"
+lib_run 'export AGENT_CALLS_FILE="$WORK/agent.calls" AGENT_FAIL_FIRST=2
+    HA_LIB_DIR="$WORK/agentlib" HA_AGENT_SCRIPT="$WORK/agentlib/role-agent.py"
+    HA_SYSTEMD_DIR="$WORK/systemd" HA_AGENT_WAIT=15
+    ha_install_agent'
+report "install: waits through a slow agent start (2 failed polls)" $? "$OUT"
+echo "$OUT" | grep -q "role-agent is answering (HTTP 200)"
+report "install: success message with the HTTP code" $?
+[ -f "$WORK/systemd/fusionpbx-ha-agent.service" ]
+report "install: unit written to HA_SYSTEMD_DIR (sandbox-safe)" $?
+_nc="$(cat "$WORK/agent.calls" 2>/dev/null)"
+[ -n "$_nc" ] && [ "$_nc" -ge 3 ]
+report "install: retried until the socket appeared" $? "calls: ${_nc:-none}"
+
+# the agent never answers -> die, with a single 000 and a working hint
+rm -f "$WORK/agent.calls"
+lib_run 'export AGENT_CALLS_FILE="$WORK/agent.calls" AGENT_FAIL_FIRST=999
+    HA_LIB_DIR="$WORK/agentlib" HA_AGENT_SCRIPT="$WORK/agentlib/role-agent.py"
+    HA_SYSTEMD_DIR="$WORK/systemd" HA_AGENT_WAIT=2
+    ha_install_agent' >/dev/null 2>&1
+[ $? != 0 ]; report "install: agent never answering is fatal" $?
+echo "$OUT" | grep -q "not answering on 127.0.0.1:8008 (code: 000)"
+report "install: die shows a single 000 code" $? "$OUT"
+echo "$OUT" | grep -q "systemctl status fusionpbx-ha-agent"
+report "install: die hints systemctl status" $? "$OUT"
 
 # ---------------------------------------------------------------------------
 echo
