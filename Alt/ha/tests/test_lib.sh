@@ -78,7 +78,12 @@ case "$_q" in
     *listen_addresses*) echo "${FIX_LISTEN:-*}" ;;
     *"ALTER SYSTEM SET synchronous_standby_names"*)
         # regression 0.3.9: inject a server-side refusal (stderr must end
-        # up quoted in the die message, never swallowed)
+        # up quoted in the die message, never swallowed);
+        # regression 0.3.10: PSQL_ALTER_SYNC_LOG records the SQL for
+        # quoting assertions (the hyphenated name must be double-quoted)
+        if [ -n "${PSQL_ALTER_SYNC_LOG:-}" ]; then
+            printf '%s\n' "$_q" >> "$PSQL_ALTER_SYNC_LOG"
+        fi
         if [ "${PSQL_ALTER_SYNC_RC:-0}" != "0" ]; then
             echo "psql: ERROR:  stub-injected ALTER SYSTEM failure" >&2
             exit "${PSQL_ALTER_SYNC_RC}"
@@ -289,13 +294,13 @@ report "ALTER SYSTEM path: quiet success" "$?" "$OUT"
 [ ! -f "$WORK/pgdata/postgresql.auto.conf" ]
 report "ALTER SYSTEM path: postgresql.auto.conf untouched" $?
 
-PSQL_ALTER_SYNC_RC=3 PSQL_SYNCNAMES="fpbx-ha-2" lib_run 'ha_sync_names_write local fpbx-ha-2 && echo wrote'
+PSQL_ALTER_SYNC_RC=3 PSQL_SYNCNAMES='"fpbx-ha-2"' lib_run 'ha_sync_names_write local fpbx-ha-2 && echo wrote'
 echo "$OUT" | grep -q '^wrote$'
 report "refused ALTER: direct auto.conf edit succeeds" "$?" "$OUT"
-grep -q "^synchronous_standby_names = 'fpbx-ha-2'$" "$WORK/pgdata/postgresql.auto.conf"
-report "refused ALTER: value written to postgresql.auto.conf" $?
+grep -q "^synchronous_standby_names = '\"fpbx-ha-2\"'\$" "$WORK/pgdata/postgresql.auto.conf"
+report "refused ALTER: value written to postgresql.auto.conf (GUC form)" $?
 
-PSQL_ALTER_SYNC_RC=3 PSQL_SYNCNAMES="fpbx-ha-2" lib_run 'ha_sync_names_write local fpbx-ha-2 && echo wrote'
+PSQL_ALTER_SYNC_RC=3 PSQL_SYNCNAMES='"fpbx-ha-2"' lib_run 'ha_sync_names_write local fpbx-ha-2 && echo wrote'
 [ "$(grep -c '^synchronous_standby_names' "$WORK/pgdata/postgresql.auto.conf")" = "1" ]
 report "refused ALTER: idempotent - exactly one sync line" $?
 
@@ -311,7 +316,7 @@ _rc=$?
     && printf '%s' "$OUT" | grep -q "stub-injected ALTER SYSTEM failure"
 report "remote failure: FATAL quotes the real psql error" "$?" "rc=$_rc"
 
-PSQL_ALTER_SYNC_RC=3 PSQL_SYNCNAMES="fpbx-ha-2" PSQL_APPNAME="fpbx-ha-2" lib_run '
+PSQL_ALTER_SYNC_RC=3 PSQL_SYNCNAMES='"fpbx-ha-2"' PSQL_APPNAME="fpbx-ha-2" lib_run '
     HA_NODE_ID=1
     HA_NODE1_NAME="fpbx-ha-1"; HA_NODE1_IP="10.0.0.11"
     HA_NODE2_NAME="fpbx-ha-2"; HA_NODE2_IP="10.0.0.12"
@@ -327,6 +332,54 @@ PSQL_ALTER_SYNC_RC=3 PSQL_SYNCNAMES="" PSQL_APPNAME="" lib_run '
 '
 echo "$OUT" | grep -q '^ensured$' && echo "$OUT" | grep -q "sync mode: OFF on local"
 report "ha_ensure_sync: async clear through the file fallback" "$?" "$(echo "$OUT" | tail -1)"
+
+# ---------------------------------------------------------------------------
+echo "== synchronous_standby_names quoting (regression 0.3.10) =="
+# the real bench: ALTER SYSTEM refused the raw hyphenated name with
+# "syntax error at or near \"-\"" and the 0.3.9 file fallback left an
+# INVALID line in postgresql.auto.conf (the server would refuse to
+# RESTART). The parameter has its own grammar: a hyphenated name must be
+# double-quoted INSIDE the value ('"fpbx-ha-2"'), while '' and '*' are
+# complete values of their own and must never be quoted.
+
+lib_run 'ha_sync_names_gucval fpbx-ha-2'
+[ "$OUT" = '"fpbx-ha-2"' ]
+report "gucval: hyphenated name is double-quoted" $?
+
+lib_run 'ha_sync_names_gucval fpbx_ha_2'
+[ "$OUT" = "fpbx_ha_2" ]
+report "gucval: plain identifier passes through" $?
+
+lib_run 'ha_sync_names_gucval "*"'
+[ "$OUT" = "*" ]
+report "gucval: '*' (any standby, B2) is never quoted" $?
+
+lib_run 'ha_sync_names_gucval ""'
+[ -z "$OUT" ]
+report "gucval: empty value stays empty (async clear)" $?
+
+rm -f "$WORK/alter.log" "$WORK/pgdata/postgresql.auto.conf"
+PSQL_ALTER_SYNC_LOG="$WORK/alter.log" lib_run 'ha_sync_names_write local fpbx-ha-2 && echo wrote'
+echo "$OUT" | grep -q '^wrote$' \
+    && grep -qF "ALTER SYSTEM SET synchronous_standby_names = '\"fpbx-ha-2\"';" "$WORK/alter.log"
+report "ALTER SYSTEM path: the hyphenated name is quoted in the SQL" "$?" "$OUT"
+
+# resume self-heal: the crashed bench left an INVALID unquoted line in
+# postgresql.auto.conf - the fixed re-run must leave exactly one VALID line
+rm -f "$WORK/pgdata/postgresql.auto.conf"
+echo "synchronous_standby_names = 'fpbx-ha-2'" > "$WORK/pgdata/postgresql.auto.conf"
+PSQL_ALTER_SYNC_RC=3 PSQL_SYNCNAMES='"fpbx-ha-2"' lib_run 'ha_sync_names_write local fpbx-ha-2 && echo wrote'
+echo "$OUT" | grep -q '^wrote$' \
+    && [ "$(grep -c '^synchronous_standby_names' "$WORK/pgdata/postgresql.auto.conf")" = "1" ] \
+    && grep -q "^synchronous_standby_names = '\"fpbx-ha-2\"'\$" "$WORK/pgdata/postgresql.auto.conf"
+report "self-heal: an invalid line left by the crashed run is replaced" "$?" "$OUT"
+
+# '*' must stay literal: '"*"' would be a NAME, not the any-standby wildcard
+rm -f "$WORK/pgdata/postgresql.auto.conf"
+PSQL_ALTER_SYNC_RC=3 PSQL_SYNCNAMES='*' lib_run 'ha_sync_names_write local "*" && echo wrote'
+echo "$OUT" | grep -q '^wrote$' \
+    && grep -qxF "synchronous_standby_names = '*'" "$WORK/pgdata/postgresql.auto.conf"
+report "B2 fallback: '*' written unquoted (wildcard, not a name)" "$?" "$OUT"
 
 # CLI source-order contracts: authorized_keys must not wait for step 14
 _s12="$(sed -n '/^init_step_12_wait_standby()/,/^}/p' "$CLI")"
