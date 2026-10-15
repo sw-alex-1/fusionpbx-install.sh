@@ -739,16 +739,28 @@ BEGIN
 END
 \$hfx\$;
 HAFIX
-    chmod 644 "$_hfsa_sql"    # psql runs as the postgres OS user
-    if ! pg_runuser_psql -d "$HA_REPMGR_DB" -v ON_ERROR_STOP=1 -f "$_hfsa_sql" >/dev/null; then
+    # Feed the SQL via STDIN, never via '-f': on ALT the root session TMPDIR
+    # is per-user private (pam_mktemp: /tmp/.private/root, mode 0700), and
+    # psql runs as the postgres user - it cannot traverse root's private
+    # directory, so '-f $TMPDIR_FILE' dies with 'Permission denied'
+    # (regression 0.3.4). The redirect is opened by THIS root shell; psql
+    # merely inherits the already-open file descriptor.
+    # stderr is captured (NOT swallowed by pg_runuser_psql) so the FATAL
+    # message quotes the actual psql error.
+    _hfsa_err="$(mktemp "${TMPDIR:-/tmp}/fpbx-ha-schema-err.XXXXXX")"
+    if ! runuser -u postgres -- psql -d "$HA_REPMGR_DB" -v ON_ERROR_STOP=1 \
+            <"$_hfsa_sql" >"$_hfsa_err" 2>&1; then
         die "cannot apply the repmgr extension grants in $HA_REPMGR_DB
+psql reported:
+$(tail -n 8 "$_hfsa_err" | sed 's/^/  /')
 The generated SQL is kept at $_hfsa_sql - inspect the error with:
-  runuser -u postgres -- psql -d $HA_REPMGR_DB -v ON_ERROR_STOP=1 -f $_hfsa_sql"
+  runuser -u postgres -- psql -d $HA_REPMGR_DB -v ON_ERROR_STOP=1 < $_hfsa_sql"
     fi
-    rm -f "$_hfsa_sql"
+    rm -f "$_hfsa_sql" "$_hfsa_err"
 
     # best-effort role grants: silent on purpose (a changed signature in a
-    # future PostgreSQL major must not block a registration)
+    # future PostgreSQL major must not block a registration); stdin for the
+    # same per-user-TMPDIR reason as the hard block above
     _hfsa_opt="$(mktemp "${TMPDIR:-/tmp}/fpbx-ha-schema-opt.XXXXXX")"
     cat >"$_hfsa_opt" <<HAFIX
 GRANT pg_monitor TO $HA_REPMGR_USER;
@@ -760,8 +772,7 @@ GRANT EXECUTE ON FUNCTION pg_catalog.pg_stat_file(text, boolean) TO $HA_REPMGR_U
 GRANT EXECUTE ON FUNCTION pg_catalog.pg_ls_waldir() TO $HA_REPMGR_USER;
 GRANT EXECUTE ON FUNCTION pg_catalog.pg_ls_archivepg_wal() TO $HA_REPMGR_USER;
 HAFIX
-    chmod 644 "$_hfsa_opt"
-    pg_runuser_psql -d "$HA_REPMGR_DB" -f "$_hfsa_opt" >/dev/null || true
+    pg_runuser_psql -d "$HA_REPMGR_DB" <"$_hfsa_opt" >/dev/null || true
     rm -f "$_hfsa_opt"
 
     verbose "  repmgr extension schema: ownership + grants handed to the $HA_REPMGR_USER role"

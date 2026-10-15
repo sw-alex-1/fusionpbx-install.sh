@@ -40,9 +40,10 @@ echo "2: eth0    inet 10.0.0.11/24 brd 10.0.0.255 scope global eth0"
 EOF
 chmod +x "$WORK/fakebin/ssh-keygen" "$WORK/fakebin/ip"
 
-# stub psql (schema-grant tests): query-aware answers; every -f FILE
-# invocation is copied to $HA_TEST_CAPTURE for content assertions
-# (PSQL_F_RC: failure exit code for -f calls only)
+# stub psql (schema-grant tests): query-aware answers; calls WITHOUT -c/-tAc/-f
+# carry the SQL on STDIN (0.3.4: cross-user-safe feeding) - each such call is
+# captured to $HA_TEST_CAPTURE for content assertions
+# (PSQL_F_RC: failure exit code + stderr line for the stdin calls only)
 cat > "$WORK/fakebin/psql" <<'EOF'
 #!/bin/sh
 _orig="$*"
@@ -54,17 +55,21 @@ while [ $# -gt 0 ]; do
         *) shift ;;
     esac
 done
-if [ -n "$_f" ]; then
+if [ -z "$_q" ] && [ -z "$_f" ]; then
     _cap="${HA_TEST_CAPTURE:-}"
     if [ -n "$_cap" ] && [ -d "$_cap" ]; then
         _n=0
         [ -f "$_cap/count" ] && _n=$(cat "$_cap/count" 2>/dev/null)
         _n=$((_n + 1))
         echo "$_n" > "$_cap/count"
-        cp "$_f" "$_cap/$_n.sql"
+        cat > "$_cap/$_n.sql"
         printf '%s\n' "$_orig" > "$_cap/$_n.args"
     fi
-    [ "${PSQL_F_RC:-0}" != "0" ] && exit "${PSQL_F_RC}"
+    if [ "${PSQL_F_RC:-0}" != "0" ]; then
+        echo "psql:<stdin>:7: ERROR:  stub-injected failure" >&2
+        exit "${PSQL_F_RC}"
+    fi
+    exit 0
 fi
 case "$_q" in
     *pg_is_in_recovery*) echo "${FIX_RECOVERY:-f}" ;;
@@ -346,6 +351,10 @@ grep -q "ON_ERROR_STOP" "$HA_TEST_CAPTURE/1.args" 2>/dev/null
 report "primary: hard block runs with ON_ERROR_STOP" $?
 grep -q "ON_ERROR_STOP" "$HA_TEST_CAPTURE/2.args" 2>/dev/null && _o=bad || _o=ok
 report "primary: best-effort block without ON_ERROR_STOP" "$_o"
+# 0.3.4 regression contract: psql (running as postgres) must never be handed
+# a '-f $TMPDIR_FILE' - on ALT the root TMPDIR is per-user private (mode 0700)
+if grep -q ' -f ' "$HA_TEST_CAPTURE/1.args" "$HA_TEST_CAPTURE/2.args" 2>/dev/null; then _sf=bad; else _sf=ok; fi
+report "primary: SQL fed via stdin, never -f (ALT per-user /tmp)" "$_sf"
 echo "$OUT" | grep -q "ownership + grants handed"
 report "primary: verbose summary" $?
 
@@ -365,12 +374,20 @@ report "no-extension: exits 0 (skip)" $? "$OUT"
 [ ! -e "$HA_TEST_CAPTURE/count" ] && ! echo "$OUT" | grep -q "ownership + grants"
 report "no-extension: silent no-op" $?
 
-# the hard block fails -> die, and the message points at the kept SQL file
+# the hard block fails -> die; the message quotes the real psql error (stderr
+# is no longer swallowed) and the inspect hint stays runnable as postgres
 fixcap_reset
 lib_run 'ha_load_cluster_conf >/dev/null; export FIX_RECOVERY=f FIX_EXT=1 PSQL_F_RC=3; ha_fix_repmgr_schema_access' >/dev/null 2>&1
 [ $? != 0 ]; report "psql failure is fatal" $?
 echo "$OUT" | grep -q "cannot apply the repmgr extension grants"
 report "die message names the kept SQL file" $? "$OUT"
+echo "$OUT" | grep -q "stub-injected failure"
+report "die message quotes the actual psql error (stderr visible)" $? "$OUT"
+echo "$OUT" | grep -q "ON_ERROR_STOP=1 < " && ! echo "$OUT" | grep -q ' -f '
+report "inspect hint feeds stdin - runnable as postgres (0.3.4)" $?
+_kept="$(echo "$OUT" | sed -n 's/.*kept at \([^ ]*\) -.*/\1/p')"
+[ -n "$_kept" ] && [ -f "$_kept" ]
+report "failed run keeps the generated SQL for inspection" $?
 
 # the register prelude must run the fix BEFORE anything else - this is the
 # wiring that unblocks a resume from a state file written by an old version
