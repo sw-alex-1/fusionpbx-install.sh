@@ -76,6 +76,17 @@ case "$_q" in
     *pg_is_in_recovery*) echo "${FIX_RECOVERY:-f}" ;;
     *pg_extension*) echo "${FIX_EXT:-1}" ;;
     *listen_addresses*) echo "${FIX_LISTEN:-*}" ;;
+    *"ALTER SYSTEM SET synchronous_standby_names"*)
+        # regression 0.3.9: inject a server-side refusal (stderr must end
+        # up quoted in the die message, never swallowed)
+        if [ "${PSQL_ALTER_SYNC_RC:-0}" != "0" ]; then
+            echo "psql: ERROR:  stub-injected ALTER SYSTEM failure" >&2
+            exit "${PSQL_ALTER_SYNC_RC}"
+        fi
+        exit 0 ;;
+    *"SHOW synchronous_standby_names"*) echo "${PSQL_SYNCNAMES:-}" ;;
+    *"SELECT application_name FROM pg_stat_replication"*) echo "${PSQL_APPNAME:-}" ;;
+    *"SELECT sync_state FROM pg_stat_replication"*) echo "${PSQL_SYNCSTATE:-sync}" ;;
     *"SELECT 1"*) echo 1 ;;
     *) : ;;
 esac
@@ -263,6 +274,72 @@ report "wait witness: HA_WAIT_NODES overrides the 900s default" $?
 _w12="$(sed -n '/^init_step_12_wait_standby()/,/^}/p' "$CLI")"
 echo "$_w12" | grep -q 'HA_WAIT_NODES:-900'
 report "wait standby: HA_WAIT_NODES overrides the 900s default" $?
+
+# ---------------------------------------------------------------------------
+echo "== synchronous_standby_names write (regression 0.3.9) =="
+# the real bench: init step 13 died 'FATAL: cannot set synchronous_standby_
+# names on local' with NO reason quoted (pg_runuser_psql swallows stderr);
+# the standby's media seed (join step 9) then died 'Permission denied'
+# because authorized_keys (init step 14) had never run
+rm -f "$WORK/pgdata/postgresql.auto.conf"
+
+lib_run 'ha_sync_names_write local fpbx-ha-2 && echo wrote'
+echo "$OUT" | grep -q '^wrote$' && [ "$(echo "$OUT" | wc -l)" = "1" ]
+report "ALTER SYSTEM path: quiet success" "$?" "$OUT"
+[ ! -f "$WORK/pgdata/postgresql.auto.conf" ]
+report "ALTER SYSTEM path: postgresql.auto.conf untouched" $?
+
+PSQL_ALTER_SYNC_RC=3 PSQL_SYNCNAMES="fpbx-ha-2" lib_run 'ha_sync_names_write local fpbx-ha-2 && echo wrote'
+echo "$OUT" | grep -q '^wrote$'
+report "refused ALTER: direct auto.conf edit succeeds" "$?" "$OUT"
+grep -q "^synchronous_standby_names = 'fpbx-ha-2'$" "$WORK/pgdata/postgresql.auto.conf"
+report "refused ALTER: value written to postgresql.auto.conf" $?
+
+PSQL_ALTER_SYNC_RC=3 PSQL_SYNCNAMES="fpbx-ha-2" lib_run 'ha_sync_names_write local fpbx-ha-2 && echo wrote'
+[ "$(grep -c '^synchronous_standby_names' "$WORK/pgdata/postgresql.auto.conf")" = "1" ]
+report "refused ALTER: idempotent - exactly one sync line" $?
+
+PSQL_ALTER_SYNC_RC=3 PSQL_SYNCNAMES="" lib_run 'ha_sync_names_write local "" && echo cleared'
+echo "$OUT" | grep -q '^cleared$'
+report "refused ALTER: empty value clears the setting" "$?" "$OUT"
+! grep -q '^synchronous_standby_names' "$WORK/pgdata/postgresql.auto.conf"
+report "refused ALTER: sync line removed from postgresql.auto.conf" $?
+
+PSQL_ALTER_SYNC_RC=3 lib_run 'HA_DB_PASSWORD="pw123"; ha_sync_names_write 10.0.0.12 fpbx-ha-2'
+_rc=$?
+[ "$_rc" != 0 ] && printf '%s' "$OUT" | grep -q "cannot set synchronous_standby_names on 10.0.0.12" \
+    && printf '%s' "$OUT" | grep -q "stub-injected ALTER SYSTEM failure"
+report "remote failure: FATAL quotes the real psql error" "$?" "rc=$_rc"
+
+PSQL_ALTER_SYNC_RC=3 PSQL_SYNCNAMES="fpbx-ha-2" PSQL_APPNAME="fpbx-ha-2" lib_run '
+    HA_NODE_ID=1
+    HA_NODE1_NAME="fpbx-ha-1"; HA_NODE1_IP="10.0.0.11"
+    HA_NODE2_NAME="fpbx-ha-2"; HA_NODE2_IP="10.0.0.12"
+    ha_ensure_sync local && echo ensured
+'
+echo "$OUT" | grep -q '^ensured$' && echo "$OUT" | grep -q "sync mode: ON on local"
+report "ha_ensure_sync: sync ON through the file fallback" "$?" "$(echo "$OUT" | tail -1)"
+
+PSQL_ALTER_SYNC_RC=3 PSQL_SYNCNAMES="" PSQL_APPNAME="" lib_run '
+    HA_NODE_ID=1
+    HA_NODE2_NAME="fpbx-ha-2"
+    ha_ensure_sync local && echo ensured
+'
+echo "$OUT" | grep -q '^ensured$' && echo "$OUT" | grep -q "sync mode: OFF on local"
+report "ha_ensure_sync: async clear through the file fallback" "$?" "$(echo "$OUT" | tail -1)"
+
+# CLI source-order contracts: authorized_keys must not wait for step 14
+_s12="$(sed -n '/^init_step_12_wait_standby()/,/^}/p' "$CLI")"
+_ak12="$(echo "$_s12" | grep -n 'ha_write_authorized_keys' | head -1 | cut -d: -f1)"
+_aw12="$(echo "$_s12" | grep -n 'ha_wait ' | head -1 | cut -d: -f1)"
+[ -n "$_ak12" ] && [ -n "$_aw12" ] && [ "$_ak12" -lt "$_aw12" ]
+report "init step 12: authorized_keys before the standby wait" $?
+
+_s13="$(sed -n '/^init_step_13_sync_on()/,/^}/p' "$CLI")"
+_ak13="$(echo "$_s13" | grep -n 'ha_write_authorized_keys' | head -1 | cut -d: -f1)"
+_es13="$(echo "$_s13" | grep -n 'ha_ensure_sync' | head -1 | cut -d: -f1)"
+[ -n "$_ak13" ] && [ -n "$_es13" ] && [ "$_ak13" -lt "$_es13" ]
+report "init step 13: authorized_keys self-heal before sync-on" $?
 
 # ---------------------------------------------------------------------------
 echo "== cluster.conf generation + loading =="

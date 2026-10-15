@@ -400,6 +400,11 @@ init_poll_standby_streaming() {
 init_step_12_wait_standby() {
     # same self-heal as step 11 (regression 0.3.6)
     ha_ensure_cluster_firewall
+    # the standby's join step 9 (media seed) SSHes into THIS node with the
+    # sync key while we are still waiting here - authorized_keys cannot
+    # wait for step 14: on the real bench step 13 crashed, 14 never ran and
+    # the seed died with 'Permission denied' (regression 0.3.9). Idempotent.
+    ha_write_authorized_keys
     ha_wait "streaming standby $(ha_node_name 2) (run --join on $HA_INIT_NODE2_IP)" "${HA_WAIT_NODES:-900}" init_poll_standby_streaming \
         || die "the standby did not start streaming within ${HA_WAIT_NODES:-900}s
 (re-run this SAME command - it resumes from this step;
@@ -407,6 +412,10 @@ export HA_WAIT_NODES=<seconds> to wait longer)"
 }
 
 init_step_13_sync_on() {
+    # resume self-heal (regression 0.3.9): a bench resume entered here with
+    # steps 1-12 done and authorized_keys still unwritten (step 14 business)
+    # while the standby's media seed was already failing - re-apply it first
+    ha_write_authorized_keys
     ha_ensure_sync local
 }
 

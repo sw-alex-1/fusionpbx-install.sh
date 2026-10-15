@@ -1164,6 +1164,16 @@ ha_detect_php_fpm() {
 # =============================================================================
 # Synchronous replication management (DESIGN.md changelog 0.3)
 #
+# ha_sync_names_write <host> <value-or-empty> - the ONLY writer for
+# synchronous_standby_names (regression 0.3.9):
+#   1. ALTER SYSTEM (server-side, clean);
+#   2. when the server refuses it - a DIRECT postgresql.auto.conf edit +
+#      reload for host=local (root restores the ownership; the standby
+#      branch of ha_ensure_pg_listen uses the same file-edit precedent);
+#   3. a remote host has no shared FS - die, QUOTING the captured psql
+#      stderr (the 0.3.4 lesson: a hard-fail path must never swallow the
+#      reason - the real bench died with a bare 'cannot set ... on local').
+#
 # ha_ensure_sync <primary-host|local>:
 #   - a streaming standby exists  -> synchronous_standby_names='<standby
 #     node name>' (fallback '*' when the name does not match - see design
@@ -1172,15 +1182,77 @@ ha_detect_php_fpm() {
 #     writes continue; DESIGN.md 11.1 "async until the standby returns")
 # =============================================================================
 
+ha_sync_names_write() {
+    _hsw_host="$1"
+    _hsw_value="$2"
+    _hsw_what="set"
+    [ -n "$_hsw_value" ] || _hsw_what="clear"
+    _hsw_err="$(mktemp "${TMPDIR:-/tmp}/fpbx-ha-syncnames.XXXXXX")"
+
+    # 1. primary path: ALTER SYSTEM, stderr captured (never swallowed)
+    if [ "$_hsw_host" = "local" ]; then
+        runuser -u postgres -- psql -c \
+            "ALTER SYSTEM SET synchronous_standby_names = '${_hsw_value}';" \
+            >/dev/null 2>"$_hsw_err"
+        _hsw_rc=$?
+    else
+        PGPASSWORD="$HA_DB_PASSWORD" psql -h "$_hsw_host" -p "$HA_PG_PORT" \
+            -U postgres -c \
+            "ALTER SYSTEM SET synchronous_standby_names = '${_hsw_value}';" \
+            >/dev/null 2>"$_hsw_err"
+        _hsw_rc=$?
+    fi
+    if [ "$_hsw_rc" -eq 0 ]; then
+        rm -f "$_hsw_err"
+        pg_psql_superuser "$_hsw_host" -c "SELECT pg_reload_conf();" >/dev/null 2>&1 || true
+        return 0
+    fi
+
+    # 2. the server refused ALTER SYSTEM: write the file directly (local
+    #    only - a remote host has no shared filesystem with us)
+    if [ "$_hsw_host" != "local" ]; then
+        die "cannot $_hsw_what synchronous_standby_names on $_hsw_host
+psql reported:
+$(tail -n 8 "$_hsw_err" | sed 's/^/  /')"
+    fi
+    warn "ALTER SYSTEM was refused - writing postgresql.auto.conf directly"
+    _hsw_auto="$(ha_pg_data_dir)/postgresql.auto.conf"
+    if ! touch "$_hsw_auto" 2>/dev/null; then
+        die "cannot $_hsw_what synchronous_standby_names on local: ALTER SYSTEM was refused and $_hsw_auto is not writable
+ALTER SYSTEM reported:
+$(tail -n 8 "$_hsw_err" | sed 's/^/  /')"
+    fi
+    chown postgres:postgres "$_hsw_auto" 2>/dev/null || true
+    chmod 600 "$_hsw_auto" 2>/dev/null || true
+    sed -i '/^[[:space:]]*synchronous_standby_names[[:space:]]*=/d' "$_hsw_auto" 2>/dev/null
+    [ -n "$_hsw_value" ] && echo "synchronous_standby_names = '${_hsw_value}'" >> "$_hsw_auto"
+    pg_runuser_psql -c "SELECT pg_reload_conf();" >/dev/null 2>&1 || true
+
+    # the reload is asynchronous: confirm SHOW reflects the new value
+    _hsw_try=0
+    while [ "$_hsw_try" -lt 5 ]; do
+        _hsw_cur="$(pg_runuser_psql -tAc "SHOW synchronous_standby_names" 2>/dev/null | tr -d ' \r')"
+        if [ "$_hsw_cur" = "$_hsw_value" ]; then
+            rm -f "$_hsw_err"
+            return 0
+        fi
+        _hsw_try=$((_hsw_try + 1))
+        sleep 1
+    done
+    die "cannot $_hsw_what synchronous_standby_names on local: the direct postgresql.auto.conf edit did not take effect
+The file: $_hsw_auto
+ALTER SYSTEM reported:
+$(tail -n 8 "$_hsw_err" | sed 's/^/  /')
+Hint: runuser -u postgres -- psql -c 'SHOW synchronous_standby_names'; check the PostgreSQL log"
+}
+
 ha_ensure_sync() {
     _hes_host="$1"
     _hes_names="$(pg_psql_superuser "$_hes_host" -tAc \
         "SELECT application_name FROM pg_stat_replication WHERE state='streaming'" \
         | tr -d ' \r' | grep -v '^$')"
     if [ -z "$_hes_names" ]; then
-        pg_psql_superuser "$_hes_host" -c "ALTER SYSTEM SET synchronous_standby_names = '';" >/dev/null \
-            || die "cannot clear synchronous_standby_names on $_hes_host"
-        pg_psql_superuser "$_hes_host" -c "SELECT pg_reload_conf();" >/dev/null
+        ha_sync_names_write "$_hes_host" ""
         verbose "  sync mode: OFF on $_hes_host (no streaming standby - async until it returns)"
         return 0
     fi
@@ -1190,9 +1262,7 @@ ha_ensure_sync() {
         warn "streaming standby name is '$_hes_names' (expected '$_hes_target') - using '*' (design question B2 fallback)"
         _hes_target="*"
     fi
-    pg_psql_superuser "$_hes_host" -c "ALTER SYSTEM SET synchronous_standby_names = '$_hes_target';" >/dev/null \
-        || die "cannot set synchronous_standby_names on $_hes_host"
-    pg_psql_superuser "$_hes_host" -c "SELECT pg_reload_conf();" >/dev/null
+    ha_sync_names_write "$_hes_host" "$_hes_target"
 
     # verify: sync_state must become 'sync'
     _hes_try=0
