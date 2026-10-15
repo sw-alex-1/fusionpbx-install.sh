@@ -63,6 +63,10 @@ HA_AGENT_PORT="${HA_AGENT_PORT:-8008}"
 # (HA_HOSTS_FILE is overridable so the test suite never touches /etc)
 HA_HOSTS_FILE="${HA_HOSTS_FILE:-/etc/hosts}"
 
+# where layer 1 persists the iptables rules (iptables.service loads this
+# file on boot); HA_IPTABLES_CONF is overridable for the test sandbox
+HA_IPTABLES_CONF="${HA_IPTABLES_CONF:-/etc/sysconfig/iptables}"
+
 # managed-block markers (see ha_block_* below)
 HA_BLOCK_BEGIN="# BEGIN fusionpbx-ha (managed)"
 HA_BLOCK_END="# END fusionpbx-ha (managed)"
@@ -129,6 +133,7 @@ confirm() {
 # =============================================================================
 
 svc_active() { systemctl is-active --quiet "$1" 2>/dev/null; }
+svc_is_enabled() { systemctl is-enabled --quiet "$1" 2>/dev/null; }
 
 svc_enable_start() {
     _ses_svc="$1"
@@ -891,6 +896,26 @@ repmgr_cmd() {
     runuser -u postgres -- repmgr -f "$HA_REPMGR_CONF" "$@" 2>&1
 }
 
+# soft cross-node reachability probe: pg_isready when available, silence
+# otherwise. On failure HA_PG_ISREADY_MSG carries the tool verdict
+# ("no response" vs "rejecting connections") so the die-messages can tell
+# a firewall drop from a starting/shutting-down server (regression 0.3.6)
+ha_pg_isready() {
+    _hpr_ip="$1"
+    HA_PG_ISREADY_MSG=""
+    if cmd_exists pg_isready; then
+        _hpr_out="$(pg_isready -h "$_hpr_ip" -p "$HA_PG_PORT" -t 3 2>&1)"
+        _hpr_rc=$?
+        if [ "$_hpr_rc" = "0" ]; then
+            return 0
+        fi
+        HA_PG_ISREADY_MSG="${_hpr_out:-pg_isready exited with code $_hpr_rc}"
+        return "$_hpr_rc"
+    fi
+    warn "pg_isready not available - skipping the reachability check for $_hpr_ip"
+    return 0
+}
+
 # role-agent probe: 200 = node is primary, 503 = standby/down, 000 = unreachable
 ha_agent_code() {
     _hac_ip="$1"
@@ -1202,6 +1227,73 @@ ha_apply_no_proxy() {
     export no_proxy="${no_proxy:+$no_proxy,}$_hanp_extra"
     export NO_PROXY="$no_proxy"
     verbose "  proxy bypass list extended with cluster addresses"
+}
+
+# =============================================================================
+# Cluster firewall (DESIGN.md 14.4/14.6)
+# =============================================================================
+
+# Layer 1 whitelists INPUT WITHOUT the cluster ports (iptables.sh: policy
+# DROP, only 22/80/443/7443/SIP/RTP/1194 allowed). PostgreSQL 5432 and the
+# role-agent 8008 are therefore unreachable from the other nodes, while
+# repmgr, the peer haproxy (its backends check BOTH data nodes on 5432 +
+# the agent on 8008), the witness and the --join preflight all need exactly
+# those cross-node connections. On the bench the very first one (--join
+# preflight) died with "the peer data node ... is not reachable on port
+# 5432" while the server socket was listening fine - packets were dropped
+# by the peer's firewall (regression 0.3.6). The HA layer opens its ports
+# for the CLUSTER PEER ADDRESSES ONLY:
+#   22    - media sync (lsyncd) SSH between the data nodes
+#   5432  - PostgreSQL/repmgr: streaming, witness, metadata, pg_rewind
+#   8008  - role-agent health checks of haproxy (both data nodes)
+# Idempotent (iptables -C before every insert), safe to re-run at any
+# point: on a node without a firewall (a bare witness) the rules are
+# no-ops. Inserted at INPUT position 1 the rules stay ahead of any DROP
+# rule a sysadmin or fail2ban may add later. Persistence follows layer 1
+# (iptables-save > /etc/sysconfig/iptables) but ONLY on nodes where the
+# iptables service (or its rules file) exists - a bare witness loads
+# nothing from there, its default INPUT policy is ACCEPT anyway.
+ha_ensure_cluster_firewall() {
+    if ! cmd_exists iptables; then
+        warn "iptables not available - skipping the cluster firewall rules
+make sure the peers can reach ports 22/$HA_PG_PORT/$HA_AGENT_PORT on this node"
+        return 0
+    fi
+    if svc_active firewalld; then
+        warn "firewalld is active - the HA layer manages plain iptables only
+open 22/$HA_PG_PORT/$HA_AGENT_PORT for the cluster peers in firewalld manually"
+        return 0
+    fi
+    _hefw_added=0
+    for _hefw_i in 1 2 3; do
+        _hefw_ip="$(ha_node_ip "$_hefw_i")"
+        [ -n "$_hefw_ip" ] || continue
+        # own addresses need no INPUT rules (loopback traffic is open)
+        if own_ips 2>/dev/null | grep -qxF "$_hefw_ip"; then
+            continue
+        fi
+        for _hefw_port in 22 "$HA_PG_PORT" "$HA_AGENT_PORT"; do
+            iptables -C INPUT -s "$_hefw_ip" -p tcp --dport "$_hefw_port" -j ACCEPT >/dev/null 2>&1 \
+                && continue
+            if ! iptables -I INPUT 1 -s "$_hefw_ip" -p tcp --dport "$_hefw_port" -j ACCEPT >/dev/null 2>&1; then
+                warn "cannot add the iptables rule for $_hefw_ip:$_hefw_port - continuing"
+                continue
+            fi
+            _hefw_added=$((_hefw_added + 1))
+        done
+    done
+    if [ "$_hefw_added" -gt 0 ]; then
+        verbose "  cluster firewall: $_hefw_added iptables rule(s) added (22/$HA_PG_PORT/$HA_AGENT_PORT from the peer nodes)"
+    else
+        verbose "  cluster firewall: peer rules already present (no changes)"
+    fi
+    if svc_is_enabled iptables || [ -f "$HA_IPTABLES_CONF" ]; then
+        if iptables-save > "$HA_IPTABLES_CONF" 2>/dev/null; then
+            verbose "  iptables rules persisted to $HA_IPTABLES_CONF"
+        else
+            warn "cannot persist the iptables rules to $HA_IPTABLES_CONF - after a reboot re-run --repair"
+        fi
+    fi
 }
 
 # =============================================================================

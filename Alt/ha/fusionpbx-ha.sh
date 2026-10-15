@@ -156,17 +156,6 @@ ha_require_root_and_alt() {
     [ -f /etc/altlinux-release ] || die "this is not an ALT Linux system (/etc/altlinux-release not found)"
 }
 
-# soft reachability probe: pg_isready when available, silence otherwise
-ha_pg_isready() {
-    _hpr_ip="$1"
-    if cmd_exists pg_isready; then
-        pg_isready -h "$_hpr_ip" -p "$HA_PG_PORT" -t 3 >/dev/null 2>&1
-        return $?
-    fi
-    warn "pg_isready not available - skipping the reachability check for $_hpr_ip"
-    return 0
-}
-
 ha_port_free() {
     _hpf_port="$1"
     if cmd_exists ss; then
@@ -300,6 +289,11 @@ init_step_4_pg_prep() {
 }
 
 init_step_5_wal_log_hints() {
+    # PostgreSQL becomes network-reachable in this step (listen_addresses)
+    # - open the cluster firewall ports at the same time, otherwise no
+    # peer can ever connect: layer 1 whitelists INPUT without 5432/8008
+    # (regression 0.3.6)
+    ha_ensure_cluster_firewall
     _iwl_need_restart=0
 
     if [ "$(pg_runuser_psql -tAc "SHOW wal_log_hints" | tr -d ' \r')" = "on" ]; then
@@ -385,6 +379,10 @@ init_poll_witness_registered() {
 }
 
 init_step_11_wait_witness() {
+    # self-heal for runs resumed from an older state file: the firewall
+    # rules were only added to step 5 by 0.3.6, a resume from step 11
+    # would never re-run it (regression 0.3.6)
+    ha_ensure_cluster_firewall
     ha_wait "witness node registration (run --join on $HA_INIT_NODE3_IP)" 900 init_poll_witness_registered \
         || die "the witness did not join within 15 minutes"
 }
@@ -396,6 +394,8 @@ init_poll_standby_streaming() {
 }
 
 init_step_12_wait_standby() {
+    # same self-heal as step 11 (regression 0.3.6)
+    ha_ensure_cluster_firewall
     ha_wait "streaming standby $(ha_node_name 2) (run --join on $HA_INIT_NODE2_IP)" 900 init_poll_standby_streaming \
         || die "the standby did not start streaming within 15 minutes"
 }
@@ -455,9 +455,19 @@ The cluster was initialized with PostgreSQL $HA_PG_VERSION."
 
     if [ "$HA_NODE_ID" != "3" ]; then
         _jsp_peer="$(ha_peer_ip)"
+        # the local INPUT rules for the peers: after the join the primary's
+        # haproxy checks THIS node's agent (8008) and both backends on 5432
+        # (the peer's own rules are its --init's job)
+        ha_ensure_cluster_firewall
         if ! ha_pg_isready "$_jsp_peer"; then
             die "the peer data node $_jsp_peer is not reachable on port $HA_PG_PORT
---join needs the running primary - complete --init on it first"
+probe verdict: ${HA_PG_ISREADY_MSG:-pg_isready failed without a message}
+--join needs the running primary:
+  1. complete --init on the primary first - it opens the cluster firewall
+     rules (22/$HA_PG_PORT/$HA_AGENT_PORT from the cluster nodes; layer 1
+     whitelists INPUT WITHOUT the cluster ports, regression 0.3.6)
+  2. re-run this SAME command - completed steps are skipped automatically
+manual check on the peer:  iptables -L INPUT -n | grep -E '($HA_PG_PORT|$HA_AGENT_PORT)'"
         fi
         _jsp_code="$(ha_agent_code "$_jsp_peer")"
         [ "$_jsp_code" = "200" ] || warn "peer role-agent at $_jsp_peer answers HTTP $_jsp_code (not primary yet?) - continuing, clone will verify"
@@ -620,10 +630,16 @@ wit_step_1_preflight() {
     ha_detect_role || die "this host's IP is not in the cluster node list"
     [ "$HA_NODE_ID" = "3" ] || die "internal error: witness steps on a data node"
     _jsp_up=""
+    ha_ensure_cluster_firewall
     for _wit_ip in "$(ha_node_ip 1)" "$(ha_node_ip 2)"; do
         if ha_pg_isready "$_wit_ip"; then _jsp_up="$_wit_ip"; break; fi
     done
-    [ -n "$_jsp_up" ] || die "neither $(ha_node_ip 1) nor $(ha_node_ip 2) is reachable on $HA_PG_PORT - a data node must be running"
+    [ -n "$_jsp_up" ] || die "neither $(ha_node_ip 1) nor $(ha_node_ip 2) is reachable on $HA_PG_PORT - a data node must be running
+probe verdict: ${HA_PG_ISREADY_MSG:-pg_isready failed without a message}
+complete --init on the primary data node first - it opens the cluster
+firewall rules (22/$HA_PG_PORT/$HA_AGENT_PORT from the cluster nodes;
+layer 1 whitelists INPUT WITHOUT the cluster ports, regression 0.3.6)
+manual check on the data node:  iptables -L INPUT -n | grep -E '($HA_PG_PORT|$HA_AGENT_PORT)'"
     verbose "  preflight OK: joining as WITNESS (node 3)"
 }
 
@@ -1131,7 +1147,7 @@ Check: systemctl status haproxy $HA_AGENT_UNIT_NAME"
         if ha_pg_isready "$(ha_node_ip 3)"; then
             _dr_ok "witness $(ha_node_ip 3) is reachable"
         else
-            _dr_warn "witness $(ha_node_ip 3) unreachable - automatic failover is DISABLED until it returns (RUNBOOK.md 4)"
+            _dr_warn "witness $(ha_node_ip 3) unreachable${HA_PG_ISREADY_MSG:+ - $HA_PG_ISREADY_MSG} - automatic failover is DISABLED until it returns (RUNBOOK.md 4)"
         fi
     fi
 
@@ -1302,6 +1318,10 @@ A rebuilt node joins with: fusionpbx-ha.sh --join TOKEN
     ha_detect_role || die "this host's IP is not in the cluster node list"
     ha_apply_proxy
     ha_apply_no_proxy
+    # a rebuilt node may have re-run layer 1: its iptables.sh FLUSHES all
+    # rules and re-applies the whitelist WITHOUT the cluster ports
+    # (regression 0.3.6)
+    ha_ensure_cluster_firewall
 
     if [ "$HA_NODE_ID" = "3" ]; then
         ha_run_sequence "repair-witness" \

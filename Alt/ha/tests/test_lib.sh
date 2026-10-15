@@ -89,10 +89,17 @@ cat > "$WORK/fakebin/runuser" <<'EOF'
 exec "$@"
 EOF
 
-# stub systemctl: everything succeeds (register prelude reload paths)
+# stub systemctl: everything succeeds (register prelude reload paths).
+# SELECTIVE (0.3.6 cluster-firewall tests): is-active firewalld honors
+# FIREWALLD_ACTIVE (default 1 = inactive), is-enabled honors
+# SYSTEMCTL_IS_ENABLED_RC (default 0 = enabled) - everything else stays 0
 cat > "$WORK/fakebin/systemctl" <<'EOF'
 #!/bin/sh
-exit 0
+case "$*" in
+    *firewalld*) exit "${FIREWALLD_ACTIVE:-1}" ;;
+    is-enabled*) exit "${SYSTEMCTL_IS_ENABLED_RC:-0}" ;;
+    *) exit 0 ;;
+esac
 EOF
 
 # stub curl (agent-wait tests): AGENT_CURL_FAIL=1 -> every call fails
@@ -115,6 +122,61 @@ printf '%s' "${AGENT_CODE:-200}"
 EOF
 
 chmod +x "$WORK/fakebin/psql" "$WORK/fakebin/runuser" "$WORK/fakebin/systemctl" "$WORK/fakebin/curl"
+
+# stub pg_isready (0.3.6): PG_ISREADY_RC + PG_ISREADY_OUT control the
+# verdict; without PG_ISREADY_OUT the stub answers like the real tool
+# ("... - accepting connections" / "... - no response")
+cat > "$WORK/fakebin/pg_isready" <<'EOF'
+#!/bin/sh
+if [ "${PG_ISREADY_SILENT:-0}" = "1" ]; then
+    exit "${PG_ISREADY_RC:-0}"
+fi
+if [ -n "${PG_ISREADY_OUT:-}" ]; then
+    echo "$PG_ISREADY_OUT"
+else
+    case "${PG_ISREADY_RC:-0}" in
+        0) echo "$* - accepting connections" ;;
+        *) echo "$* - no response" ;;
+    esac
+fi
+exit "${PG_ISREADY_RC:-0}"
+EOF
+
+# stub iptables (0.3.6): rules live in $IPT_STATE (one normalized spec per
+# line), EVERY invocation is appended to $IPT_LOG; -C checks membership,
+# -I/-A append. iptables-save (separate stub) dumps the state file -
+# that is exactly the surface ha_ensure_cluster_firewall touches
+cat > "$WORK/fakebin/iptables" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >> "${IPT_LOG:?}"
+case "$1" in
+    -C)
+        shift
+        [ "${1:-}" = "INPUT" ] && shift
+        grep -qxF -- "$*" "${IPT_STATE:?}" 2>/dev/null && exit 0
+        exit 1
+        ;;
+    -I|-A)
+        shift
+        [ "${1:-}" = "INPUT" ] && shift
+        case "${1:-}" in
+            "" | *[!0-9]*) : ;;
+            *) shift ;;
+        esac
+        printf '%s\n' "$*" >> "${IPT_STATE:?}"
+        exit 0
+        ;;
+    *)  exit 0 ;;
+esac
+EOF
+
+cat > "$WORK/fakebin/iptables-save" <<'EOF'
+#!/bin/sh
+cat "${IPT_STATE:?}" 2>/dev/null
+exit 0
+EOF
+
+chmod +x "$WORK/fakebin/pg_isready" "$WORK/fakebin/iptables" "$WORK/fakebin/iptables-save"
 
 PASS=0
 FAIL=0
@@ -458,6 +520,101 @@ echo "$OUT" | grep -q "not answering on 127.0.0.1:8008 (code: 000)"
 report "install: die shows a single 000 code" $? "$OUT"
 echo "$OUT" | grep -q "systemctl status fusionpbx-ha-agent"
 report "install: die hints systemctl status" $? "$OUT"
+
+# ---------------------------------------------------------------------------
+echo "== pg_isready probe verdict (regression 0.3.6) =="
+# the join preflight died with a bare "not reachable on port 5432" while
+# the real pg_isready verdict ("no response" = firewall drop vs
+# "rejecting connections" = server alive but starting/shutting down) was
+# discarded (>/dev/null 2>&1)
+
+lib_run 'ha_pg_isready 10.0.0.12 && echo "ok:${HA_PG_ISREADY_MSG:-empty}"'
+echo "$OUT" | grep -q "^ok:empty$"
+report "probe: success leaves no verdict" $? "$OUT"
+
+lib_run 'export PG_ISREADY_RC=2 PG_ISREADY_OUT="10.0.0.12:5432 - no response"
+    ha_pg_isready 10.0.0.12; echo "rc=$? msg=$HA_PG_ISREADY_MSG"'
+echo "$OUT" | grep -q "^rc=2 msg=10.0.0.12:5432 - no response$"
+report "probe: firewall-drop verdict carried out" $? "$OUT"
+
+lib_run 'export PG_ISREADY_RC=1 PG_ISREADY_OUT="10.0.0.12:5432 - rejecting connections"
+    ha_pg_isready 10.0.0.12; echo "rc=$? msg=$HA_PG_ISREADY_MSG"'
+echo "$OUT" | grep -q "^rc=1 msg=.*rejecting connections$"
+report "probe: rejecting-server verdict carried out" $? "$OUT"
+
+lib_run 'export PG_ISREADY_RC=2 PG_ISREADY_SILENT=1
+    ha_pg_isready 10.0.0.12; echo "rc=$? msg=$HA_PG_ISREADY_MSG"'
+echo "$OUT" | grep -q "^rc=2 msg=pg_isready exited with code 2$"
+report "probe: empty verdict falls back to the exit code" $? "$OUT"
+
+mv "$WORK/fakebin/pg_isready" "$WORK/pg_isready.hidden"
+lib_run 'ha_pg_isready 10.0.0.12; echo "rc=$? msg=${HA_PG_ISREADY_MSG:-empty}"'
+echo "$OUT" | grep -q "^rc=0 msg=empty$" && echo "$OUT" | grep -q "pg_isready not available"
+report "probe: missing tool warns and passes (soft check)" $? "$OUT"
+mv "$WORK/pg_isready.hidden" "$WORK/fakebin/pg_isready"
+
+# ---------------------------------------------------------------------------
+echo "== cluster firewall (regression 0.3.6) =="
+# layer 1 whitelists INPUT WITHOUT the cluster ports -> the HA layer must
+# open 22/5432/8008 for the PEER addresses only (own address skipped);
+# cluster.conf fixture from the section above: self 10.0.0.11, peers
+# 10.0.0.12 (standby) and 10.0.0.13 (witness); own ip-stub reports .11
+
+mkdir -p "$WORK/fw"
+: > "$WORK/fw/state"; : > "$WORK/fw/log"
+
+fw_run() {
+    lib_run "export IPT_STATE='$WORK/fw/state' IPT_LOG='$WORK/fw/log' HA_IPTABLES_CONF='$WORK/fw/iptables.conf'
+        ha_load_cluster_conf >/dev/null
+        $1"
+}
+
+fw_run 'ha_ensure_cluster_firewall; echo "rc=$?"'
+echo "$OUT" | grep -q "^rc=0$"
+report "fw: exits 0 on a data node" $? "$OUT"
+
+[ "$(grep -c -- '^-I INPUT' "$WORK/fw/log")" = "6" ]
+report "fw: exactly 6 peer rules (2 peers x 22/5432/8008)" $?
+grep -qxF -- "-I INPUT 1 -s 10.0.0.12 -p tcp --dport 5432 -j ACCEPT" "$WORK/fw/log"
+report "fw: standby peer rule on the PostgreSQL port" $?
+grep -qxF -- "-I INPUT 1 -s 10.0.0.13 -p tcp --dport 8008 -j ACCEPT" "$WORK/fw/log"
+report "fw: witness peer rule on the agent port" $?
+! grep -q -- "-s 10.0.0.11 " "$WORK/fw/log"
+report "fw: no rule for the own address" $?
+grep -q -- "-s 10.0.0.12 -p tcp --dport 5432 -j ACCEPT" "$WORK/fw/iptables.conf" 2>/dev/null
+report "fw: rules persisted the layer-1 way (iptables-save)" $?
+echo "$OUT" | grep -q "6 iptables rule(s) added"
+report "fw: reports the number of added rules" $? "$OUT"
+
+# re-run: every -C hits -> no further inserts, no duplicates
+fw_run 'ha_ensure_cluster_firewall; echo "rc=$?"'
+[ "$(grep -c -- '^-I INPUT' "$WORK/fw/log")" = "6" ] && echo "$OUT" | grep -q "^rc=0$"
+report "fw: idempotent - re-run inserts nothing" $?
+echo "$OUT" | grep -q "peer rules already present"
+report "fw: re-run reports 'already present'" $? "$OUT"
+
+# no iptables service and no rules file -> no orphan file is written
+# (a bare witness loads nothing from /etc/sysconfig/iptables)
+rm -f "$WORK/fw/iptables.conf"
+lib_run "export IPT_STATE='$WORK/fw/state' IPT_LOG='$WORK/fw/log' SYSTEMCTL_IS_ENABLED_RC=1
+    ha_load_cluster_conf >/dev/null
+    ha_ensure_cluster_firewall; echo rc=\$?"
+[ ! -f "$WORK/fw/iptables.conf" ] && echo "$OUT" | grep -q "^rc=0$"
+report "fw: no iptables service -> no orphan rules file" $? "$OUT"
+
+# firewalld active -> the HA layer does not fight it, warns instead
+lib_run "export IPT_STATE='$WORK/fw/state' IPT_LOG='$WORK/fw/log' FIREWALLD_ACTIVE=0
+    ha_load_cluster_conf >/dev/null
+    ha_ensure_cluster_firewall; echo rc=\$?"
+echo "$OUT" | grep -q "firewalld is active" && echo "$OUT" | grep -q "^rc=0$"
+report "fw: firewalld active -> warn and skip" $? "$OUT"
+
+# no iptables binary at all -> soft skip, never fatal
+mv "$WORK/fakebin/iptables" "$WORK/iptables.hidden"
+lib_run "ha_load_cluster_conf >/dev/null; ha_ensure_cluster_firewall; echo rc=\$?"
+echo "$OUT" | grep -q "iptables not available" && echo "$OUT" | grep -q "^rc=0$"
+report "fw: missing iptables -> warn, not fatal" $? "$OUT"
+mv "$WORK/iptables.hidden" "$WORK/fakebin/iptables"
 
 # ---------------------------------------------------------------------------
 echo

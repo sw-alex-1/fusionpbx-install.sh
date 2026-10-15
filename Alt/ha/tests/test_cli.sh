@@ -115,9 +115,30 @@ cat > "$FB/ip" <<'EOF'
 echo "2: eth0    inet ${FAKE_IP:-10.0.0.11}/24 brd 10.0.0.255 scope global eth0"
 EOF
 
+# pg_isready stub (0.3.6): PG_ISREADY_RC + PG_ISREADY_OUT control the
+# verdict like test_lib.sh (real tool output is quoted in messages now)
 cat > "$FB/pg_isready" <<'EOF'
 #!/bin/sh
+if [ -n "${PG_ISREADY_OUT:-}" ]; then
+    echo "$PG_ISREADY_OUT"
+else
+    case "${PG_ISREADY_RC:-0}" in
+        0) echo "$* - accepting connections" ;;
+        *) echo "$* - no response" ;;
+    esac
+fi
 exit "${PG_ISREADY_RC:-0}"
+EOF
+
+# iptables stubs (0.3.6, defensive): cluster-firewall calls are no-ops in
+# CLI flows; -C reports "present" so nothing is ever inserted
+ cat > "$FB/iptables" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+cat > "$FB/iptables-save" <<'EOF'
+#!/bin/sh
+exit 0
 EOF
 
 # stub ssh-keygen: fake key pair, no container dependency (test_lib.sh style)
@@ -160,7 +181,7 @@ echo "apt-get: stub - no repository in the test sandbox" >&2
 exit 100
 EOF
 
-for _fb in systemctl timedatectl psql runuser repmgr curl ip pg_isready ssh-keygen ss ping rpm apt-get; do
+for _fb in systemctl timedatectl psql runuser repmgr curl ip pg_isready ssh-keygen ss ping rpm apt-get iptables iptables-save; do
     chmod +x "$FB/$_fb"
 done
 
@@ -209,6 +230,8 @@ ha_cli() {
         export HA_PROMOTE_SH="$WORK/lib/promote.sh"
         export HA_HAPROXY_MAIN="$WORK/haproxy.d/main.cfg"
         export HA_HOSTS_FILE="$WORK/hosts-cli"
+        # cluster-firewall persistence target (0.3.6): sandbox-safe
+        export HA_IPTABLES_CONF="$WORK/iptables.rules"
         # default role-agent answers: node1 primary, node2 standby
         export CURL_CODES="${CURL_CODES:-10.0.0.11=200,10.0.0.12=503}"
         export PATH="$FB:$PATH"
@@ -421,6 +444,12 @@ PG_ISREADY_RC=2 ha_cli --doctor > "$WORK/out.log" 2>&1; _rc=$?
 [ "$_rc" = "0" ] && grep -q "witness 10.0.0.13 unreachable" "$WORK/out.log" \
   && grep -q "automatic failover is DISABLED" "$WORK/out.log"
 report "--doctor warns when the witness is unreachable (still healthy)" "$?"
+
+echo "== --doctor: witness verdict quoted (0.3.6) =="
+PG_ISREADY_RC=2 PG_ISREADY_OUT="10.0.0.13:5432 - no response" ha_cli --doctor > "$WORK/out.log" 2>&1; _rc=$?
+[ "$_rc" = "0" ] \
+  && grep -q "unreachable - 10.0.0.13:5432 - no response" "$WORK/out.log"
+report "--doctor quotes the pg_isready verdict (firewall vs down)" "$?" "$(grep -m1 'unreachable' "$WORK/out.log")"
 
 echo "== --doctor: NTP out of sync =="
 TIMEDATECTL_VALUE=no ha_cli --doctor > "$WORK/out.log" 2>&1; _rc=$?
