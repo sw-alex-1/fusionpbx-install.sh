@@ -482,6 +482,57 @@ report "prelude: exits 0" $? "$OUT"
 [ -s "$HA_TEST_CAPTURE/1.sql" ] && grep -q "ALTER SCHEMA repmgr OWNER TO repmgr;" "$HA_TEST_CAPTURE/1.sql" 2>/dev/null
 report "prelude: schema fix executed (register self-heal)" $?
 
+# the prelude must also re-apply .pgpass before every register (0.3.7) -
+# on the witness it is the ONLY writer (the unpack step no longer writes
+# it: postgresql-server is not installed there yet); a file deleted by
+# hand also comes back on the next register/repair
+[ -s "$WORK/.pgpass" ] && grep -q "fusionpbx-ha: managed block" "$WORK/.pgpass"
+report "prelude: .pgpass re-applied (register self-heal, 0.3.7)" $?
+grep -q '^10.0.0.11:5432:\*:postgres:' "$WORK/.pgpass" && grep -q '^10.0.0.12:5432:\*:fusionpbx:' "$WORK/.pgpass"
+report "prelude: .pgpass carries the data-role lines" $?
+[ "$(stat -c %a "$WORK/.pgpass")" = "600" ]
+report "prelude: .pgpass mode 600" $?
+
+# ---------------------------------------------------------------------------
+echo "== .pgpass (regression 0.3.7: witness join died at step 2) =="
+# the real bench: 'FATAL: cannot write /var/lib/pgsql/.pgpass' in
+# wit_step_2_unpack - the witness has no layer 1, postgresql-server is
+# installed only by step 3, so the directory did not exist yet
+
+# witness role: repmgr lines only - no postgres/app credentials
+rm -f "$WORK/.pgpass"
+lib_run 'ha_load_cluster_conf >/dev/null; ha_write_pgpass witness >/dev/null; echo ok'
+[ "$OUT" = "ok" ]; report "witness role: write exits 0" $? "$OUT"
+grep -q ':repmgr:' "$WORK/.pgpass"
+report "witness role: repmgr lines present" $?
+if grep -qE ':(postgres|fusionpbx):' "$WORK/.pgpass"; then _pw=bad; else _pw=ok; fi
+report "witness role: NO postgres/app credentials" "$_pw"
+
+# the home directory does not exist yet (no postgresql-server): a die that
+# names the cause, not bash's bare redirect error from the real bench
+rm -f "$WORK/.pgpass"
+lib_run 'ha_load_cluster_conf >/dev/null; HA_PGDATA_DEFAULT="$WORK/no-pg/yet" ha_write_pgpass witness' >/dev/null 2>&1
+[ $? != 0 ]; report "missing home dir: fatal" $?
+echo "$OUT" | grep -q "postgresql-server is not installed yet"
+report "missing home dir: die names the cause" $? "$OUT"
+[ ! -e "$WORK/no-pg" ]
+report "missing home dir: nothing created on the way" $?
+
+# ordering contract on the CLI source: the witness unpack step must not
+# write .pgpass (the packages step comes later); the register prelude must
+CLI="$REPO/Alt/ha/fusionpbx-ha.sh"
+_wit2="$(sed -n '/^wit_step_2_unpack()/,/^}/p' "$CLI")"
+if echo "$_wit2" | grep -q 'ha_write_pgpass'; then _pw2=bad; else _pw2=ok; fi
+report "wit unpack step: no .pgpass write before the packages step" "$_pw2"
+_j2="$(sed -n '/^join_step_2_unpack()/,/^}/p' "$CLI")"
+echo "$_j2" | grep -q 'ha_write_pgpass data'
+report "standby unpack step: .pgpass still written (layer 1 present)" $?
+_pl="$(sed -n '/^ha_register_prelude()/,/^}/p' "$LIB")"
+echo "$_pl" | grep -q 'ha_write_pgpass witness'
+report "register prelude: witness .pgpass written" $?
+echo "$_pl" | grep -q 'ha_write_pgpass data'
+report "register prelude: data-node .pgpass written" $?
+
 # ---------------------------------------------------------------------------
 echo "== role-agent install/wait (regression 0.3.5) =="
 # failing curl -> exactly ONE '000' (the old '|| echo 000' printed two:

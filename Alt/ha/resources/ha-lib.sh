@@ -798,6 +798,8 @@ HAFIX
 #   - listen_addresses (older versions never set it)
 #   - repmgr.conf when it differs from the current template (legacy keys)
 #   - the sudoers drop-in and promote.sh (data nodes only)
+#   - the .pgpass (older versions wrote the witness copy in the unpack step,
+#     BEFORE postgresql-server was installed - regression 0.3.7)
 # Everything here is idempotent and a no-op on a healthy current-version node.
 # -----------------------------------------------------------------------------
 ha_register_prelude() {
@@ -807,8 +809,8 @@ ha_register_prelude() {
     # "permission denied for schema repmgr" (regression 0.3.3)
     ha_fix_repmgr_schema_access
     case "$_hrp_role" in
-        witness) ha_write_pg_hba witness ;;
-        *)       ha_write_pg_hba data; ha_install_sudoers; ha_install_promote_sh ;;
+        witness) ha_write_pgpass witness; ha_write_pg_hba witness ;;
+        *)       ha_write_pgpass data; ha_write_pg_hba data; ha_install_sudoers; ha_install_promote_sh ;;
     esac
     systemctl reload "$HA_PG_SERVICE" 2>/dev/null \
         || pg_runuser_psql -c "SELECT pg_reload_conf();" >/dev/null 2>&1 || true
@@ -829,10 +831,23 @@ ha_register_prelude() {
 }
 
 # .pgpass for the postgres system user (repmgr + superuser + app credentials
-# on the data nodes; repmgr only on the witness)
+# on the data nodes; repmgr only on the witness).
+#
+# The file lives next to PGDATA (the postgres system user's home) - taken
+# from ha_pg_data_dir(), never hardcoded, so the sandbox tests resolve the
+# same way as production. MUST be called only AFTER postgresql-server is
+# installed: the witness has no layer 1 and /var/lib/pgsql appears only
+# with the packages step, so writing .pgpass any earlier dies with an
+# actionable message instead of bash's bare 'No such file or directory'
+# (regression 0.3.7: the witness join used to write it in the unpack step).
 ha_write_pgpass() {
-    _hpw_file="/var/lib/pgsql/.pgpass"
+    _hpw_dir="$(dirname "$(ha_pg_data_dir)")"
+    _hpw_dir="${_hpw_dir%/}"
+    _hpw_file="$_hpw_dir/.pgpass"
     _hpw_role="${1:-data}"       # data | witness
+    [ -d "$_hpw_dir" ] || die "$_hpw_dir does not exist - postgresql-server is not installed yet.
+The .pgpass can only be written after the packages step (regression 0.3.7:
+the witness join used to write it in the unpack step, before the packages)."
     {
         echo "# fusionpbx-ha: managed block"
         if [ "$_hpw_role" = "witness" ]; then

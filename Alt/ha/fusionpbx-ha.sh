@@ -494,7 +494,11 @@ join_step_2_unpack() {
         ha_install_sudoers
         verbose "  repmgr configuration written: $HA_REPMGR_CONF (role: standby)"
     else
-        ha_write_pgpass witness
+        # defensive branch - the dispatcher routes node 3 to the wit_* steps;
+        # NO .pgpass here: the witness has no layer 1, /var/lib/pgsql appears
+        # only after step 3 installs postgresql-server; the register prelude
+        # writes it (regression 0.3.7)
+        :
     fi
     ha_write_etc_hosts_block
     ha_apply_no_proxy
@@ -647,7 +651,9 @@ wit_step_2_unpack() {
     mkdir -p "$HA_ETC_DIR"
     chmod "$HA_CONF_DIR_MODE" "$HA_ETC_DIR"
     install -m 600 "$HA_JOIN_TMP_CONF" "$HA_CLUSTER_CONF" || die "cannot write $HA_CLUSTER_CONF"
-    ha_write_pgpass witness
+    # NO .pgpass here: the witness has no layer 1, /var/lib/pgsql appears
+    # only after step 3 installs postgresql-server; the register prelude
+    # (step 6) writes it (regression 0.3.7)
     ha_write_etc_hosts_block
     ha_apply_no_proxy
 }
