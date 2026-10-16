@@ -7,8 +7,15 @@
 -- on exactly one node, therefore two opposing push streams are safe.
 --
 -- delete=true propagates deletions made in the UI to the peer node.
--- The receiving side is restricted by the forced rrsync command in
--- authorized_keys (see DESIGN.md section 6.3).
+-- The receiving side is restricted by the forced rrsync-command in
+-- authorized_keys (see DESIGN.md section 6.3): it runs WITHOUT -absolute,
+-- so every remote path is served RELATIVE to the restricted root
+-- ($HA_SYNC_DIR) - a leading '/' IS the tree root. The target is therefore
+-- 'root@<peer>:/' (the tree root itself); the pre-0.3.12 form
+-- 'root@<peer>:/var/lib/freeswitch/storage' DOUBLED on the peer into
+-- $HA_SYNC_DIR/var/lib/freeswitch/storage and silently built a nested
+-- tree (regression 0.3.12). The trailing '/' on the source pins the
+-- contents-sync semantics regardless of how lsyncd normalizes it.
 --
 -- Unit (lsyncd.service, ALT RPM 2.3.1-alt2) hardcodes this exact path.
 
@@ -21,8 +28,8 @@ settings {
 
 sync {
         default.rsync,
-        source    = "@@SYNC_DIR@@",
-        target    = "root@@@PEER_IP@@:@@SYNC_DIR@@",
+        source    = "@@SYNC_DIR@@/",
+        target    = "root@@@PEER_IP@@:/",
         delay     = @@SYNC_DELAY@@,
         delete    = true,
         rsync     = {

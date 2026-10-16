@@ -102,7 +102,12 @@ check_line "$_cfg" '^    mode tcp$' "mode tcp"
 echo "== lsyncd configuration =="
 HA_LSYNCD_CONF="$WORK/lsyncd.conf.lua"
 ha_render_lsyncd_conf 10.0.0.12
-check_line "$HA_LSYNCD_CONF" 'target *= *"root@10.0.0.12:/var/lib/freeswitch/storage"' "push target = peer"
+# 0.3.12: rrsync (no -absolute in the forced command) serves client paths
+# RELATIVE to its restricted root - the target must name the tree root
+# itself (':/'), the absolute form doubled into $HA_SYNC_DIR/$HA_SYNC_DIR
+# on the peer; the explicit source slash pins the contents-sync semantics
+check_line "$HA_LSYNCD_CONF" 'target *= *"root@10.0.0.12:/"' "push target = the peer's rrsync tree root (:/)"
+check_line "$HA_LSYNCD_CONF" 'source *= *"/var/lib/freeswitch/storage/"' "source carries the contents slash"
 check_line "$HA_LSYNCD_CONF" 'delete *= *true' "delete=true (UI deletions propagate)"
 check_line "$HA_LSYNCD_CONF" 'delay *= *5' "delay from cluster.conf"
 check_line "$HA_LSYNCD_CONF" '/etc/fusionpbx-ha/sync_key' "dedicated sync key"

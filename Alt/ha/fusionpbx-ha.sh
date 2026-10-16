@@ -632,11 +632,23 @@ join_step_9_seed_media() {
     verbose "  pulling the media tree from $(ha_peer_name) (seed BEFORE the sync"
     verbose "  daemon starts - protects the peer copy from being wiped by an"
     verbose "  empty local tree; DESIGN.md 10.2)"
+    # The peer's forced rrsync-command carries NO -absolute flag: every
+    # client path is served RELATIVE to the restricted root ($HA_SYNC_DIR) -
+    # a leading '/' means the tree root itself (rrsync maps the arg onto
+    # <restricted-root><arg>). The pre-0.3.12 spec "root@peer:$HA_SYNC_DIR/"
+    # therefore doubled into $HA_SYNC_DIR/$HA_SYNC_DIR/: os.path.realpath is
+    # non-strict, so the doubled path sailed through the 'unsafe arg' check
+    # and the sender-side open died ENOENT on EVERY pull ('post-realpath
+    # open failed (race detected)' - the exact bench death). The 0.3.11
+    # step-race was real but secondary: that path form could never succeed.
+    # ':/' is the root of the peer's restricted tree (regression 0.3.12).
     rsync -a --delete \
         -e "ssh -i $HA_SYNC_KEY -o UserKnownHostsFile=$HA_KNOWN_HOSTS -o StrictHostKeyChecking=accept-new -o BatchMode=yes" \
-        "root@$(ha_peer_ip):$HA_SYNC_DIR/" "$HA_SYNC_DIR/" \
-        || die "media seed failed - check sshd on $(ha_peer_ip) and the sync key
-(hint: systemctl status sshd on $(ha_peer_ip))"
+        "root@$(ha_peer_ip):/" "$HA_SYNC_DIR/" \
+        || die "media seed failed - the pull needs sshd up on $(ha_peer_ip), the sync
+key in root's authorized_keys there (rrsync-restricted root: $HA_SYNC_DIR) and
+that dir existing on the peer
+(hint: 'fusionpbx-ha.sh --doctor' on $(ha_peer_ip); systemctl status sshd there)"
     verbose "  media tree seeded: $HA_SYNC_DIR"
 }
 
@@ -1151,6 +1163,30 @@ Check: systemctl status haproxy $HA_AGENT_UNIT_NAME"
                 _dr_ok "lsyncd log clean"
             fi
             [ -f "$HA_SYNC_DIR" ] || [ -d "$HA_SYNC_DIR" ] || _dr_fail "sync dir missing: $HA_SYNC_DIR"
+        fi
+
+        # 8b. lsyncd config conformance (data nodes): a config rendered by an
+        # OLDER script version can be silently wrong for the current template
+        # (0.3.12: the peer's forced rrsync-command serves paths RELATIVE to
+        # its restricted root - the pre-0.3.12 absolute target mirrored the
+        # tree into a NESTED dir on the peer). Already-initialized nodes
+        # never re-run init step 14, so the doctor is their convergence
+        # point: re-render from the current template and restart on drift.
+        if [ -f "$HA_LSYNCD_CONF" ]; then
+            _dc_lsyn_new="$HA_ETC_DIR/.lsyncd.conf.doctor"
+            ha_render "$HA_RES_DIR/lsyncd.conf.lua.tpl" "$_dc_lsyn_new" \
+                "SYNC_DIR=$HA_SYNC_DIR" "SYNC_DELAY=$HA_SYNC_DELAY" "PEER_IP=$(ha_peer_ip)"
+            if cmp -s "_dc_lsyn_new" "$HA_LSYNCD_CONF"; then
+                _dr_ok "lsyncd config matches the current template"
+            else
+                cat "_dc_lsyn_new" > "$HA_LSYNCD_CONF"
+                if systemctl restart "$HA_LSYNCD_SERVICE" 2>/dev/null; then
+                    _dr_warn "lsyncd config was stale (older script version) - re-rendered, lsyncd restarted"
+                else
+                    _dr_fail "lsyncd config was stale - re-rendered, but the lsyncd restart failed (check: journalctl -u $HA_LSYNCD_SERVICE -n 30)"
+                fi
+            fi
+            rm -f "_dc_lsyn_new"
         fi
         if cmd_exists sshd; then :; else _dr_warn "cannot verify sshd command"; fi
         # inotify budget for large recording trees (design question B7)

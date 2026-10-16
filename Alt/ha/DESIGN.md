@@ -2,10 +2,10 @@
 
 | | |
 |---|---|
-| **Версия** | 0.3.11 (реализация начата — см. §18) |
+| **Версия** | 0.3.12 (реализация начата — см. §18) |
 | **Дата** | 2026-10-16 |
 | **Дом** | `Alt/ha/` репозитория `fusionpbx-install.sh`, ветка `alt` |
-| **Статус** | Реализация v1 + hotfix 0.3.11. Стендовая проверка на 3×ALT, ЧИСТАЯ переустановка (§15.3): primary и witness установились полностью (шаги 15/15, sync-репликация включена — GUC-цитирование 0.3.10 подтверждено стендом); join standby упал на шаге 9 (seed media): усиленный ALT rrsync умер «post-realpath open failed (race detected): … No such file or directory» — media-каталог на primary создаётся слоем 1, его создавал только init-шаг 14, а seed обгонял шаги 13–14 сразу после начала стриминга. Исправлено в 0.3.11 (ha_ensure_sync_dir: шаг 6 до register + self-heal 12/13 + владелец angie), resume продолжит с шага 9 (fpbx2). |
+| **Статус** | Реализация v1 + hotfix 0.3.12. Стендовая проверка на 3×ALT, ЧИСТАЯ переустановка (§15.3): primary и witness полностью (15/15, 11/11 — sync-репликация включена, GUC-цитирование 0.3.10 подтверждено), join standby падал на шаге 9 (seed media) дважды: «rrsync error: post-realpath open failed (race detected): /var/lib/freeswitch/storage/ No such file or directory». Истинный корень вскрыт разбором исходника усиленного rrsync: **без флага `-absolute` клиентский путь с ведущим «/» подаётся ОТНОСИТЕЛЬНО корня restricted-дерева** — старая форма «root@peer:$HA_SYNC_DIR/» удваивалась в $HA_SYNC_DIR/$HA_SYNC_DIR/, нестрогий realpath пропускал её мимо «unsafe arg», а sender-режим умирал ENOENT на каждом pull (гонка шагов 0.3.11 реальна, но вторична — с той формой пути seed не прошёл бы никогда; воспроизведено живым тестом на СУЩЕСТВУЮЩЕМ каталоге). Исправлено в 0.3.12: seed тянет «:/» (корень restricted-дерева пира), target lsyncd — «root@peer:/», `--doctor` сводит конфиг lsyncd к текущему шаблону (перерендер + рестарт). Resume продолжит с шага 9 (fpbx2), затем `--doctor` на fpbx1. |
 | **Язык сообщений скрипта** | Английский (как в установщике слоя 1) |
 
 ---
@@ -323,6 +323,12 @@ no-pty,no-agent-forwarding,no-X11-forwarding,no-port-forwarding \
 ssh-ed25519 AAAA... fusionpbx-ha-sync
 ```
 
+- `command=` запускает rrsync **без `-absolute`** (0.3.12): клиентские пути
+  подаются ОТНОСИТЕЛЬНО корня restricted-дерева — ведущий `/` в удалённом
+  пути означает сам `$HA_SYNC_DIR`, а не корень ФС; поэтому seed (join-шаг 9)
+  и lsyncd адресуют пир как `root@<peer>:/` — абсолютная форма
+  `root@<peer>:/var/lib/freeswitch/storage` удваивалась и умирала ENOENT
+  (§10.2);
 - если `rrsync` в составе rsmgr-независимого пакета rsync в ALT не найден
   (проверить путь — §16), деградация: `from=` без `command=` (ограничение
   только по IP; допустимо, т.к. ключ всё равно единственного назначения);
@@ -401,7 +407,7 @@ WAIT и продолжится сама, как только сосед заре
 | 6 | start+register | старт `postgresql.service` (поднимется в recovery) → идемпотентная прелюдия (pg_hba/listen/re-render; гранты схемы на standby — no-op: метаданная БД — стриминговая копия primary) → `repmgr standby register --upstream-node-id=1`; в conninfo — `application_name=fpbx-ha-2` (для `synchronous_standby_names` с VM1, §16-в2) |
 | 7 | agent + haproxy | те же конфиги, что на VM1 (идентичны на всех data-нодах) |
 | 8 | repoint-DSN | как шаг 10 у `--init`; перезапуск сервисов; smoke-тест |
-| 9 | seed-media | rsync **от VM1 к себе** (pull): `rsync -a --delete -e "ssh -i sync_key" VM1:$HA_SYNC_DIR/ $HA_SYNC_DIR/` — локальная копия становится зеркальной до первого старта lsyncd (§10.2, ловушка `--delete`) |
+| 9 | seed-media | rsync **от VM1 к себе** (pull): `rsync -a --delete -e "ssh -i sync_key" VM1:/ $HA_SYNC_DIR/` — источник `:/` — КОРЕНЬ restricted-дерева rrsync пира (без `-absolute` пути клиента отсчитываются от него; абсолютная форма удваивалась и умирала ENOENT — 0.3.12); локальная копия становится зеркальной до первого старта lsyncd (§10.2, ловушка `--delete`) |
 | 10 | lsyncd-start | конфиг VM2 (push → VM1, `delete=true`), enable+start |
 | 11 | finalize | маркер; сводка (`repmgr cluster show` уже видит 2/3) |
 
@@ -513,12 +519,24 @@ settings { logfile = "/var/log/lsyncd/lsyncd.log",
            statusFile = "/var/log/lsyncd/lsyncd.status",
            statusInterval = 20, inotifyMode = "CloseWrite" }
 sync { default.rsync,
-       source = "/var/lib/freeswitch/storage",
-       target = "root@10.0.0.11:/var/lib/freeswitch/storage",
+       source = "/var/lib/freeswitch/storage/",
+       target = "root@10.0.0.11:/",
        delay = 5, maxProcesses = 1,
-       rsync = { archive = true, compress = true, _extra = { "--delete" },
+       rsync = { archive = true, compress = true, delete = true,
                  rsh = "ssh -i /etc/fusionpbx-ha/sync_key -o StrictHostKeyChecking=accept-new" } }
 ```
+
+Пути rrsync отсчитываются ОТ КОРНЯ restricted-дерева (0.3.12): forced-command
+в authorized_keys не содержит `-absolute`, поэтому ведущий `/` в клиентском
+пути означает корень дерева, а не корень ФС — `target = "root@<peer>:/"`
+указывает ровно на `$HA_SYNC_DIR` пира. Форма
+`root@<peer>:/var/lib/freeswitch/storage` удваивалась в
+`$HA_SYNC_DIR/var/lib/freeswitch/storage`: push-поток молча строил вложенное
+дерево на приёмной стороне (receiver-режим не умирает, а создаёт
+отсутствующий путь), а seed (sender-режим) умирал жёстким ENOENT
+«post-realpath open failed (race detected)». Конфиг уже инициализированной
+ноды (init-14 больше не перезапустится) сходится к текущему шаблону через
+`--doctor`: перерендер + перезапуск lsyncd при расхождении.
 
 Две ловушки закрываются процедурно:
 
@@ -768,4 +786,5 @@ host repmgr      repmgr     10.0.0.13/32  md5   # witness к себе (conninfo 
 | 0.3.9 | 2026-10-15 | **Hotfix: `--init` упал на шаге 13 — `FATAL: cannot set synchronous_standby_names on local` без причины, а `--join` standby следом упал на шаге 9 (seed media): `Permission denied (publickey,password)`** (стенд fpbx1/fpbx2; отказы связаны). Корни: **(а) причина отказа ALTER SYSTEM глушилась** — `pg_runuser_psql` закрывает stderr (`2>/dev/null`), FATAL уходил без диагностики (класс 0.3.4); **(б) authorized_keys sync-ключа писался только init-шагом 14** — seed standby (join-шаг 9) ходит по SSH на primary сразу после своей регистрации, пока primary ещё стоит на шаге 12/13: крэш шага 13 гарантировал отсутствие authorized_keys. Исправление: `ha_sync_names_write()` — единственный писатель `synchronous_standby_names`: сперва `ALTER SYSTEM`, при отказе сервера — прямая правка `postgresql.auto.conf` + reload + SHOW-верификация (файловый прецедент — standby-ветка `ha_ensure_pg_listen`; root восстанавливает владельца), для удалённого хоста — die с цитированием захваченного stderr psql; `ha_ensure_sync` переписан на неё (обе ветки: set/clear); `ha_write_authorized_keys` добавлен в init-шаги 12 (до ожидания standby) и 13 (self-heal resume с выполненными 1–12 — текущий стенд) — идемпотентно, шаг 14 сохранён. Тесты: +12 (путь ALTER; фолбэк: запись/идемпотентность/сброс; die удалённого отказа цитирует ошибку psql; ha_ensure_sync ON/async через фолбэк; контракты authorized_keys в шагах 12/13 до wait/sync-on) — итого 216 |
 | 0.3.10 | 2026-10-15 | **Hotfix: `--init` упал на шаге 13 — `ALTER SYSTEM` отказал с `ОШИБКА: неверное значение для параметра "synchronous_standby_names": "fpbx-ha-2" … syntax error at or near "-"`, а файловый фолбэк 0.3.9 доложил «the direct postgresql.auto.conf edit did not take effect»** (стенд fpbx1, resume с шага 13). Корень: у `synchronous_standby_names` собственная грамматика, в которой нецитированное имя не может содержать дефис — значение `fpbx-ha-2` нелегально, легальная форма `"fpbx-ha-2"` (двойные кавычки ВНУТРИ значения; §13.3). Оба пути 0.3.9 несли сырое имя: `ALTER SYSTEM` валидирует значение и отказал; фолбэк записал в `postgresql.auto.conf` НЕВАЛИДНУЮ строку — reload её отверг (SHOW не сошёлся → FATAL), а файл стал миной: PostgreSQL primary отказался бы стартовать после любого рестарта/перезагрузки до переустановки шага. Исправление: новая `ha_sync_names_gucval()` — единственный переводчик сырого имени в GUC-форму (имена с дефисами → в двойные кавычки; `''` и `'*'` — complete-значения, цитировать нельзя: `'"*"'` было бы ИМЕНЕМ, а не маской any-standby ветки B2); `ha_sync_names_write()` несёт GUC-форму во всех трёх путях (ALTER SYSTEM, файловая запись, SHOW-верификация); оба пути self-heal — перезаписывают невалидную строку, оставшуюся от упавшего прогона (ALTER SYSTEM заменяет ключ целиком при перезаписи файла; фолбэк sed-ит все sync-строки до записи) — resume с шага 13 чинит всё сам; verbose `ha_ensure_sync` печатает фактическую GUC-форму. Прочее: §13.3 дополнен правилом цитирования. Тесты: +7 (gucval: дефис → в кавычки, простой идентификатор/`*`/пусто → как есть; ALTER-путь цитирует имя в SQL — PSQL_ALTER_SYNC_LOG в стабе; self-heal невалидной строки из упавшего прогона; `*` без кавычек в файле; обновлены 4 проверки 0.3.9 на GUC-форму) — итого 223 |
 | 0.3.11 | 2026-10-16 | **Hotfix: ЧИСТАЯ переустановка на стенде (fpbx1→fpbx3→fpbx2): primary и witness полностью (15/15 и 11/11 — включая sync-on с GUC-цитированием 0.3.10), но join standby упал на шаге 9 (seed media): `rrsync error: post-realpath open failed (race detected): /var/lib/freeswitch/storage/ No such file or directory`**. Корень — ГОНКА ШАГОВ между двумя узлами: standby начинает стриминг уже на join-шаге 7 и сразу идёт на шаг 9 (seed по rrsync), а на primary media-каталог создавал только init-шаг 14 (за wait-шагом 12 и sync-on 13) — на чистой системе его больше НИКТО не создаёт (слой 1 готовит только `recordings/`; ALT-пакет FreeSWITCH — тоже нет). Дополнительно вскрыто по коду rrsync (усиленная ALT-сборка: realpath+open с пином inode против symlink-race): в sender-режиме ENOENT на запрошенном каталоге — жёсткий die; Python `os.path.realpath` нестрогий — отсутствующий путь проходит проверку «unsafe arg» и умирает только на open (потому ENOENT — доказанное отсутствие каталога, а не симлинк: симлинк дал бы «unsafe arg» или ELOOP). Исправление: новая `ha_ensure_sync_dir()` — mkdir + владелец FreeSWITCH (`angie:angie` этого порта — config.sh fs_user; переопределяемо HA_SYNC_DIR_OWNER; root:root каталог молча ломал бы запись войсмейл/факсов/записей) + warn при неудачном chown (не fatal); вызовы: init-шаг 6 (ДО primary register — раньше seed'а не бывает клона, гонка закрыта для любого порядка join), init-шаги 12/13 (self-heal resume со старых state-файлов, паттерн authorized_keys 0.3.9), init-шаг 14 и join-шаг 9 (заменили голый mkdir), prp-шаг 3 (пережившая primary после перестройки — lsyncd не умеет смотреть отсутствующий каталог). Прочее: §8.1 строка 6 дополнена. Тесты: +9 (create/idempotent/chown-warn-not-fatal; контракты: шаг 6 до register, 12/13 self-heal до wait/sync-on, шаг 14 и join-шаг 9 до rsync, repair-primary до lsyncd) — итого 232 |
+| 0.3.12 | 2026-10-16 | **Hotfix: повторный `--join` standby (resume с шага 9 после 0.3.11) упал на seed media СНОВА той же ошибкой `rrsync error: post-realpath open failed (race detected): /var/lib/freeswitch/storage/ No such file or directory`** — хотя каталог на primary давно создан (init-14, 15/15). Переанализ исходника усиленного rrsync (маппинг аргументов в validated_arg): **без флага `-absolute` клиентский путь с ведущим `/` подаётся ОТНОСИТЕЛЬНО корня restricted-дерева** (`arg = args.dir + arg`), старая форма seed `root@peer:$HA_SYNC_DIR/` удваивалась в `$HA_SYNC_DIR/$HA_SYNC_DIR/`; нестрогий `os.path.realpath` не меняет отсутствующий путь, а проверка «unsafe arg» сравнивает его с корнем — префикс совпадает, пропуск; sender-режим умирает на `os.open` с ENOENT, `die()` печатает ИСХОДНЫЙ аргумент клиента (`sys.argv[0] + ' error:'` — префикс сообщения) — дословно ошибка стенда. Воспроизведено живым тестом на СУЩЕСТВУЮЩЕМ корне: абсолютная форма умирает, `:/` — проходит валидацию. Т.е. **seed с абсолютной формой пути не мог пройти НИКОГДА, при любом состоянии каталога**; «гонка шагов» 0.3.11 реальна (первый прогон действительно опередил init-14), но вторична. Та же ошибка сидела в `lsyncd.conf.lua.tpl`: push-таргет `root@peer:$HA_SYNC_DIR` на приёмной стороне тихо создавал ВЛОЖЕННОЕ дерево `$HA_SYNC_DIR/var/lib/freeswitch/storage` — мусор уже лежал на fpbx2 с момента старта lsyncd на fpbx1. Исправление: (1) seed тянет `root@peer:/` — корень restricted-дерева пира; (2) шаблон lsyncd: `source = "$HA_SYNC_DIR/"` (явный слэш содержимого) + `target = "root@peer:/"`; (3) `--doctor` (data-нода, конфиг существует) рендерит по текущему шаблону и при расхождении перезаписывает + перезапускает lsyncd — точка сходимости для уже инициализированных нод, чей init-14 больше не перезапустится; (4) мусорное вложенное дерево на standby стирается самим seed (`--delete` зеркалит чистое дерево primary); (5) die-подсказка seed-шага называет реальные причины (rrsync-корень пира, `--doctor`) вместо неверной «check sshd». ha_ensure_sync_dir (0.3.11) сохранён. Прочее: §6.3 (семантика путей rrsync), §8.2 шаг 9, §10.2 (target/source + абзац о семантике), шапка. Тесты: +8 (контракты формы `:/` для seed и шаблона; негативный контракт — абсолютной формы больше нет; doctor-контракт перерендера+рестарта; ЖИВАЯ семантика rrsync: абсолютная форма воспроизводит смерть стенда на существующем каталоге, «/» проходит валидацию; обновлён рендер-контракт target+source) — итого 240 |
 

@@ -448,6 +448,53 @@ _pl3="$(echo "$_p3" | grep -n 'ha_render_lsyncd_conf' | head -1 | cut -d: -f1)"
 report "repair-primary: media dir ensured before lsyncd" $?
 
 # ---------------------------------------------------------------------------
+echo "== media path form over rrsync (regression 0.3.12) =="
+# The forced rrsync-command on the peer has NO -absolute flag: a client path
+# with a leading '/' is served RELATIVE to the restricted root ($HA_SYNC_DIR)
+# - rrsync maps the arg onto <root><arg>. The pre-0.3.12 seed spec
+# root@peer:$HA_SYNC_DIR/ doubled into $HA_SYNC_DIR/$HA_SYNC_DIR/: realpath
+# is non-strict, the doubled path passed the 'unsafe arg' check and the
+# sender-side open died ENOENT on every pull ('post-realpath open failed
+# (race detected)' - the exact bench death; 0.3.11's step-race was real but
+# secondary: that path form could never succeed). The seed must pull ':/' -
+# the root of the peer's restricted tree. The lsyncd template carries the
+# same fix, and --doctor converges configs rendered by older script
+# versions (an initialized node never re-runs init step 14).
+echo "$_j9" | grep -Fq '"root@$(ha_peer_ip):/"'
+report "join step 9: pulls the rrsync tree root (:/), not an absolute path" $?
+if echo "$_j9" | grep -Fq 'ha_peer_ip):$HA_SYNC_DIR'; then false; else true; fi
+report "join step 9: no absolute \$HA_SYNC_DIR remote spec left" $?
+grep -Fq 'source    = "@@SYNC_DIR@@/"' "$RES/lsyncd.conf.lua.tpl"
+report "lsyncd template: source pins the contents slash" $?
+grep -Fq 'target    = "root@@@PEER_IP@@:/"' "$RES/lsyncd.conf.lua.tpl"
+report "lsyncd template: target is the rrsync tree root (:/)" $?
+_dc="$(sed -n '/^cmd_doctor()/,/^}/p' "$CLI")"
+_dc_ck="$(echo "$_dc" | grep -n 'lsyncd.conf.lua.tpl' | head -1 | cut -d: -f1)"
+_dc_rs="$(echo "$_dc" | grep -n 'systemctl restart "$HA_LSYNCD_SERVICE"' | head -1 | cut -d: -f1)"
+[ -n "$_dc_ck" ] && [ -n "$_dc_rs" ] && [ "$_dc_ck" -lt "$_dc_rs" ]
+report "doctor: re-renders a stale lsyncd config and restarts the daemon" $?
+
+# live rrsync semantics (the same hardened wrapper class ALT ships - skip
+# when the test host has none): the bench's absolute form reproduces the
+# exact bench death; '/' passes validation and reaches the server exec
+_rr_bin="$(command -v rrsync 2>/dev/null || true)"
+[ -z "$_rr_bin" ] && [ -x /usr/bin/rrsync ] && _rr_bin=/usr/bin/rrsync
+rm -rf "$WORK/rr"; mkdir -p "$WORK/rr/root"
+if [ -n "$_rr_bin" ]; then
+    _rr_out="$(SSH_ORIGINAL_COMMAND='rsync --server --sender . /var/lib/freeswitch/storage/' \
+        "$_rr_bin" "$WORK/rr/root" </dev/null 2>&1)"; _rr_rc=$?
+    [ "$_rr_rc" -ne 0 ] && echo "$_rr_out" | grep -q 'post-realpath open failed'
+    report "rrsync live: the absolute path form doubles and dies ENOENT" "$?" "${_rr_out:-}"
+    _rr_out="$(SSH_ORIGINAL_COMMAND='rsync --server --sender . /' \
+        "$_rr_bin" "$WORK/rr/root" </dev/null 2>&1 | tr -d '\0')"
+    if echo "$_rr_out" | grep -q 'post-realpath open failed\|unsafe arg'; then false; else true; fi
+    report "rrsync live: '/' (the restricted tree root) passes validation" "$?" "${_rr_out:-}"
+else
+    report "rrsync live: the absolute path form doubles and dies ENOENT (skipped: no rrsync on the test host)" 0
+    report "rrsync live: '/' (the restricted tree root) passes validation (skipped: no rrsync on the test host)" 0
+fi
+
+# ---------------------------------------------------------------------------
 echo "== cluster.conf generation + loading =="
 lib_run '
     HA_CLUSTER_NAME="t-cluster"
