@@ -448,26 +448,30 @@ _pl3="$(echo "$_p3" | grep -n 'ha_render_lsyncd_conf' | head -1 | cut -d: -f1)"
 report "repair-primary: media dir ensured before lsyncd" $?
 
 # ---------------------------------------------------------------------------
-echo "== media path form over rrsync (regression 0.3.12) =="
-# The forced rrsync-command on the peer has NO -absolute flag: a client path
-# with a leading '/' is served RELATIVE to the restricted root ($HA_SYNC_DIR)
-# - rrsync maps the arg onto <root><arg>. The pre-0.3.12 seed spec
-# root@peer:$HA_SYNC_DIR/ doubled into $HA_SYNC_DIR/$HA_SYNC_DIR/: realpath
-# is non-strict, the doubled path passed the 'unsafe arg' check and the
-# sender-side open died ENOENT on every pull ('post-realpath open failed
-# (race detected)' - the exact bench death; 0.3.11's step-race was real but
-# secondary: that path form could never succeed). The seed must pull ':/' -
-# the root of the peer's restricted tree. The lsyncd template carries the
-# same fix, and --doctor converges configs rendered by older script
-# versions (an initialized node never re-runs init step 14).
-echo "$_j9" | grep -Fq '"root@$(ha_peer_ip):/"'
-report "join step 9: pulls the rrsync tree root (:/), not an absolute path" $?
+echo "== media path form over rrsync (regression 0.3.13) =="
+# The hardened rrsync family has TWO incompatible client-path mappings:
+# newer builds PREPEND the restricted root onto a leading-slash arg, but
+# the ALT-shipped snapshot LSTRIPS the slash and serves the rest against
+# its CWD (= the restricted root). On the ALT build '/' arrives as '' and
+# realpath('') = CWD = the root itself fails the startswith(dir + '/')
+# containment check ('unsafe arg: / [\'\', ...]' - the 0.3.13 bench death,
+# reproduced live on the stand-lstrip variant); the pre-0.3.12 absolute
+# form doubled into $HA_SYNC_DIR/$HA_SYNC_DIR/ and died ENOENT at the
+# sender open ('post-realpath open failed'). The ONLY form valid on every
+# variant is the bare dot - validated_arg skips it entirely ('arg != .'),
+# and '.' resolves to CWD = the peer's restricted tree root. The seed
+# pulls ':.', the lsyncd template pushes to ':.', and --doctor converges
+# configs rendered by older script versions.
+echo "$_j9" | grep -Fq '"root@$(ha_peer_ip):."'
+report "join step 9: pulls the rrsync tree root as the bare dot (:.)" $?
 if echo "$_j9" | grep -Fq 'ha_peer_ip):$HA_SYNC_DIR'; then false; else true; fi
 report "join step 9: no absolute \$HA_SYNC_DIR remote spec left" $?
+if echo "$_j9" | grep -Fq '"root@$(ha_peer_ip):/"'; then false; else true; fi
+report "join step 9: the 0.3.12 ':/' form is gone (dies on the ALT rrsync)" $?
 grep -Fq 'source    = "@@SYNC_DIR@@/"' "$RES/lsyncd.conf.lua.tpl"
 report "lsyncd template: source pins the contents slash" $?
-grep -Fq 'target    = "root@@@PEER_IP@@:/"' "$RES/lsyncd.conf.lua.tpl"
-report "lsyncd template: target is the rrsync tree root (:/)" $?
+grep -Fq 'target    = "root@@@PEER_IP@@:."' "$RES/lsyncd.conf.lua.tpl"
+report "lsyncd template: target is the bare dot (:.)" $?
 _dc="$(sed -n '/^cmd_doctor()/,/^}/p' "$CLI")"
 _dc_ck="$(echo "$_dc" | grep -n 'lsyncd.conf.lua.tpl' | head -1 | cut -d: -f1)"
 _dc_rs="$(echo "$_dc" | grep -n 'systemctl restart "$HA_LSYNCD_SERVICE"' | head -1 | cut -d: -f1)"
@@ -475,24 +479,77 @@ _dc_rs="$(echo "$_dc" | grep -n 'systemctl restart "$HA_LSYNCD_SERVICE"' | head 
 report "doctor: re-renders a stale lsyncd config and restarts the daemon" $?
 
 # live rrsync semantics (the same hardened wrapper class ALT ships - skip
-# when the test host has none): the bench's absolute form reproduces the
-# exact bench death; '/' passes validation and reaches the server exec
+# when the test host has none): the family has TWO arg mappings - newer
+# builds prepend the restricted root, the ALT snapshot LSTRIPS the leading
+# slash (CWD-relative), so '/' is VARIANT-DEPENDENT: it passed the 0.3.12
+# container test (prepend build) and died on the bench with "unsafe arg:
+# / ['', ...]" (lstrip build, reproduced locally on the stand-matching
+# master snapshot). The script must rely ONLY on the bare dot, which
+# validated_arg skips entirely - assert both live.
 _rr_bin="$(command -v rrsync 2>/dev/null || true)"
 [ -z "$_rr_bin" ] && [ -x /usr/bin/rrsync ] && _rr_bin=/usr/bin/rrsync
 rm -rf "$WORK/rr"; mkdir -p "$WORK/rr/root"
 if [ -n "$_rr_bin" ]; then
     _rr_out="$(SSH_ORIGINAL_COMMAND='rsync --server --sender . /var/lib/freeswitch/storage/' \
         "$_rr_bin" "$WORK/rr/root" </dev/null 2>&1)"; _rr_rc=$?
-    [ "$_rr_rc" -ne 0 ] && echo "$_rr_out" | grep -q 'post-realpath open failed'
-    report "rrsync live: the absolute path form doubles and dies ENOENT" "$?" "${_rr_out:-}"
-    _rr_out="$(SSH_ORIGINAL_COMMAND='rsync --server --sender . /' \
+    [ "$_rr_rc" -ne 0 ] && echo "$_rr_out" | grep -q 'post-realpath open failed\|unsafe arg'
+    report "rrsync live: the absolute path form never survives validation" "$?" "${_rr_out:-}"
+    _rr_out="$(SSH_ORIGINAL_COMMAND='rsync --server --sender -a --delete . .' \
         "$_rr_bin" "$WORK/rr/root" </dev/null 2>&1 | tr -d '\0')"
-    if echo "$_rr_out" | grep -q 'post-realpath open failed\|unsafe arg'; then false; else true; fi
-    report "rrsync live: '/' (the restricted tree root) passes validation" "$?" "${_rr_out:-}"
+    if echo "$_rr_out" | grep -q 'post-realpath open failed\|unsafe arg\|does not run rsync'; then false; else true; fi
+    report "rrsync live: the bare dot (the 0.3.13 client form) passes validation" "$?" "${_rr_out:-}"
 else
-    report "rrsync live: the absolute path form doubles and dies ENOENT (skipped: no rrsync on the test host)" 0
-    report "rrsync live: '/' (the restricted tree root) passes validation (skipped: no rrsync on the test host)" 0
+    report "rrsync live: the absolute path form never survives validation (skipped: no rrsync on the test host)" 0
+    report "rrsync live: the bare dot (the 0.3.13 client form) passes validation (skipped: no rrsync on the test host)" 0
 fi
+
+# ---------------------------------------------------------------------------
+echo "== authorized_keys convergence (regression 0.3.13) =="
+# The bench: the standby's sync-key line was rejected by sshd preauth
+# ('invalid key option string') - the peer's pushes died. The writer must
+# (a) purge ANY stray line carrying the sync key outside the managed block
+# (interrupted write / older version) and (b) re-add exactly one valid
+# line with the forced rrsync command, leaving foreign keys untouched.
+echo '#!/bin/sh' > "$WORK/localbin/rrsync"; chmod +x "$WORK/localbin/rrsync"
+mkdir -p "$WORK/sshdir"
+{
+    echo 'ssh-rsa AAAAOLDOTHERKEY admin@workstation'
+    printf 'from="10.0.0.11",command="/bad unbalanced ssh-ed25519 AAAAFAKEPUBLICKEY fusionpbx-ha-sync\n'
+} > "$WORK/sshdir/authorized_keys"
+lib_run "HA_SYNC_SSH_DIR='$WORK/sshdir'; HA_SYNC_PUBLIC_KEY='ssh-ed25519 AAAAFAKEPUBLICKEY fusionpbx-ha-sync'; HA_SYNC_DIR='/var/lib/freeswitch/storage'; HA_NODE1_IP='10.0.0.11'; HA_NODE2_IP='10.0.0.12'; ha_write_authorized_keys && echo written"
+echo "$OUT" | grep -q '^written$'
+report "writer: succeeds with a broken pre-existing sync-key line" "$?" "$OUT"
+[ "$(grep -c 'AAAAFAKEPUBLICKEY' "$WORK/sshdir/authorized_keys")" = "1" ]
+report "writer: exactly ONE line carries the sync key (stray purged)" $?
+grep -q '^from="10.0.0.11,10.0.0.12",command="' "$WORK/sshdir/authorized_keys"
+report "writer: fresh line carries the forced rrsync command" $?
+grep -q 'AAAAOLDOTHERKEY' "$WORK/sshdir/authorized_keys"
+report "writer: foreign admin key untouched" $?
+awk '/BEGIN fusionpbx-ha/{f=1} f && /AAAAFAKEPUBLICKEY/{print; exit}' "$WORK/sshdir/authorized_keys" | grep -q '^from='
+report "writer: sync-key line lives inside the managed block" $?
+lib_run "HA_SYNC_SSH_DIR='$WORK/sshdir'; HA_SYNC_PUBLIC_KEY='ssh-ed25519 AAAAFAKEPUBLICKEY fusionpbx-ha-sync'; HA_SYNC_DIR='/var/lib/freeswitch/storage'; HA_NODE1_IP='10.0.0.11'; HA_NODE2_IP='10.0.0.12'; ha_write_authorized_keys && echo again"
+[ "$(grep -c 'AAAAFAKEPUBLICKEY' "$WORK/sshdir/authorized_keys")" = "1" ] && echo "$OUT" | grep -q '^again$'
+report "writer: idempotent - re-run keeps exactly one sync-key line" $?
+
+# 0.3.13 source contracts: the 0.3.12 doctor truncated the lsyncd config
+# to zero bytes (a missing '$' made cmp/cat/rm read a literal '_dc_lsyn_new'
+# file - 'cat: _dc_lsyn_new: No such file or directory' while the redirect
+# already truncated the real config), and it must converge authorized_keys
+# + self-heal repmgrd/lsyncd.
+if grep -Fq 'cat "$_dc_lsyn_new"' "$CLI" && ! grep -Fq 'cat "_dc_lsyn_new"' "$CLI"; then true; else false; fi
+report "doctor: lsyncd re-render uses the \$_dc_lsyn_new variable (no truncation)" $?
+echo "$_dc" | grep -q 'ha_write_authorized_keys'
+report "doctor: authorized_keys convergence check present" $?
+echo "$_dc" | grep -q 'ha_install_repmgr_dropin'
+report "doctor: repmgrd self-heal installs the boot-ordering drop-in" $?
+grep -q 'After=$HA_PG_SERVICE.service' "$LIB"
+report "drop-in: repmgrd ordered after local postgresql" $?
+_cj="$(sed -n '/^cmd_join()/,/^}/p' "$CLI")"
+echo "$_cj" | grep -q 'ha_write_authorized_keys' && echo "$_cj" | grep -Fq 'command=join-standby'
+report "cmd_join: authorized_keys converged on resume (join-standby state)" $?
+_j3="$(sed -n '/^join_step_3_packages()/,/^}/p' "$CLI")"
+echo "$_j3" | grep -q 'rsync curl' && echo "$_j3" | grep -q 'ha_write_authorized_keys'
+report "join step 3: sync-key line re-rendered once rsync is installed" $?
 
 # ---------------------------------------------------------------------------
 echo "== cluster.conf generation + loading =="

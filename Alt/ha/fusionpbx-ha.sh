@@ -541,6 +541,12 @@ join_step_3_packages() {
     else
         pkg_install_required "postgresql${HA_PG_VERSION}-repmgr" haproxy lsyncd sudo \
             python3 python3-module-psycopg2 openssh-clients rsync curl
+        # 0.3.13: step 2 wrote the sync-key line BEFORE rsync existed on
+        # this node - without rrsync it carries no forced command at all.
+        # Re-render now that the package (and its rrsync helper) is in
+        # place. Idempotent; on resume this step is skipped and the
+        # cmd_join prelude does the convergence instead.
+        ha_write_authorized_keys
     fi
 }
 
@@ -632,23 +638,29 @@ join_step_9_seed_media() {
     verbose "  pulling the media tree from $(ha_peer_name) (seed BEFORE the sync"
     verbose "  daemon starts - protects the peer copy from being wiped by an"
     verbose "  empty local tree; DESIGN.md 10.2)"
-    # The peer's forced rrsync-command carries NO -absolute flag: every
-    # client path is served RELATIVE to the restricted root ($HA_SYNC_DIR) -
-    # a leading '/' means the tree root itself (rrsync maps the arg onto
-    # <restricted-root><arg>). The pre-0.3.12 spec "root@peer:$HA_SYNC_DIR/"
-    # therefore doubled into $HA_SYNC_DIR/$HA_SYNC_DIR/: os.path.realpath is
-    # non-strict, so the doubled path sailed through the 'unsafe arg' check
-    # and the sender-side open died ENOENT on EVERY pull ('post-realpath
-    # open failed (race detected)' - the exact bench death). The 0.3.11
-    # step-race was real but secondary: that path form could never succeed.
-    # ':/' is the root of the peer's restricted tree (regression 0.3.12).
+    # The peer's forced rrsync-command carries NO -absolute flag, and the
+    # hardened rrsync family has TWO incompatible client-path mappings:
+    # newer builds PREPEND the restricted root onto a leading-slash arg,
+    # but the ALT-shipped snapshot LSTRIPS the slash and serves the rest
+    # against its CWD (= the restricted root - rrsync chdirs first). On
+    # that ALT build neither pre-0.3.13 form can ever work: ':/' arrives
+    # as '' and realpath('') = CWD = the root ITSELF, which fails the
+    # startswith(dir + '/') containment check - die "unsafe arg: /
+    # ['', ...]" (the 0.3.13 bench death); the absolute form doubles into
+    # $HA_SYNC_DIR/$HA_SYNC_DIR/ and the sender open dies ENOENT
+    # ('post-realpath open failed' - the 0.3.11/0.3.12 bench death). The
+    # ONLY client form valid on every rrsync variant is the bare dot:
+    # validated_arg skips it entirely ('arg != .'), and '.' resolves to
+    # CWD = the peer's restricted tree root (regression 0.3.13).
     rsync -a --delete \
         -e "ssh -i $HA_SYNC_KEY -o UserKnownHostsFile=$HA_KNOWN_HOSTS -o StrictHostKeyChecking=accept-new -o BatchMode=yes" \
-        "root@$(ha_peer_ip):/" "$HA_SYNC_DIR/" \
+        "root@$(ha_peer_ip):." "$HA_SYNC_DIR/" \
         || die "media seed failed - the pull needs sshd up on $(ha_peer_ip), the sync
 key in root's authorized_keys there (rrsync-restricted root: $HA_SYNC_DIR) and
 that dir existing on the peer
-(hint: 'fusionpbx-ha.sh --doctor' on $(ha_peer_ip); systemctl status sshd there)"
+(hint: 'fusionpbx-ha.sh --doctor' on $(ha_peer_ip); if the key is rejected:
+journalctl -u sshd -n 20 on $(ha_peer_ip) shows 'invalid key option string' - the
+sync-key line there must be re-rendered by a 0.3.13+ --doctor)"
     verbose "  media tree seeded: $HA_SYNC_DIR"
 }
 
@@ -1149,6 +1161,20 @@ Check: systemctl status haproxy $HA_AGENT_UNIT_NAME"
     for _dc_svc in $_dc_set; do
         if svc_active "$_dc_svc" 2>/dev/null; then
             _dr_ok "service $_dc_svc active"
+        elif [ "$_dc_svc" = "$HA_REPMGRD_SERVICE" ] || [ "$_dc_svc" = "$HA_LSYNCD_SERVICE" ]; then
+            # self-heal (0.3.13): on the bench repmgrd was dead after a
+            # node reboot while postgresql was up (the ALT unit can lose
+            # the boot race), and lsyncd was left dead by the 0.3.12
+            # doctor bug that truncated its config. Both are always-on
+            # daemons of a joined node: install the ordering drop-in
+            # (repmgrd only), start back, re-check.
+            [ "$_dc_svc" = "$HA_REPMGRD_SERVICE" ] && ha_install_repmgr_dropin
+            if systemctl start "$_dc_svc" 2>/dev/null && sleep 2 \
+                && svc_active "$_dc_svc" 2>/dev/null; then
+                _dr_ok "service $_dc_svc started (was inactive - check why: journalctl -u $_dc_svc -n 30)"
+            else
+                _dr_fail "service $_dc_svc NOT active and a start attempt failed (check: journalctl -u $_dc_svc -n 30)"
+            fi
         else
             _dr_fail "service $_dc_svc NOT active"
         fi
@@ -1176,17 +1202,36 @@ Check: systemctl status haproxy $HA_AGENT_UNIT_NAME"
             _dc_lsyn_new="$HA_ETC_DIR/.lsyncd.conf.doctor"
             ha_render "$HA_RES_DIR/lsyncd.conf.lua.tpl" "$_dc_lsyn_new" \
                 "SYNC_DIR=$HA_SYNC_DIR" "SYNC_DELAY=$HA_SYNC_DELAY" "PEER_IP=$(ha_peer_ip)"
-            if cmp -s "_dc_lsyn_new" "$HA_LSYNCD_CONF"; then
+            if cmp -s "$_dc_lsyn_new" "$HA_LSYNCD_CONF"; then
                 _dr_ok "lsyncd config matches the current template"
             else
-                cat "_dc_lsyn_new" > "$HA_LSYNCD_CONF"
+                cat "$_dc_lsyn_new" > "$HA_LSYNCD_CONF"
                 if systemctl restart "$HA_LSYNCD_SERVICE" 2>/dev/null; then
                     _dr_warn "lsyncd config was stale (older script version) - re-rendered, lsyncd restarted"
                 else
                     _dr_fail "lsyncd config was stale - re-rendered, but the lsyncd restart failed (check: journalctl -u $HA_LSYNCD_SERVICE -n 30)"
                 fi
             fi
-            rm -f "_dc_lsyn_new"
+            rm -f "$_dc_lsyn_new"
+        fi
+
+        # 8c. authorized_keys conformance (data nodes): the sync-key line
+        # is written ONCE (join step 2 / init steps 12-14). A line left by
+        # an older script, an interrupted write or a pre-rrsync write can
+        # leave the peer's rsync/lsyncd pushes rejected outright (sshd:
+        # 'invalid key option string'). Same convergence philosophy as 8b:
+        # re-render idempotently, report drift. Root only - a read-only
+        # doctor run by a mere mortal must not die on /root/.ssh perms.
+        if [ -n "${HA_SYNC_PUBLIC_KEY:-}" ] && [ "$(id -u)" = "0" ]; then
+            _dc_ak_file="${HA_SYNC_SSH_DIR:-/root/.ssh}/authorized_keys"
+            _dc_ak_sum="$(md5sum "$_dc_ak_file" 2>/dev/null | awk '{print $1}')"
+            ha_write_authorized_keys
+            if [ -n "$_dc_ak_sum" ] \
+                && [ "$(md5sum "$_dc_ak_file" 2>/dev/null | awk '{print $1}')" = "$_dc_ak_sum" ]; then
+                _dr_ok "authorized_keys: sync-key line matches the current pattern"
+            else
+                _dr_warn "authorized_keys: sync-key line re-rendered (was stale, broken or missing)"
+            fi
         fi
         if cmd_exists sshd; then :; else _dr_warn "cannot verify sshd command"; fi
         # inotify budget for large recording trees (design question B7)
@@ -1353,6 +1398,18 @@ Maintenance of a joined node is done with: fusionpbx-ha.sh --repair"
     HA_JOIN_ROLE="standby"
     [ "$HA_NODE_ID" = "3" ] && HA_JOIN_ROLE="witness"
     ha_apply_proxy
+
+    # Resume convergence (0.3.13): a join-standby state file means an
+    # earlier attempt ran - possibly with an older script whose sync-key
+    # line sshd now refuses to parse ('invalid key option string' in the
+    # peer's sshd log - its pushes die preauth), or written before step 3
+    # installed rrsync (no forced command at all). Step 2 is skipped on
+    # resume, so converge the line HERE (idempotent: managed block +
+    # stray-line purge inside ha_write_authorized_keys).
+    if [ "$HA_NODE_ID" != "3" ] && [ -f "$HA_STATE_FILE" ] \
+        && grep -q '^command=join-standby$' "$HA_STATE_FILE" 2>/dev/null; then
+        ha_write_authorized_keys
+    fi
 
     if [ "$HA_NODE_ID" = "3" ]; then
         ha_run_sequence "join-witness" \

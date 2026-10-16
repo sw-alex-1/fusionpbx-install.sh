@@ -156,6 +156,25 @@ svc_stop() {
     fi
 }
 
+# 0.3.13: on the bench repmgrd was dead after a node reboot while
+# postgresql was up - the ALT unit can lose the boot race. A tiny drop-in
+# serializes the start order; a no-op if the unit already orders itself.
+ha_install_repmgr_dropin() {
+    _hrd_unit_dir="/etc/systemd/system/${HA_REPMGRD_SERVICE}.service.d"
+    _hrd_conf="$_hrd_unit_dir/fusionpbx-ha.conf"
+    [ -f "$_hrd_conf" ] && return 0
+    mkdir -p "$_hrd_unit_dir" 2>/dev/null || { warn "cannot create $_hrd_unit_dir - repmgrd keeps its stock boot ordering"; return 1; }
+    cat > "$_hrd_conf" <<DROPIN
+# fusionpbx-ha: start repmgrd only after local PostgreSQL (boot race, 0.3.13)
+[Unit]
+After=$HA_PG_SERVICE.service
+Wants=$HA_PG_SERVICE.service
+DROPIN
+    systemctl daemon-reload 2>/dev/null || true
+    verbose "  repmgrd boot ordering drop-in installed: $_hrd_conf"
+    return 0
+}
+
 # =============================================================================
 # Packages (APT-RPM, layer-1 util.sh pattern)
 # =============================================================================
@@ -978,10 +997,19 @@ ha_ensure_sync_dir() {
 }
 
 ha_write_authorized_keys() {
-    _hak_sshdir=/root/.ssh
+    _hak_sshdir="${HA_SYNC_SSH_DIR:-/root/.ssh}"
     mkdir -p "$_hak_sshdir"
     chmod 700 "$_hak_sshdir" 2>/dev/null || true
     touch "$_hak_sshdir/authorized_keys"
+    # Purge ANY line outside the managed block that carries the sync key
+    # (0.3.13): a line left by an older script version or an interrupted
+    # write can be unparseable for sshd - the peer's rsync/lsyncd pushes
+    # are then rejected preauth ('invalid key option string' in its sshd
+    # log). The key blob is unique to this cluster; the fresh line is
+    # re-added below inside the managed block.
+    _hak_keyblob="$(printf '%s' "$HA_SYNC_PUBLIC_KEY" | awk '{print $2}')"
+    [ -n "$_hak_keyblob" ] \
+        && sed -i "\|${_hak_keyblob}|d" "$_hak_sshdir/authorized_keys" 2>/dev/null
     _hak_rrsync="$(ha_install_rrsync)"
     if [ -n "$_hak_rrsync" ]; then
         _hak_restrict="from=\"$(ha_node_ip 1),$(ha_node_ip 2)\",command=\"$_hak_rrsync $HA_SYNC_DIR\",no-pty,no-agent-forwarding,no-X11-forwarding,no-port-forwarding"

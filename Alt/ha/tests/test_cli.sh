@@ -230,6 +230,9 @@ ha_cli() {
         export HA_PROMOTE_SH="$WORK/lib/promote.sh"
         export HA_HAPROXY_MAIN="$WORK/haproxy.d/main.cfg"
         export HA_HOSTS_FILE="$WORK/hosts-cli"
+        # 0.3.13: --doctor re-renders the sync-key line - keep it in the
+        # sandbox (never the real /root/.ssh, even when tests run as root)
+        export HA_SYNC_SSH_DIR="$WORK/sshdir"
         # cluster-firewall persistence target (0.3.6): sandbox-safe
         export HA_IPTABLES_CONF="$WORK/iptables.rules"
         # default role-agent answers: node1 primary, node2 standby

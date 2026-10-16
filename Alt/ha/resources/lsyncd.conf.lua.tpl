@@ -8,14 +8,17 @@
 --
 -- delete=true propagates deletions made in the UI to the peer node.
 -- The receiving side is restricted by the forced rrsync-command in
--- authorized_keys (see DESIGN.md section 6.3): it runs WITHOUT -absolute,
--- so every remote path is served RELATIVE to the restricted root
--- ($HA_SYNC_DIR) - a leading '/' IS the tree root. The target is therefore
--- 'root@<peer>:/' (the tree root itself); the pre-0.3.12 form
--- 'root@<peer>:/var/lib/freeswitch/storage' DOUBLED on the peer into
--- $HA_SYNC_DIR/var/lib/freeswitch/storage and silently built a nested
--- tree (regression 0.3.12). The trailing '/' on the source pins the
--- contents-sync semantics regardless of how lsyncd normalizes it.
+-- authorized_keys (see DESIGN.md section 6.3). The hardened rrsync
+-- family has TWO client-path mappings and the ALT-shipped build serves
+-- a leading-slash path against its CWD (= the restricted root, rrsync
+-- chdirs first): there '/' arrives as '' and realpath('') = CWD = the
+-- root itself fails the containment check ('unsafe arg' - the 0.3.13
+-- bench death), while the pre-0.3.12 absolute target doubled into a
+-- nested tree on the peer. The only form valid on EVERY rrsync variant
+-- is the bare dot: rrsync skips it in validation ('arg != .') and
+-- resolves it to CWD = the peer's restricted tree root. The trailing
+-- '/' on the source pins the contents-sync semantics regardless of how
+-- lsyncd normalizes it.
 --
 -- Unit (lsyncd.service, ALT RPM 2.3.1-alt2) hardcodes this exact path.
 
@@ -29,7 +32,7 @@ settings {
 sync {
         default.rsync,
         source    = "@@SYNC_DIR@@/",
-        target    = "root@@@PEER_IP@@:/",
+        target    = "root@@@PEER_IP@@:.",
         delay     = @@SYNC_DELAY@@,
         delete    = true,
         rsync     = {
