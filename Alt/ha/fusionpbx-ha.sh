@@ -341,6 +341,14 @@ init_step_6_repmgr_conf() {
     ha_render_repmgr_conf primary
     ha_install_promote_sh
     ha_install_sudoers
+    # the standby's media seed (join step 9) pulls $HA_SYNC_DIR over rrsync
+    # the moment it starts streaming - LONG before init reaches the media
+    # sync setup (step 14) that used to be the dir's only creator: on the
+    # real bench the seed won the race and rrsync died 'post-realpath open
+    # failed (race detected): ... No such file or directory'. Ensured HERE
+    # so it exists before the primary register (step 7) - no standby can
+    # seed earlier than it can clone (regression 0.3.11).
+    ha_ensure_sync_dir
     verbose "  repmgr configuration written: $HA_REPMGR_CONF (role: primary)"
 }
 
@@ -400,6 +408,10 @@ init_poll_standby_streaming() {
 init_step_12_wait_standby() {
     # same self-heal as step 11 (regression 0.3.6)
     ha_ensure_cluster_firewall
+    # resume self-heal (regression 0.3.11): a resume from an old state file
+    # skips step 6 - the media dir must exist before the standby starts
+    # streaming (its join step 9 seeds from it immediately)
+    ha_ensure_sync_dir
     # the standby's join step 9 (media seed) SSHes into THIS node with the
     # sync key while we are still waiting here - authorized_keys cannot
     # wait for step 14: on the real bench step 13 crashed, 14 never ran and
@@ -416,12 +428,15 @@ init_step_13_sync_on() {
     # steps 1-12 done and authorized_keys still unwritten (step 14 business)
     # while the standby's media seed was already failing - re-apply it first
     ha_write_authorized_keys
+    # resume self-heal (regression 0.3.11): same for the media dir itself -
+    # the standby's seed rsync reads it through rrsync on THIS node
+    ha_ensure_sync_dir
     ha_ensure_sync local
 }
 
 init_step_14_sync_setup() {
     ha_write_authorized_keys
-    mkdir -p "$HA_SYNC_DIR" 2>/dev/null || die "cannot create $HA_SYNC_DIR"
+    ha_ensure_sync_dir
     touch "$HA_KNOWN_HOSTS" && chmod 600 "$HA_KNOWN_HOSTS"
     if cmd_exists ssh-keyscan; then
         ssh-keyscan -t ed25519 "$(ha_node_ip 2)" >> "$HA_KNOWN_HOSTS" 2>/dev/null \
@@ -613,7 +628,7 @@ join_step_8_repoint_dsn() {
 }
 
 join_step_9_seed_media() {
-    mkdir -p "$HA_SYNC_DIR" 2>/dev/null || die "cannot create $HA_SYNC_DIR"
+    ha_ensure_sync_dir
     verbose "  pulling the media tree from $(ha_peer_name) (seed BEFORE the sync"
     verbose "  daemon starts - protects the peer copy from being wiped by an"
     verbose "  empty local tree; DESIGN.md 10.2)"
@@ -932,6 +947,9 @@ prp_step_3_services() {
         || die "haproxy configuration is invalid"
     svc_enable_start "$HA_HAPROXY_SERVICE"
     svc_enable_start "$HA_REPMGRD_SERVICE"
+    # a rebuilt primary may have lost the media tree - lsyncd cannot watch
+    # a missing dir (regression 0.3.11)
+    ha_ensure_sync_dir
     ha_render_lsyncd_conf "$(ha_peer_ip)"
     svc_enable_start "$HA_LSYNCD_SERVICE"
     verbose "  all services re-verified"

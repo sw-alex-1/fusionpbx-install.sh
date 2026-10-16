@@ -390,9 +390,62 @@ report "init step 12: authorized_keys before the standby wait" $?
 
 _s13="$(sed -n '/^init_step_13_sync_on()/,/^}/p' "$CLI")"
 _ak13="$(echo "$_s13" | grep -n 'ha_write_authorized_keys' | head -1 | cut -d: -f1)"
-_es13="$(echo "$_s13" | grep -n 'ha_ensure_sync' | head -1 | cut -d: -f1)"
+# 'ha_ensure_sync local' - NOT the bare 'ha_ensure_sync': since 0.3.11 the
+# body also calls ha_ensure_sync_dir, which would shadow the sync-on call
+# in a head -1 match
+_es13="$(echo "$_s13" | grep -n 'ha_ensure_sync local' | head -1 | cut -d: -f1)"
 [ -n "$_ak13" ] && [ -n "$_es13" ] && [ "$_ak13" -lt "$_es13" ]
 report "init step 13: authorized_keys self-heal before sync-on" $?
+
+# ---------------------------------------------------------------------------
+echo "== media sync dir (regression 0.3.11) =="
+# layer 1 never creates /var/lib/freeswitch/storage (it only prepares
+# recordings/), and the standby's media seed (join step 9) reads it through
+# rrsync on the primary the MOMENT it starts streaming - on the real bench
+# it won the race against init step 14 (the only creator): rrsync died
+# 'post-realpath open failed (race detected): ... No such file or directory'.
+# ha_ensure_sync_dir must create the dir AND give it the FreeSWITCH runtime
+# ownership (angie on this port) - a root:root media dir silently breaks
+# voicemail/fax/recording writes.
+rm -rf "$WORK/media"
+lib_run "HA_SYNC_DIR='$WORK/media'; HA_SYNC_DIR_OWNER='root:root'; ha_ensure_sync_dir && echo ensured"
+echo "$OUT" | grep -q '^ensured$' && [ -d "$WORK/media" ]
+report "ensure sync dir: creates the media dir" "$?" "$OUT"
+
+lib_run "HA_SYNC_DIR='$WORK/media'; HA_SYNC_DIR_OWNER='root:root'; ha_ensure_sync_dir && echo ensured"
+echo "$OUT" | grep -q '^ensured$'
+report "ensure sync dir: idempotent on an existing dir" "$?" "$OUT"
+
+lib_run "HA_SYNC_DIR='$WORK/media2'; HA_SYNC_DIR_OWNER='no-such-user:no-such-group'; ha_ensure_sync_dir && echo ensured"
+echo "$OUT" | grep -q '^ensured$' && echo "$OUT" | grep -q 'cannot chown'
+report "ensure sync dir: chown failure is a warn, not fatal" "$?" "$OUT"
+
+# CLI source-order contracts: the media dir must exist on the primary
+# BEFORE the standby's seed can pull it - step 6 ensures it ahead of the
+# primary register, steps 12/13 self-heal resumes, step 14 and the join
+# seed keep it, the surviving-primary repair re-ensures it before lsyncd
+_s6="$(sed -n '/^init_step_6_repmgr_conf()/,/^}/p' "$CLI")"
+echo "$_s6" | grep -q 'ha_ensure_sync_dir'
+report "init step 6: media dir ensured before the primary register" $?
+_md12="$(echo "$_s12" | grep -n 'ha_ensure_sync_dir' | head -1 | cut -d: -f1)"
+[ -n "$_md12" ] && [ "$_md12" -lt "$_aw12" ]
+report "init step 12: media dir self-heal before the standby wait" $?
+_md13="$(echo "$_s13" | grep -n 'ha_ensure_sync_dir' | head -1 | cut -d: -f1)"
+[ -n "$_md13" ] && [ "$_md13" -lt "$_es13" ]
+report "init step 13: media dir self-heal before sync-on" $?
+_s14="$(sed -n '/^init_step_14_sync_setup()/,/^}/p' "$CLI")"
+echo "$_s14" | grep -q 'ha_ensure_sync_dir'
+report "init step 14: media dir ensured (kept)" $?
+_j9="$(sed -n '/^join_step_9_seed_media()/,/^}/p' "$CLI")"
+_jr9="$(echo "$_j9" | grep -n 'ha_ensure_sync_dir' | head -1 | cut -d: -f1)"
+_rs9="$(echo "$_j9" | grep -n 'rsync ' | head -1 | cut -d: -f1)"
+[ -n "$_jr9" ] && [ -n "$_rs9" ] && [ "$_jr9" -lt "$_rs9" ]
+report "join step 9: local media dir ensured before the seed rsync" $?
+_p3="$(sed -n '/^prp_step_3_services()/,/^}/p' "$CLI")"
+_pd3="$(echo "$_p3" | grep -n 'ha_ensure_sync_dir' | head -1 | cut -d: -f1)"
+_pl3="$(echo "$_p3" | grep -n 'ha_render_lsyncd_conf' | head -1 | cut -d: -f1)"
+[ -n "$_pd3" ] && [ -n "$_pl3" ] && [ "$_pd3" -lt "$_pl3" ]
+report "repair-primary: media dir ensured before lsyncd" $?
 
 # ---------------------------------------------------------------------------
 echo "== cluster.conf generation + loading =="

@@ -959,6 +959,24 @@ $(ha_node_ip 3) $(ha_node_name 3)"
     verbose "  $HA_HOSTS_FILE: cluster names added"
 }
 
+# Media sync dir (regression 0.3.11): layer 1 never creates
+# /var/lib/freeswitch/storage (it only prepares recordings/), so this
+# script is its only creator - and the standby's media seed (join step 9)
+# reads it through rrsync on the primary the MOMENT it starts streaming,
+# which on the real bench raced ahead of init step 14 (the old creator):
+# rrsync died 'post-realpath open failed (race detected): ... No such file
+# or directory' (the hardened ALT rrsync refuses a missing sender dir).
+# Ensure it EARLY (init step 6, before the primary register - no standby
+# can seed before it can clone) and at every consumer. Also sets the
+# FreeSWITCH runtime ownership (angie on this ALT port - layer-1
+# config.sh fs_user; overridable via HA_SYNC_DIR_OWNER): a root:root
+# media dir would silently break voicemail/fax/recording writes.
+ha_ensure_sync_dir() {
+    mkdir -p "$HA_SYNC_DIR" 2>/dev/null || die "cannot create $HA_SYNC_DIR"
+    chown "${HA_SYNC_DIR_OWNER:-angie:angie}" "$HA_SYNC_DIR" 2>/dev/null \
+        || warn "cannot chown $HA_SYNC_DIR to ${HA_SYNC_DIR_OWNER:-angie:angie} - set HA_SYNC_DIR_OWNER if this port uses a different FreeSWITCH user"
+}
+
 ha_write_authorized_keys() {
     _hak_sshdir=/root/.ssh
     mkdir -p "$_hak_sshdir"
