@@ -318,6 +318,20 @@ init_step_5_wal_log_hints() {
         _iwl_need_restart=1
     fi
 
+    # repmgrd's shared memory module joins the SAME restart (regression
+    # 0.3.15): repmgrd calls set/get_local_node_id right after connecting
+    # and dies with exit 1 ('unable to write to shared memory', reason only
+    # in /var/log/repmgr/repmgrd.log) when the library was not preloaded at
+    # server start. The clone inherits the line, the witness gets it in its
+    # own step 4; step 7 starts repmgrd right after this restart
+    if ha_repmgr_preload_active; then
+        verbose "  shared_preload_libraries already includes repmgr (repmgrd-ready)"
+    else
+        ha_repmgr_preload_write
+        verbose "  enabling shared_preload_libraries = 'repmgr' (repmgrd shared memory)"
+        _iwl_need_restart=1
+    fi
+
     if [ "$_iwl_need_restart" = "0" ]; then
         verbose "  nothing to apply - no PostgreSQL restart"
         return 0
@@ -334,7 +348,9 @@ init_step_5_wal_log_hints() {
     [ "$(pg_runuser_psql -tAc "SHOW wal_log_hints" | tr -d ' \r')" = "on" ] \
         || die "wal_log_hints did not stick - aborting before anything depends on it"
     ha_pg_listen_ok || die "listen_addresses did not take effect"
-    verbose "  wal_log_hints = on, listen_addresses = '*', PostgreSQL is back"
+    ha_repmgr_preload_active \
+        || die "shared_preload_libraries does not include 'repmgr' after the restart - check the PostgreSQL log"
+    verbose "  wal_log_hints = on, listen_addresses = '*', repmgr preloaded, PostgreSQL is back"
 }
 
 init_step_6_repmgr_conf() {
@@ -737,6 +753,11 @@ wit_step_4_initdb_tiny() {
                 || die "initdb failed on the witness"
             verbose "  witness PostgreSQL initialized ($_wit_pgdata, checksums on)"
         fi
+        # the preload must be IN THE CONFIG before the first start - the
+        # witness repmgrd (step 7) dies without it (regression 0.3.15);
+        # ALTER SYSTEM cannot work on a server that is not running yet,
+        # so the write helper falls back to postgresql.auto.conf
+        ha_repmgr_preload_write
         svc_enable_start "$HA_PG_SERVICE"
         pg_runuser_psql -c "SET password_encryption = 'md5'; ALTER ROLE postgres WITH PASSWORD '$HA_DB_PASSWORD';" >/dev/null
         _wit_try=0
@@ -749,6 +770,12 @@ wit_step_4_initdb_tiny() {
 
     pg_runuser_psql -tAc "SELECT 1" >/dev/null 2>&1 \
         || svc_enable_start "$HA_PG_SERVICE"
+
+    # 0.3.15: a REUSED witness (or one set up by an older script version)
+    # gets the same preload convergence as the data nodes - write when
+    # missing, ONE restart (the fresh-initdb path above already wrote the
+    # config before the first start, so this is a no-op there)
+    ha_ensure_repmgr_preload
 
     # the witness's own repmgrd (conninfo host = THIS IP) and the failover
     # consensus of the data nodes both connect to the witness node IP
@@ -1101,6 +1128,30 @@ cmd_doctor() {
     esac
 
     if [ "$_dc_rc" != "2" ]; then
+        # 2b. repmgrd shared memory preload (regression 0.3.15): without
+        # shared_preload_libraries='repmgr' repmgrd dies at startup with
+        # exit 1 and the reason ONLY in $HA_REPMGRD_LOG ('unable to write
+        # to shared memory') - the journal carries nothing but the log
+        # redirect notice. Doctor converges the CONFIG side itself and
+        # demands the ONE restart it needs (a PostgreSQL restart is a
+        # service decision, not a self-heal)
+        if ha_repmgr_preload_active; then
+            _dr_ok "shared_preload_libraries includes repmgr (repmgrd-ready)"
+        else
+            _dc_pre_err="$(mktemp "${TMPDIR:-/tmp}/fpbx-ha-doctor-pre.XXXXXX")"
+            if ( ha_repmgr_preload_write ) >"$_dc_pre_err" 2>&1; then
+                _dr_fail "repmgrd cannot run: shared_preload_libraries lacks 'repmgr'
+       (dies instantly: 'unable to write to shared memory', reason only in $HA_REPMGRD_LOG)
+       The configuration is now written - ONE PostgreSQL restart activates it:
+       systemctl restart $HA_PG_SERVICE
+       then re-run the doctor: repmgrd will come up and automatic failover returns"
+            else
+                _dr_fail "repmgrd cannot run: shared_preload_libraries lacks 'repmgr' and the write failed:
+$(sed 's/^/       /' "$_dc_pre_err" | tail -n 6)"
+            fi
+            rm -f "$_dc_pre_err"
+        fi
+
         # 3. frozen-sync detection (primary without a streaming standby but
         # with sync names configured = writes are STALLED)
         if [ "$_dc_rc" = "0" ]; then
@@ -1194,6 +1245,15 @@ Check: systemctl status haproxy $HA_AGENT_UNIT_NAME"
             else
                 _dr_fail "service $_dc_svc NOT active and a start attempt failed - journal tail:"
                 journalctl -u "$_dc_svc" -n 15 --no-pager 2>/dev/null | sed 's/^/       /' || true
+                # 0.3.15: after the 'redirecting logging output' notice
+                # EVERYTHING repmgrd says goes to its log_file - the die
+                # reason never reaches the journal. Quote the log tail
+                # right below it (bench: 'unable to write to shared
+                # memory' lived there since the first install)
+                if [ "$_dc_svc" = "$HA_REPMGRD_SERVICE" ] && [ -s "$HA_REPMGRD_LOG" ]; then
+                    error "       repmgrd log tail ($HA_REPMGRD_LOG):"
+                    tail -n 15 "$HA_REPMGRD_LOG" 2>/dev/null | sed 's/^/       /' || true
+                fi
             fi
         else
             _dr_fail "service $_dc_svc NOT active"
@@ -1203,10 +1263,17 @@ Check: systemctl status haproxy $HA_AGENT_UNIT_NAME"
     # 8. lsyncd (data nodes): service + log errors
     if [ "$HA_NODE_ID" != "3" ]; then
         if svc_active "$HA_LSYNCD_SERVICE" 2>/dev/null; then
-            if [ -f "$HA_LSYNCD_LOG" ] && tail -n 100 "$HA_LSYNCD_LOG" 2>/dev/null | grep -qi 'error\|fail'; then
-                _dr_warn "lsyncd log contains recent errors: $HA_LSYNCD_LOG"
+            # 0.3.15: only the CURRENT instance counts - errors before the
+            # last '--- Startup ---' marker belong to a dead instance (the
+            # 0.3.14 self-heal restarts lsyncd, and tail -100 kept stale
+            # boot-race errors amber forever: bench ssh Permission denied
+            # at 12:49:48, clean ever since)
+            if [ -f "$HA_LSYNCD_LOG" ] && tail -n 100 "$HA_LSYNCD_LOG" 2>/dev/null \
+                    | awk '/Startup/{buf=""} {buf=buf $0 "\n"} END{printf "%s", buf}' \
+                    | grep -qi 'error\|fail'; then
+                _dr_warn "lsyncd log contains errors from the running instance: $HA_LSYNCD_LOG"
             else
-                _dr_ok "lsyncd log clean"
+                _dr_ok "lsyncd log clean (current instance)"
             fi
             [ -f "$HA_SYNC_DIR" ] || [ -d "$HA_SYNC_DIR" ] || _dr_fail "sync dir missing: $HA_SYNC_DIR"
         fi

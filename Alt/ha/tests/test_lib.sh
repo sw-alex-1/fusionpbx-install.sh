@@ -73,7 +73,7 @@ if [ -z "$_q" ] && [ -z "$_f" ]; then
     exit 0
 fi
 case "$_q" in
-    *pg_is_in_recovery*) echo "${FIX_RECOVERY:-f}" ;;
+    *pg_is_in_recovery*) echo "${FIX_RECOVERY-f}" ;;
     *pg_extension*) echo "${FIX_EXT:-1}" ;;
     *listen_addresses*) echo "${FIX_LISTEN:-*}" ;;
     *"ALTER SYSTEM SET synchronous_standby_names"*)
@@ -90,6 +90,21 @@ case "$_q" in
         fi
         exit 0 ;;
     *"SHOW synchronous_standby_names"*) echo "${PSQL_SYNCNAMES:-}" ;;
+    # 0.3.15: repmgrd shared memory preload knobs ('-' not ':-' so a test
+    # can inject an EMPTY value - an unset var still gets the healthy
+    # default 'repmgr')
+    *"SHOW shared_preload_libraries"*) echo "${PSQL_PRELOAD-repmgr}" ;;
+    *"ALTER SYSTEM SET shared_preload_libraries"*)
+        # PSQL_ALTER_PRELOAD_LOG records the SQL for value assertions,
+        # PSQL_ALTER_PRELOAD_RC injects a server-side refusal
+        if [ -n "${PSQL_ALTER_PRELOAD_LOG:-}" ]; then
+            printf '%s\n' "$_q" >> "$PSQL_ALTER_PRELOAD_LOG"
+        fi
+        if [ "${PSQL_ALTER_PRELOAD_RC:-0}" != "0" ]; then
+            echo "psql: ERROR:  stub-injected preload ALTER failure" >&2
+            exit "${PSQL_ALTER_PRELOAD_RC}"
+        fi
+        exit 0 ;;
     *"SELECT application_name FROM pg_stat_replication"*) echo "${PSQL_APPNAME:-}" ;;
     *"SELECT sync_state FROM pg_stat_replication"*) echo "${PSQL_SYNCSTATE:-sync}" ;;
     *"SELECT 1"*) echo 1 ;;
@@ -530,6 +545,118 @@ report "writer: sync-key line lives inside the managed block" $?
 lib_run "HA_SYNC_SSH_DIR='$WORK/sshdir'; HA_SYNC_PUBLIC_KEY='ssh-ed25519 AAAAFAKEPUBLICKEY fusionpbx-ha-sync'; HA_SYNC_DIR='/var/lib/freeswitch/storage'; HA_NODE1_IP='10.0.0.11'; HA_NODE2_IP='10.0.0.12'; ha_write_authorized_keys && echo again"
 [ "$(grep -c 'AAAAFAKEPUBLICKEY' "$WORK/sshdir/authorized_keys")" = "1" ] && echo "$OUT" | grep -q '^again$'
 report "writer: idempotent - re-run keeps exactly one sync-key line" $?
+
+# ---------------------------------------------------------------------------
+echo "== shared_preload_libraries: repmgrd runtime prerequisite (regression 0.3.15) =="
+# Bench: repmgrd died instantly (exit 1) since the FIRST install with the
+# reason only in /var/log/repmgr/repmgrd.log - repmgrd calls
+# set/get_local_node_id (repmgr.so shared memory) right after connecting,
+# and that area only exists when the library was PRELOADED at server start.
+mkdir -p "$WORK/pkglib" "$WORK/emptylib"
+touch "$WORK/pkglib/repmgr.so"
+
+lib_run 'ha_repmgr_preload_active && echo yes || echo no'
+[ "$OUT" = "yes" ]; report "active: default stub SHOW (repmgr) detects the preload" $?
+PSQL_PRELOAD="pg_stat_statements,repmgr" lib_run 'ha_repmgr_preload_active && echo yes || echo no'
+[ "$OUT" = "yes" ]; report "active: comma list containing repmgr detected" $?
+PSQL_PRELOAD="pg_stat_statements" lib_run 'ha_repmgr_preload_active && echo yes || echo no'
+[ "$OUT" = "no" ]; report "active: other libraries only - not active" $?
+PSQL_PRELOAD="" lib_run 'ha_repmgr_preload_active && echo yes || echo no'
+[ "$OUT" = "no" ]; report "active: empty value - not active" $?
+
+# write: fresh value, ALTER path (server up, primary)
+PSQL_PRELOAD="" PSQL_ALTER_PRELOAD_LOG="$WORK/preload-alter.log" \
+    HA_PG_PKGLIBDIR="$WORK/pkglib" lib_run 'ha_repmgr_preload_write && echo wrote'
+[ "$(tail -1 "$WORK/preload-alter.log")" = "ALTER SYSTEM SET shared_preload_libraries = 'repmgr';" ] \
+    && echo "$OUT" | grep -q '^wrote$'
+report "write: empty runtime -> ALTER SYSTEM SET ... = 'repmgr'" $? "$OUT"
+# write: APPEND to existing libraries (never clobber other packages' entries)
+PSQL_PRELOAD="pg_stat_statements" PSQL_ALTER_PRELOAD_LOG="$WORK/preload-alter2.log" \
+    HA_PG_PKGLIBDIR="$WORK/pkglib" lib_run 'ha_repmgr_preload_write && echo wrote2'
+[ "$(tail -1 "$WORK/preload-alter2.log")" = "ALTER SYSTEM SET shared_preload_libraries = 'pg_stat_statements,repmgr';" ] \
+    && echo "$OUT" | grep -q '^wrote2$'
+report "write: existing libraries preserved (append, not replace)" $? "$OUT"
+
+# write: ALTER refused on a standby in recovery -> direct auto.conf edit,
+# exactly one line, idempotent on re-run
+rm -f "$WORK/pgdata/postgresql.auto.conf"
+FIX_RECOVERY=t PSQL_PRELOAD="pg_stat_statements" PSQL_ALTER_PRELOAD_RC=3 \
+    HA_PG_PKGLIBDIR="$WORK/pkglib" lib_run 'ha_repmgr_preload_write && echo fb1'
+[ "$(grep -c '^shared_preload_libraries' "$WORK/pgdata/postgresql.auto.conf")" = "1" ] \
+    && [ "$(grep '^shared_preload_libraries' "$WORK/pgdata/postgresql.auto.conf")" = "shared_preload_libraries = 'pg_stat_statements,repmgr'" ] \
+    && echo "$OUT" | grep -q '^fb1$'
+report "write: standby fallback -> single auto.conf line with the merged value" $? "$OUT"
+FIX_RECOVERY=t PSQL_PRELOAD="pg_stat_statements" PSQL_ALTER_PRELOAD_RC=3 \
+    HA_PG_PKGLIBDIR="$WORK/pkglib" lib_run 'ha_repmgr_preload_write && echo fb2'
+[ "$(grep -c '^shared_preload_libraries' "$WORK/pgdata/postgresql.auto.conf")" = "1" ] \
+    && echo "$OUT" | grep -q '^fb2$'
+report "write: standby fallback idempotent - re-run keeps ONE line" $? "$OUT"
+
+# write: server not answering (fresh witness pre-first-start) -> auto.conf,
+# merging a pre-existing postgresql.conf entry instead of clobbering it
+rm -f "$WORK/pgdata/postgresql.auto.conf"
+echo "shared_preload_libraries = 'auto_explain'" > "$WORK/pgdata/postgresql.conf"
+FIX_RECOVERY="" PSQL_PRELOAD="" PSQL_ALTER_PRELOAD_RC=3 \
+    HA_PG_PKGLIBDIR="$WORK/pkglib" lib_run 'ha_repmgr_preload_write && echo down'
+[ "$(grep '^shared_preload_libraries' "$WORK/pgdata/postgresql.auto.conf")" = "shared_preload_libraries = 'auto_explain,repmgr'" ] \
+    && echo "$OUT" | grep -q '^down$'
+report "write: server down -> auto.conf merges the postgresql.conf entry" $? "$OUT"
+rm -f "$WORK/pgdata/postgresql.conf"
+
+# write: repmgr.so missing -> refuse to write (a preload of a missing
+# library would brick the NEXT server start)
+HA_PG_PKGLIBDIR="$WORK/emptylib" lib_run 'ha_repmgr_preload_write; echo rc=$?'
+echo "$OUT" | grep -q 'Refusing to write shared_preload_libraries'
+report "write: repmgr.so missing -> refuses (restart-safety guard)" $? "$OUT"
+
+# write: live primary refusing ALTER SYSTEM (recovery=f, rc!=0) -> die with
+# the psql verdict, no silent file fallback
+FIX_RECOVERY=f PSQL_PRELOAD="" PSQL_ALTER_PRELOAD_RC=3 \
+    HA_PG_PKGLIBDIR="$WORK/pkglib" lib_run 'ha_repmgr_preload_write; echo rc=$?'
+echo "$OUT" | grep -q 'refused on a live primary' && echo "$OUT" | grep -q 'stub-injected preload ALTER failure'
+report "write: live primary refusal -> die quoting the real psql error" $? "$OUT"
+
+# pkglibdir override precedence
+HA_PG_PKGLIBDIR="$WORK/pkglib" lib_run 'p=$(ha_pg_pkglibdir); [ "$p" = "$WORK/pkglib" ] && echo ok'
+[ "$OUT" = "ok" ]; report "pkglibdir: HA_PG_PKGLIBDIR override honored" $?
+
+# drop-in (0.3.15): content-aware write - upgrades the stale 0.3.13 copy
+# (no Environment= line) and stays quiet on an identical re-run
+rm -rf "$WORK/systemd"
+mkdir -p "$WORK/systemd/repmgr.service.d"
+printf '# fusionpbx-ha: start repmgrd only after local PostgreSQL (boot race, 0.3.13)\n[Unit]\nAfter=postgresql.service\nWants=postgresql.service\n' \
+    > "$WORK/systemd/repmgr.service.d/fusionpbx-ha.conf"
+HA_SYSTEMD_DIR="$WORK/systemd" lib_run 'ha_install_repmgr_dropin && echo di1'
+grep -q '^Environment=REPMGRD_OPTS=$' "$WORK/systemd/repmgr.service.d/fusionpbx-ha.conf" \
+    && grep -q '^After=postgresql.service$' "$WORK/systemd/repmgr.service.d/fusionpbx-ha.conf" \
+    && echo "$OUT" | grep -q '^di1$'
+report "drop-in: stale 0.3.13 copy upgraded (ordering kept + REPMGRD_OPTS defined)" $? "$OUT"
+HA_SYSTEMD_DIR="$WORK/systemd" lib_run 'ha_install_repmgr_dropin && echo di2'
+grep -c '^Environment=REPMGRD_OPTS=$' "$WORK/systemd/repmgr.service.d/fusionpbx-ha.conf" | grep -q '^1$' \
+    && echo "$OUT" | grep -q '^di2$'
+report "drop-in: idempotent - exactly one Environment= line after re-run" $? "$OUT"
+
+# 0.3.15 source contracts: the preload joins the init step-5 one-restart
+# batch BEFORE the restart decision, is verified after it; the register
+# prelude and the witness step converge it; the doctor checks it and quotes
+# the repmgrd LOG FILE (not only the journal) when the daemon dies
+_i5="$(sed -n '/^init_step_5_wal_log_hints()/,/^}/p' "$CLI")"
+echo "$_i5" | grep -q 'ha_repmgr_preload_active' && echo "$_i5" | grep -q 'ha_repmgr_preload_write'
+report "init step 5: preload joins the one-restart step (write before restart)" $?
+echo "$_i5" | grep -q 'ha_repmgr_preload_active \\' && echo "$_i5" | grep -q "|| die \"shared_preload_libraries does not include"
+report "init step 5: preload verified after the restart" $?
+_hrp="$(sed -n '/^ha_register_prelude()/,/^}/p' "$LIB")"
+echo "$_hrp" | grep -q 'ha_ensure_repmgr_preload'
+report "register prelude: repmgr preload convergence (resume self-heal)" $?
+_w4="$(sed -n '/^wit_step_4_initdb_tiny()/,/^}/p' "$CLI")"
+echo "$_w4" | grep -q 'ha_repmgr_preload_write' && echo "$_w4" | grep -q 'ha_ensure_repmgr_preload'
+report "witness: preload written before the first start + convergence for a reused witness" $?
+echo "$_dc" | grep -q 'ha_repmgr_preload_active' && echo "$_dc" | grep -q 'ha_repmgr_preload_write'
+report "doctor: preload check + config-side self-heal" $?
+echo "$_dc" | grep -q 'HA_REPMGRD_LOG'
+report "doctor: repmgrd log-file tail quoted on service failure" $?
+echo "$_dc" | grep -q "awk '/Startup/{buf=\"\"}"
+report "doctor: lsyncd log errors counted from the CURRENT instance only" $?
 
 # 0.3.13 source contracts: the 0.3.12 doctor truncated the lsyncd config
 # to zero bytes (a missing '$' made cmp/cat/rm read a literal '_dc_lsyn_new'

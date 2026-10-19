@@ -34,6 +34,9 @@ HA_SYSTEMD_DIR="${HA_SYSTEMD_DIR:-/etc/systemd/system}"
 HA_AGENT_WAIT="${HA_AGENT_WAIT:-30}"
 
 HA_REPMGR_CONF="${HA_REPMGR_CONF:-/etc/repmgr/repmgr.conf}"
+# repmgrd's own log target (log_file in repmgr.conf; the reason for any
+# daemon death lands HERE, never in the journal - 0.3.15)
+HA_REPMGRD_LOG="${HA_REPMGRD_LOG:-/var/log/repmgr/repmgrd.log}"
 HA_HAPROXY_CONF_D="${HA_HAPROXY_CONF_D:-/etc/haproxy/conf.d}"
 HA_HAPROXY_CONF="$HA_HAPROXY_CONF_D/fusionpbx-ha.cfg"
 HA_HAPROXY_MAIN="${HA_HAPROXY_MAIN:-/etc/haproxy/haproxy.cfg}"
@@ -157,21 +160,47 @@ svc_stop() {
 }
 
 # 0.3.13: on the bench repmgrd was dead after a node reboot while
-# postgresql was up - the ALT unit can lose the boot race. A tiny drop-in
-# serializes the start order; a no-op if the unit already orders itself.
+# postgresql was up - a tiny drop-in serializes the start order (turned out
+# to be a no-op: the ALT unit already has After=postgresql.service - the
+# REAL bench killer was the missing shared_preload_libraries, 0.3.15 - but
+# an explicit ordering costs nothing).
+# 0.3.15: (a) content-aware write - the old early-return on file-existence
+# kept the 0.3.13 copy forever; (b) Environment=REPMGRD_OPTS= defines the
+# variable the ALT ExecStart references (${REPMGRD_OPTS}), silencing the
+# "Referenced but unset environment variable" warning on every start.
 ha_install_repmgr_dropin() {
-    _hrd_unit_dir="/etc/systemd/system/${HA_REPMGRD_SERVICE}.service.d"
+    _hrd_unit_dir="${HA_SYSTEMD_DIR}/${HA_REPMGRD_SERVICE}.service.d"
     _hrd_conf="$_hrd_unit_dir/fusionpbx-ha.conf"
-    [ -f "$_hrd_conf" ] && return 0
-    mkdir -p "$_hrd_unit_dir" 2>/dev/null || { warn "cannot create $_hrd_unit_dir - repmgrd keeps its stock boot ordering"; return 1; }
-    cat > "$_hrd_conf" <<DROPIN
-# fusionpbx-ha: start repmgrd only after local PostgreSQL (boot race, 0.3.13)
+    _hrd_tmp="$(mktemp "${TMPDIR:-/tmp}/fpbx-ha-dropin.XXXXXX")"
+    cat > "$_hrd_tmp" <<DROPIN
+# fusionpbx-ha: repmgrd unit hardening (ordering 0.3.13, env 0.3.15)
 [Unit]
 After=$HA_PG_SERVICE.service
 Wants=$HA_PG_SERVICE.service
+
+[Service]
+# the ALT unit references \${REPMGRD_OPTS} in ExecStart but
+# /etc/sysconfig/repmgr ships the variable commented out - defining it as
+# empty keeps the command line identical and the warning gone
+Environment=REPMGRD_OPTS=
 DROPIN
+    if ! mkdir -p "$_hrd_unit_dir" 2>/dev/null; then
+        rm -f "$_hrd_tmp"
+        warn "cannot create $_hrd_unit_dir - repmgrd keeps its stock unit"
+        return 1
+    fi
+    if [ -f "$_hrd_conf" ] && cmp -s "$_hrd_tmp" "$_hrd_conf"; then
+        rm -f "$_hrd_tmp"
+        return 0
+    fi
+    install -m 644 "$_hrd_tmp" "$_hrd_conf" 2>/dev/null || {
+        rm -f "$_hrd_tmp"
+        warn "cannot write $_hrd_conf - repmgrd keeps its previous drop-in"
+        return 1
+    }
+    rm -f "$_hrd_tmp"
     systemctl daemon-reload 2>/dev/null || true
-    verbose "  repmgrd boot ordering drop-in installed: $_hrd_conf"
+    verbose "  repmgrd unit drop-in installed: $_hrd_conf (ordering + REPMGRD_OPTS)"
     return 0
 }
 
@@ -670,6 +699,135 @@ ha_ensure_pg_listen() {
 }
 
 # -----------------------------------------------------------------------------
+# shared_preload_libraries = 'repmgr' (regression 0.3.15)
+#
+# repmgrd ALWAYS writes its node id into the shared memory area provided by
+# the repmgr.so server module right after connecting (the SQL wrappers
+# set_local_node_id()/get_local_node_id() live in the extension, the
+# implementation in repmgr.so only works when the library was PRELOADED at
+# server start - the memory area does not exist on demand). Without the
+# preload repmgrd dies INSTANTLY with exit code 1 and the reason only in
+# log_file ('unable to write to shared memory', hint: 'ensure
+# "shared_preload_libraries" includes "repmgr"').
+#
+# Verified against the ALT RPM postgresql16-repmgr 5.5.0-alt5 binary and
+# repmgrd 5.5.0 main(): every other startup failure is either pre-notice
+# (config parse / log open - no 'redirecting logging output' line in the
+# journal) or exit code 6 (one connection attempt, NO retry at startup).
+# The bench signature - redirect NOTICE printed, PostgreSQL up, instant
+# status=1/FAILURE, journal otherwise silent - matches this check and
+# nothing else. Everything else in the stack (repmgr CLI, replication,
+# haproxy, role-agent) works WITHOUT the preload; only repmgrd dies, so
+# the cluster looked healthy while automatic failover was silently absent
+# since the very first install.
+# -----------------------------------------------------------------------------
+
+# 0 = the postmaster already runs with repmgr preloaded (runtime view)
+ha_repmgr_preload_active() {
+    _hrpa_cur="$(pg_runuser_psql -tAc "SHOW shared_preload_libraries" 2>/dev/null | tr -d ' \r')"
+    echo ",$_hrpa_cur," | grep -q ",repmgr,"
+}
+
+# Server module directory. repmgr.so MUST be proven to exist before the
+# GUC is ever written: preloading a missing library makes the NEXT server
+# start die ('could not access file ... repmgr.so') - that would turn a
+# repair into an outage (HA_PG_PKGLIBDIR: test-sandbox override).
+ha_pg_pkglibdir() {
+    if [ -n "${HA_PG_PKGLIBDIR:-}" ]; then printf '%s\n' "$HA_PG_PKGLIBDIR"; return 0; fi
+    if command -v pg_config >/dev/null 2>&1; then
+        _hgpd="$(pg_config --pkglibdir 2>/dev/null)"
+        [ -n "$_hgpd" ] && { printf '%s\n' "$_hgpd"; return 0; }
+    fi
+    printf '%s\n' /usr/lib64/pgsql    # ALT postgresql16 layout fallback
+}
+
+# Write shared_preload_libraries = '<current>,repmgr' (APPEND - never
+# drop entries other packages set). Idempotent callers check
+# ha_repmgr_preload_active first; a second write just replaces the GUC with
+# the same composed value. Dies when repmgr.so cannot be proven present.
+ha_repmgr_preload_write() {
+    _hrpw_dir="$(ha_pg_pkglibdir)"
+    [ -f "$_hrpw_dir/repmgr.so" ] \
+        || die "repmgr.so not found in $_hrpw_dir - is the repmgr package installed?
+Refusing to write shared_preload_libraries: PostgreSQL would then refuse to
+start at the next restart (an outage instead of a repair)."
+
+    _hrpw_cur="$(pg_runuser_psql -tAc "SHOW shared_preload_libraries" 2>/dev/null | tr -d ' \r')"
+    # server down / never started yet: compose from postgresql.conf so a
+    # pre-existing entry there is not silently clobbered by the auto.conf
+    # line (auto.conf wins the merge)
+    if [ -z "$_hrpw_cur" ] && [ -f "$(ha_pg_data_dir)/postgresql.conf" ]; then
+        _hrpw_cur="$(grep -E '^[[:space:]]*shared_preload_libraries[[:space:]]*=' "$(ha_pg_data_dir)/postgresql.conf" 2>/dev/null \
+            | tail -1 | cut -d= -f2- | tr -d " '\"" )"
+    fi
+    _hrpw_val="repmgr"
+    [ -n "$_hrpw_cur" ] && _hrpw_val="${_hrpw_cur},repmgr"
+
+    _hrpw_err="$(mktemp "${TMPDIR:-/tmp}/fpbx-ha-preload.XXXXXX")"
+    # runuser DIRECTLY (not pg_runuser_psql): the helper swallows stderr
+    # internally (2>/dev/null) and the refusal reason must be captured for
+    # the die path - the 0.3.4 swallowed-error class, ha_sync_names_write
+    # made the same call
+    runuser -u postgres -- psql -c "ALTER SYSTEM SET shared_preload_libraries = '${_hrpw_val}';" \
+        >/dev/null 2>"$_hrpw_err"
+    if [ $? -eq 0 ]; then
+        rm -f "$_hrpw_err"
+        verbose "  shared_preload_libraries = '${_hrpw_val}' written (activates at the next PostgreSQL start)"
+        return 0
+    fi
+
+    # ALTER SYSTEM refused. Legitimate when the server is in recovery (a
+    # standby: ALTER SYSTEM is not allowed there) or not answering at all
+    # (pre-first-start, e.g. the fresh witness right after initdb) - in
+    # both cases postgresql.auto.conf is written directly (the standby
+    # file-writes are fine, same pattern as listen_addresses). A LIVE
+    # primary refusing ALTER SYSTEM is unexpected: die with the real
+    # psql verdict instead of papering over it.
+    _hrpw_rec="$(pg_runuser_psql -tAc "SELECT pg_is_in_recovery()" 2>/dev/null | tr -d ' \r')"
+    case "$_hrpw_rec" in
+        t|"") ;;   # standby in recovery | server not answering
+        *) _hrpw_why="$(tail -n 8 "$_hrpw_err" | sed 's/^/  /')"
+           rm -f "$_hrpw_err"
+           die "ALTER SYSTEM SET shared_preload_libraries was refused on a live primary:
+$_hrpw_why" ;;
+    esac
+    rm -f "$_hrpw_err"
+
+    warn "ALTER SYSTEM was refused - writing postgresql.auto.conf directly"
+    _hrpw_auto="$(ha_pg_data_dir)/postgresql.auto.conf"
+    touch "$_hrpw_auto" 2>/dev/null \
+        || die "cannot write $_hrpw_auto (shared_preload_libraries not set - repmgrd cannot run)"
+    chown postgres:postgres "$_hrpw_auto" 2>/dev/null || true
+    sed -i '/^[[:space:]]*shared_preload_libraries[[:space:]]*=/d' "$_hrpw_auto" 2>/dev/null
+    echo "shared_preload_libraries = '${_hrpw_val}'" >> "$_hrpw_auto"
+    verbose "  shared_preload_libraries = '${_hrpw_val}' written to $_hrpw_auto (activates at the next PostgreSQL start)"
+    return 0
+}
+
+# Full convergence: write when missing, ONE restart, verify. Call only
+# where a PostgreSQL restart is acceptable (register prelude flows - the
+# same contract ha_ensure_pg_listen already has there).
+ha_ensure_repmgr_preload() {
+    ha_repmgr_preload_active \
+        && { verbose "  repmgr shared library is preloaded (repmgrd-ready)"; return 0; }
+    verbose "  shared_preload_libraries lacks 'repmgr' - repmgrd cannot run without"
+    verbose "  its shared memory module (dies: 'unable to write to shared memory')"
+    ha_repmgr_preload_write
+    verbose "  - ONE PostgreSQL restart to activate the preload"
+    systemctl restart "$HA_PG_SERVICE" || die "PostgreSQL restart failed (shared_preload_libraries)"
+    _herp_try=0
+    while [ "$_herp_try" -lt 30 ]; do
+        pg_runuser_psql -tAc "SELECT 1" >/dev/null 2>&1 && break
+        sleep 1
+        _herp_try=$((_herp_try + 1))
+    done
+    pg_runuser_psql -tAc "SELECT 1" >/dev/null 2>&1 || die "PostgreSQL did not come back after the preload restart"
+    ha_repmgr_preload_active || die "shared_preload_libraries does not include 'repmgr' after the restart - check the PostgreSQL log"
+    verbose "  repmgr shared library preloaded (repmgrd-ready)"
+    return 0
+}
+
+# -----------------------------------------------------------------------------
 # sudoers drop-in: repmgr.service runs as User=postgres, but the service_*_command
 # lines in repmgr.conf need systemctl (root). Tight NOPASSWD allowlist for the
 # PostgreSQL service only (DESIGN.md 13.2; the repmgr RPM may ship its own
@@ -837,6 +995,12 @@ ha_register_prelude() {
     esac
     systemctl reload "$HA_PG_SERVICE" 2>/dev/null \
         || pg_runuser_psql -c "SELECT pg_reload_conf();" >/dev/null 2>&1 || true
+    # 0.3.15: repmgrd cannot run without the preloaded shared memory module
+    # (bench: repmgrd died with exit 1 since the FIRST install while the
+    # rest of the cluster looked healthy). Register time - before the
+    # repmgrd start in these same flows - is the convergence point for
+    # nodes whose init/join was run by an older script version
+    ha_ensure_repmgr_preload
     ha_ensure_pg_listen
 
     _hrp_tmp="$(mktemp "${TMPDIR:-/tmp}/fpbx-ha-repmgr.XXXXXX")"

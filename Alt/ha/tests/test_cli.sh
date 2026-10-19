@@ -27,17 +27,44 @@ report() {
 # ---------------------------------------------------------------------------
 FB="$WORK/fakebin"
 mkdir -p "$FB" "$WORK/etc" "$WORK/pgdata" "$WORK/storage/recordings" \
-         "$WORK/lib" "$WORK/haproxy.d"
+         "$WORK/lib" "$WORK/haproxy.d" "$WORK/pkglib"
 echo "16" > "$WORK/pgdata/PG_VERSION"
 : > "$WORK/lsyncd.log"
 : > "$WORK/hosts-cli"      # /etc/hosts sandbox for any step that reaches it
+touch "$WORK/pkglib/repmgr.so"      # 0.3.15: preload write guard target
+: > "$WORK/repmgrd.log"             # 0.3.15: doctor repmgrd log tail target
+mkdir -p "$WORK/systemd/repmgr.service.d"   # 0.3.15: drop-in sandbox target
 
 cat > "$FB/systemctl" <<'EOF'
 #!/bin/sh
+# 0.3.15: selective stub - SYSTEMCTL_INACTIVE (space-separated unit list)
+# makes those units report is-active=3 (doctor self-heal branches) and,
+# with SYSTEMCTL_START_FAIL set, their start attempts fail so the FAIL
+# diagnostics (inline journal + repmgrd log tail) become reachable.
+# NOTE: the real callers pass flags before the unit ('is-active --quiet
+# repmgr') - the unit is the LAST non-flag argument, not $2
+_unit=""
+for _a in "$@"; do
+    case "$_a" in
+        is-active|is-enabled|start|stop|restart|reload|reset-failed|enable|disable|daemon-reload|--quiet|-q|--no-pager) ;;
+        *) _unit="$_a" ;;
+    esac
+done
 case "$1" in
-    is-active) exit 0 ;;   # everything active
-    *) exit 0 ;;
+    is-active)
+        case " ${SYSTEMCTL_INACTIVE:-} " in
+            *" $_unit "*) exit 3 ;;
+        esac
+        exit 0 ;;
+    start)
+        case " ${SYSTEMCTL_INACTIVE:-} " in
+            *" $_unit "*)
+                [ -n "${SYSTEMCTL_START_FAIL:-}" ] && exit "${SYSTEMCTL_START_FAIL}"
+                ;;
+        esac
+        exit 0 ;;
 esac
+exit 0
 EOF
 
 cat > "$FB/timedatectl" <<'EOF'
@@ -64,6 +91,10 @@ case "$_sql" in
     *"count(*) FROM pg_stat_replication"*) echo "${PSQL_STREAMING:-1}" ;;
     *sync_state*) echo "${PSQL_SYNCSTATE:-sync}" ;;
     *synchronous_standby_names*) echo "${PSQL_SYNCNAMES:-}" ;;
+    # 0.3.15: repmgrd shared memory preload ('-' not ':-' - an EMPTY value
+    # must stay empty so the missing-preload doctor path is testable)
+    *"SHOW shared_preload_libraries"*) echo "${PSQL_PRELOAD-repmgr}" ;;
+    *"ALTER SYSTEM SET shared_preload_libraries"*) exit 0 ;;
     *"count(*) FROM repmgr.nodes"*) echo "${PSQL_NODES:-3}" ;;
     *"SELECT 1"*) echo 1 ;;
     *"SELECT 1 FROM pg_roles"*) echo 1 ;;
@@ -223,6 +254,13 @@ ha_cli() {
         export HA_L1_WEB_CONF="$WORK/web-config.conf"
         export HA_LSYNCD_LOG="$WORK/lsyncd.log"
         export HA_REPMGR_CONF="$WORK/repmgr.conf"
+        # 0.3.15: repmgrd log tail + the repmgr.so existence guard target
+        export HA_REPMGRD_LOG="$WORK/repmgrd.log"
+        export HA_PG_PKGLIBDIR="$WORK/pkglib"
+        # 0.3.15: the selective systemctl stub makes the doctor self-heal
+        # branches reachable - the drop-in writer must stay in the sandbox
+        # (never the real /etc/systemd/system, even when tests run as root)
+        export HA_SYSTEMD_DIR="$WORK/systemd"
         export HA_LSYNCD_CONF="$WORK/lsyncd.conf.lua"
         export HA_HAPROXY_CONF_D="$WORK/haproxy.d"
         export HA_HAPROXY_CONF="$WORK/haproxy.d/fusionpbx-ha.cfg"
@@ -464,6 +502,57 @@ FAKE_IP=10.0.0.13 ha_cli --doctor > "$WORK/out.log" 2>&1; _rc=$?
 [ "$_rc" = "0" ] && grep -q "service postgresql active" "$WORK/out.log" \
   && ! grep -q "entry point" "$WORK/out.log"
 report "--doctor witness: no haproxy/agent checks" "$?"
+
+# ---------------------------------------------------------------------------
+echo "== --doctor: repmgr shared memory preload (regression 0.3.15) =="
+# Bench: repmgrd died instantly (exit 1, journal silent) since the first
+# install - shared_preload_libraries lacked 'repmgr'. The doctor must FAIL
+# with the restart instruction AND converge the config side itself.
+PSQL_PRELOAD="" ha_cli --doctor > "$WORK/out.log" 2>&1; _rc=$?
+[ "$_rc" != "0" ] && grep -q "repmgrd cannot run" "$WORK/out.log" \
+  && grep -q "systemctl restart postgresql" "$WORK/out.log" \
+  && grep -q "The configuration is now written" "$WORK/out.log"
+report "--doctor: missing preload -> FAIL + config written + restart demanded" "$?" "$(grep -m1 'shared_preload_libraries' "$WORK/out.log")"
+
+echo "== --doctor: healthy preload line =="
+ha_cli --doctor > "$WORK/out.log" 2>&1; _rc=$?
+[ "$_rc" = "0" ] && grep -q "shared_preload_libraries includes repmgr" "$WORK/out.log"
+report "--doctor: preloaded node shows the repmgrd-ready OK line" "$?"
+
+echo "== --doctor: repmgrd log tail quoted on service failure (0.3.15) =="
+# repmgrd writes its die reason to log_file, NOT to the journal - the doctor
+# must quote the log tail right below the journal tail
+printf '[2026-10-19 12:49:51] [ERROR] unable to write to shared memory\n[2026-10-19 12:49:51] [HINT] ensure "shared_preload_libraries" includes "repmgr"\n' > "$WORK/repmgrd.log"
+SYSTEMCTL_INACTIVE="repmgr" SYSTEMCTL_START_FAIL=1 ha_cli --doctor > "$WORK/out.log" 2>&1; _rc=$?
+[ "$_rc" != "0" ] && grep -q "repmgrd log tail" "$WORK/out.log" \
+  && grep -q "unable to write to shared memory" "$WORK/out.log"
+report "--doctor: repmgrd log file tail quoted inline on daemon failure" "$?" "$(grep -m1 'repmgrd log tail' "$WORK/out.log")"
+
+echo "== --doctor: lsyncd errors from a DEAD instance ignored (0.3.15) =="
+# Bench: ssh Permission denied during the boot race at 12:49:48 kept the
+# doctor amber forever (tail -100) although the self-heal restart fixed it
+# seconds later - only errors AFTER the last '--- Startup ---' count
+{
+  echo "12:49:44 Normal: --- Startup ---"
+  echo "12:49:48 Error: Temporary or permanent failure on startup, Terminating"
+  echo "12:49:48 Normal: --- Startup ---"
+  echo "12:49:49 Normal: Finished (list)"
+} > "$WORK/lsyncd.log"
+ha_cli --doctor > "$WORK/out.log" 2>&1; _rc=$?
+[ "$_rc" = "0" ] && grep -q "lsyncd log clean (current instance)" "$WORK/out.log" \
+  && ! grep -q "lsyncd log contains errors" "$WORK/out.log"
+report "--doctor: stale pre-restart lsyncd errors no longer warn" "$?"
+{
+  echo "12:49:48 Normal: --- Startup ---"
+  echo "13:05:11 Error: Temporary or permanent failure, Terminating"
+} > "$WORK/lsyncd.log"
+ha_cli --doctor > "$WORK/out.log" 2>&1; _rc=$?
+# lsyncd log errors are a WARNING, not a failure: the doctor stays green
+# (exit 0) but must count and surface the error line
+[ "$_rc" = "0" ] && grep -q "errors from the running instance" "$WORK/out.log"
+report "--doctor: fresh lsyncd errors (current instance) still warn" "$?"
+: > "$WORK/lsyncd.log"
+: > "$WORK/repmgrd.log"
 
 # ---------------------------------------------------------------------------
 echo "== --print-token =="

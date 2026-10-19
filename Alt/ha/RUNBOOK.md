@@ -306,7 +306,8 @@ curl) персистентно. На второй и последующие ра
 
 | Что смотреть | Где |
 |---|---|
-| События кластера, failover, promote | `/var/log/repmgr/` (или `journalctl -u repmgr`) |
+| События кластера, failover, promote | `/var/log/repmgr/repmgrd.log` — ГЛАВНЫЙ источник по repmgrd: после строки `redirecting logging output` ВСЯ диагностика демона уходит туда, `journalctl -u repmgr` бесполезен (0.3.15) |
+| Причина смерти repmgrd при старте | `tail -n 20 /var/log/repmgr/repmgrd.log`; типовое: `unable to write to shared memory` = нет `shared_preload_libraries='repmgr'` → `./fusionpbx-ha.sh --doctor` (напишет конфиг) → `systemctl restart postgresql` |
 | Состояние кластера одной командой | `repmgr cluster show` (под postgres) |
 | Синхронизация медиа-файлов | `/var/log/lsyncd/lsyncd.log` и `lsyncd.status` |
 | PostgreSQL | `journalctl -u postgresql` |
