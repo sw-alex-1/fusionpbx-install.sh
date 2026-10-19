@@ -551,6 +551,21 @@ _j3="$(sed -n '/^join_step_3_packages()/,/^}/p' "$CLI")"
 echo "$_j3" | grep -q 'rsync curl' && echo "$_j3" | grep -q 'ha_write_authorized_keys'
 report "join step 3: sync-key line re-rendered once rsync is installed" $?
 
+# 0.3.14: the self-heal must (a) converge the lsyncd config BEFORE starting
+# the daemon (starting on a stale config crash-loops the unit into systemd's
+# start-rate-limit, which then refuses even the valid restart seconds later
+# - the 0.3.13 bench trap), (b) clear that limiter state with reset-failed,
+# and (c) quote the journal tail INLINE when a daemon refuses to come up.
+_dc_sh="$(echo "$_dc" | sed -n '/0.3.14: (a) never START lsyncd/,/journal tail:/p')"
+echo "$_dc_sh" | grep -q 'lsyncd.conf.lua.tpl' && echo "$_dc_sh" | grep -q 'systemctl start'
+report "doctor self-heal: converges the lsyncd config before starting it" $?
+echo "$_dc" | grep -q 'systemctl reset-failed "\$_dc_svc"'
+report "doctor self-heal: clears the start-rate-limit (reset-failed)" $?
+echo "$_dc" | grep -Fq 'journalctl -u "$_dc_svc" -n 15'
+report "doctor: a failed start quotes the journal tail inline" $?
+echo "$_dc" | grep -Fq 'journalctl -u "$HA_LSYNCD_SERVICE" -n 15'
+report "doctor: a failed lsyncd restart quotes the journal tail inline" $?
+
 # ---------------------------------------------------------------------------
 echo "== cluster.conf generation + loading =="
 lib_run '

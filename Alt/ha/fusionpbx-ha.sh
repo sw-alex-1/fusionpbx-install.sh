@@ -1168,12 +1168,32 @@ Check: systemctl status haproxy $HA_AGENT_UNIT_NAME"
             # doctor bug that truncated its config. Both are always-on
             # daemons of a joined node: install the ordering drop-in
             # (repmgrd only), start back, re-check.
+            #
+            # 0.3.14: (a) never START lsyncd on a stale config - converge
+            # it first (starting on a broken config crash-loops the unit
+            # straight into systemd's start-rate-limit, which then refuses
+            # even the valid restart seconds later - the 0.3.13 bench
+            # trap); (b) reset-failed clears that limiter state before
+            # the start ("start request repeated too quickly"); (c) when
+            # the daemon still refuses to come up, quote the journal tail
+            # INLINE - the reason must be visible in the same run, not
+            # behind a second manual command.
             [ "$_dc_svc" = "$HA_REPMGRD_SERVICE" ] && ha_install_repmgr_dropin
+            if [ "$_dc_svc" = "$HA_LSYNCD_SERVICE" ] && [ -f "$HA_LSYNCD_CONF" ]; then
+                _dc_lsyn_fix="$HA_ETC_DIR/.lsyncd.conf.doctor"
+                if ha_render "$HA_RES_DIR/lsyncd.conf.lua.tpl" "$_dc_lsyn_fix" \
+                        "SYNC_DIR=$HA_SYNC_DIR" "SYNC_DELAY=$HA_SYNC_DELAY" "PEER_IP=$(ha_peer_ip)" 2>/dev/null; then
+                    cat "$_dc_lsyn_fix" > "$HA_LSYNCD_CONF" 2>/dev/null || true
+                    rm -f "$_dc_lsyn_fix"
+                fi
+            fi
+            systemctl reset-failed "$_dc_svc" 2>/dev/null || true
             if systemctl start "$_dc_svc" 2>/dev/null && sleep 2 \
                 && svc_active "$_dc_svc" 2>/dev/null; then
                 _dr_ok "service $_dc_svc started (was inactive - check why: journalctl -u $_dc_svc -n 30)"
             else
-                _dr_fail "service $_dc_svc NOT active and a start attempt failed (check: journalctl -u $_dc_svc -n 30)"
+                _dr_fail "service $_dc_svc NOT active and a start attempt failed - journal tail:"
+                journalctl -u "$_dc_svc" -n 15 --no-pager 2>/dev/null | sed 's/^/       /' || true
             fi
         else
             _dr_fail "service $_dc_svc NOT active"
@@ -1206,10 +1226,16 @@ Check: systemctl status haproxy $HA_AGENT_UNIT_NAME"
                 _dr_ok "lsyncd config matches the current template"
             else
                 cat "$_dc_lsyn_new" > "$HA_LSYNCD_CONF"
+                # 0.3.14: clear a possible start-rate-limit before the
+                # restart (a unit that crash-looped on the stale config
+                # refuses restarts - "start request repeated too quickly"),
+                # and quote the journal tail inline if it still refuses.
+                systemctl reset-failed "$HA_LSYNCD_SERVICE" 2>/dev/null || true
                 if systemctl restart "$HA_LSYNCD_SERVICE" 2>/dev/null; then
                     _dr_warn "lsyncd config was stale (older script version) - re-rendered, lsyncd restarted"
                 else
-                    _dr_fail "lsyncd config was stale - re-rendered, but the lsyncd restart failed (check: journalctl -u $HA_LSYNCD_SERVICE -n 30)"
+                    _dr_fail "lsyncd config was stale - re-rendered, but the lsyncd restart failed - journal tail:"
+                    journalctl -u "$HA_LSYNCD_SERVICE" -n 15 --no-pager 2>/dev/null | sed 's/^/       /' || true
                 fi
             fi
             rm -f "$_dc_lsyn_new"
