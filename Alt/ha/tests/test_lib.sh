@@ -790,6 +790,50 @@ _j3="$(sed -n '/^join_step_3_packages()/,/^}/p' "$CLI")"
 echo "$_j3" | grep -q 'rsync curl' && echo "$_j3" | grep -q 'ha_write_authorized_keys'
 report "join step 3: sync-key line re-rendered once rsync is installed" $?
 
+# ---------------------------------------------------------------------------
+echo "== join resume vs cluster generation (regression 0.3.18) =="
+# the real bench: node 2 resumed an October state file against a
+# re-initialized primary (--init --force REGENERATES all secrets) - step 2
+# (unpack) was skipped, so the media seed ran with the OLD sync private
+# key and died 'Permission denied (publickey)'. The token IS the identity:
+# a state file whose cluster.conf differs from the token's is garbage.
+
+mkdir -p "$WORK/etc"
+printf 'HA_CLUSTER_NAME="old-cluster"\nHA_REPMGR_PASSWORD="old-secret"\n' > "$WORK/etc/cluster.conf"
+{ echo "# state"; echo "command=join-standby"; echo "step_ok=1 join_step_1_preflight"; } > "$WORK/etc/.installer-state"
+printf 'HA_CLUSTER_NAME="fpbx-ha"\nHA_REPMGR_PASSWORD="new-secret"\n' > "$WORK/token.conf"
+
+lib_run "ha_join_state_freshen $WORK/token.conf && echo ok"
+echo "$OUT" | grep -q '^ok$' && echo "$OUT" | grep -q "DIFFERENT cluster generation" \
+    && [ ! -f "$WORK/etc/.installer-state" ]
+report "token differs from the on-disk conf: state discarded" "$?" "$(echo "$OUT" | head -2 | tail -1)"
+
+{ echo "# state"; echo "command=join-standby"; echo "step_ok=1 join_step_1_preflight"; } > "$WORK/etc/.installer-state"
+cp "$WORK/token.conf" "$WORK/etc/cluster.conf"
+lib_run "ha_join_state_freshen $WORK/token.conf && echo ok"
+echo "$OUT" | grep -q '^ok$' && [ -f "$WORK/etc/.installer-state" ] && ! echo "$OUT" | grep -q "DIFFERENT"
+report "same token re-run after a crash: state kept (resume)" $?
+
+rm -f "$WORK/etc/.installer-state"
+lib_run "ha_join_state_freshen $WORK/token.conf && echo ok"
+echo "$OUT" | grep -q '^ok$' && ! echo "$OUT" | grep -q "DIFFERENT"
+report "no state file (first join): plain no-op" $?
+
+{ echo "# state"; echo "command=join-standby"; } > "$WORK/etc/.installer-state"
+rm -f "$WORK/etc/cluster.conf"
+lib_run "ha_join_state_freshen $WORK/token.conf && echo ok"
+echo "$OUT" | grep -q '^ok$' && [ ! -f "$WORK/etc/.installer-state" ]
+report "state without an on-disk conf: garbage, discarded" $?
+
+# cmd_join contract: the freshen check runs BEFORE the 0.3.13 resume
+# convergence and BEFORE the sequence - a mismatched state must never
+# leak into either
+_f18="$(echo "$_cj" | grep -n 'ha_join_state_freshen' | head -1 | cut -d: -f1)"
+_c13="$(echo "$_cj" | grep -n 'Resume convergence (0.3.13)' | head -1 | cut -d: -f1)"
+_seqj="$(echo "$_cj" | grep -n 'ha_run_sequence ' | head -1 | cut -d: -f1)"
+[ -n "$_f18" ] && [ -n "$_c13" ] && [ -n "$_seqj" ] && [ "$_f18" -lt "$_c13" ] && [ "$_f18" -lt "$_seqj" ]
+report "cmd_join: freshen BEFORE the resume convergence and the sequence" $?
+
 # 0.3.14/0.3.16: the doctor quotes the journal tail INLINE when a service
 # is down; 0.3.16 removed the start attempt / reset-failed / config
 # convergence entirely (read-only diagnostics - configurations belong to

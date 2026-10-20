@@ -457,6 +457,35 @@ ha_state_finish() {
     rm -f "$HA_STATE_FILE" 2>/dev/null
 }
 
+# -----------------------------------------------------------------------------
+# Join resume vs. cluster generation (regression 0.3.18). A state file left
+# by an earlier join attempt is only valid for THE SAME cluster secrets:
+# '--init --force' on the primary REGENERATES them (new repmgr password,
+# new sync key, new token), and a resume from such a state file would run
+# every step against the OLD cluster.conf - step 2 (unpack) is skipped, so
+# the new token is never applied. The real bench: node 2 resumed an
+# October state file against a re-initialized primary and its media seed
+# died with 'Permission denied (publickey)' - the OLD sync private key no
+# longer matched the primary's re-generated authorized_keys. The token
+# being joined IS the cluster identity: when its cluster.conf differs from
+# the on-disk one (or the on-disk one is gone while a state file claims
+# completed steps), the state file describes a cluster that no longer
+# exists - discard it, and the join re-runs from step 1 (wipe + re-clone,
+# exactly the documented re-install path). Tolerant by design: never
+# fails (a die here would block the recovery the operator is walking
+# INTO), and no-op without a state file (the normal first join).
+# -----------------------------------------------------------------------------
+ha_join_state_freshen() {
+    _hjsf_conf="$1"    # the freshly unpacked token's cluster.conf
+    [ -f "$HA_STATE_FILE" ] || return 0
+    cmp -s "$_hjsf_conf" "$HA_CLUSTER_CONF" 2>/dev/null && return 0
+    warn "the saved join state belongs to a DIFFERENT cluster generation"
+    warn "  (the token's secrets differ from $HA_CLUSTER_CONF) -"
+    warn "  discarding it and re-joining from step 1 (local DB wiped + re-cloned)"
+    rm -f "$HA_STATE_FILE" 2>/dev/null || true
+    return 0
+}
+
 # Execute a sequence of step functions with resume support.
 # Usage: ha_run_sequence <alias> <fn1> <fn2> ...
 #

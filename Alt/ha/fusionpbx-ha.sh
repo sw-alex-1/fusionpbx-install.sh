@@ -1519,6 +1519,14 @@ Maintenance of a joined node is done with: fusionpbx-ha.sh --repair"
     [ "$HA_NODE_ID" = "3" ] && HA_JOIN_ROLE="witness"
     ha_apply_proxy
 
+    # Regression 0.3.18: a join state file is only valid for the SAME
+    # cluster secrets. '--init --force' on the primary regenerates them,
+    # and resuming against the OLD cluster.conf (step 2 unpack skipped)
+    # sent the bench to the media seed with the OLD sync private key ->
+    # 'Permission denied (publickey)'. The token IS the identity: a
+    # mismatched state file is discarded and the join re-runs from step 1.
+    ha_join_state_freshen "$HA_JOIN_TMP_CONF"
+
     # Resume convergence (0.3.13): a join-standby state file means an
     # earlier attempt ran - possibly with an older script whose sync-key
     # line sshd now refuses to parse ('invalid key option string' in the
