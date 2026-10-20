@@ -677,6 +677,12 @@ report "register prelude: NO preload convergence (0.3.16 - installer-only)" $?
 _w4="$(sed -n '/^wit_step_4_initdb_tiny()/,/^}/p' "$CLI")"
 echo "$_w4" | grep -q 'ha_repmgr_preload_write' && echo "$_w4" | grep -q 'ha_ensure_repmgr_preload'
 report "witness: preload written before the first start + convergence for a reused witness" $?
+echo "$_w4" | grep -qF 'ALTER ROLE $HA_REPMGR_USER WITH PASSWORD' \
+  && echo "$_w4" | grep -q 'password aligned with the token'
+report "witness reuse: repmgr role password aligned with the current token (0.3.16)" $?
+_i1="$(sed -n '/^init_step_1_preflight()/,/^}/p' "$CLI")"
+echo "$_i1" | grep -qF '[ ! -f "$HA_MARKER_FILE" ]' && echo "$_i1" | grep -q 'ha_port_free'
+report "init step 1: port check skipped on a marker re-configure (--init --force over an installed node, 0.3.16)" $?
 echo "$_dc" | grep -q 'ha_repmgr_preload_active' && ! echo "$_dc" | grep -q 'ha_repmgr_preload_write'
 report "doctor: preload CHECK only - never writes the config (0.3.16)" $?
 echo "$_dc" | grep -q 'HA_REPMGRD_LOG'

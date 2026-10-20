@@ -193,7 +193,11 @@ replaced with a clone of THIS one."
     ha_local_is_primary \
         || die "the local PostgreSQL is in recovery or unreadable - --init needs a healthy standalone primary"
 
-    if ! ha_state_step_is_done 1; then
+    # the free-port check belongs to a FRESH install only: a re-configure
+    # over an installed node (--init --force, marker present) finds
+    # 5433/8008 held by THIS cluster's own haproxy/agent - not a conflict
+    # (0.3.16; before, the documented maintenance path died at step 1)
+    if [ ! -f "$HA_MARKER_FILE" ] && ! ha_state_step_is_done 1; then
         ha_port_free "$HA_HAPROXY_PORT" || die "port $HA_HAPROXY_PORT is already in use (haproxy frontend)"
         ha_port_free "$HA_AGENT_PORT" || die "port $HA_AGENT_PORT is already in use (role agent)"
     fi
@@ -793,6 +797,14 @@ wit_step_4_initdb_tiny() {
     if ! pg_runuser_psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='$HA_REPMGR_USER'" | grep -q 1; then
         pg_runuser_psql -c "SET password_encryption = 'md5'; CREATE ROLE $HA_REPMGR_USER LOGIN PASSWORD '$HA_REPMGR_PASSWORD';" \
             || die "cannot create the repmgr role on the witness"
+    else
+        # 0.3.16: a REUSED witness keeps the role from its previous join -
+        # align the password with the CURRENT token (the witness repmgrd
+        # connects to this local database with it; --init --force on the
+        # primary regenerates the secrets, the reuse path must converge)
+        pg_runuser_psql -c "SET password_encryption = 'md5'; ALTER ROLE $HA_REPMGR_USER WITH PASSWORD '$HA_REPMGR_PASSWORD';" >/dev/null \
+            || die "cannot update the repmgr role password on the witness"
+        verbose "  role exists: $HA_REPMGR_USER (password aligned with the token)"
     fi
     if ! pg_runuser_psql -tAc "SELECT 1 FROM pg_database WHERE datname='$HA_REPMGR_DB'" | grep -q 1; then
         pg_runuser_psql -c "CREATE DATABASE $HA_REPMGR_DB OWNER $HA_REPMGR_USER;" \
