@@ -168,6 +168,9 @@ svc_stop() {
 # kept the 0.3.13 copy forever; (b) Environment=REPMGRD_OPTS= defines the
 # variable the ALT ExecStart references (${REPMGRD_OPTS}), silencing the
 # "Referenced but unset environment variable" warning on every start.
+# 0.3.16: installer-owned - called before EVERY repmgrd enable+start
+# (init step 7, join step 6, witness step 7, both --repair branches);
+# the doctor no longer installs anything.
 ha_install_repmgr_dropin() {
     _hrd_unit_dir="${HA_SYSTEMD_DIR}/${HA_REPMGRD_SERVICE}.service.d"
     _hrd_conf="$_hrd_unit_dir/fusionpbx-ha.conf"
@@ -804,9 +807,12 @@ $_hrpw_why" ;;
     return 0
 }
 
-# Full convergence: write when missing, ONE restart, verify. Call only
-# where a PostgreSQL restart is acceptable (register prelude flows - the
-# same contract ha_ensure_pg_listen already has there).
+# Full convergence: write when missing, ONE restart, verify. 0.3.16: the
+# only caller is the witness join step 4 (the REUSE path - an interrupted
+# join resuming with the database already running; the fresh path writes
+# the preload before the first start, the standby inherits it from the
+# clone, the primary gets it in init step 5). Never called from the doctor
+# or the register prelude - configurations belong to the installer.
 ha_ensure_repmgr_preload() {
     ha_repmgr_preload_active \
         && { verbose "  repmgr shared library is preloaded (repmgrd-ready)"; return 0; }
@@ -995,12 +1001,11 @@ ha_register_prelude() {
     esac
     systemctl reload "$HA_PG_SERVICE" 2>/dev/null \
         || pg_runuser_psql -c "SELECT pg_reload_conf();" >/dev/null 2>&1 || true
-    # 0.3.15: repmgrd cannot run without the preloaded shared memory module
-    # (bench: repmgrd died with exit 1 since the FIRST install while the
-    # rest of the cluster looked healthy). Register time - before the
-    # repmgrd start in these same flows - is the convergence point for
-    # nodes whose init/join was run by an older script version
-    ha_ensure_repmgr_preload
+    # 0.3.16: NO repmgr preload convergence here. The prelude serves the
+    # resume contract of the CURRENT version; the preload has exactly one
+    # installer write point per role (init step 5 / witness join step 4 /
+    # the standby clone) - nodes installed by an older version re-run
+    # their install command instead of being silently repaired here.
     ha_ensure_pg_listen
 
     _hrp_tmp="$(mktemp "${TMPDIR:-/tmp}/fpbx-ha-repmgr.XXXXXX")"

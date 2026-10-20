@@ -379,6 +379,9 @@ init_step_7_primary_register() {
     fi
     echo "$_ipr_out" | grep -q "successfully\|already registered" 2>/dev/null || verbose "  $_ipr_out"
     verbose "  this node is registered as the cluster primary (node 1)"
+    # 0.3.16: the repmgrd unit drop-in (ordering + REPMGRD_OPTS) is
+    # installer-owned - installed before every repmgrd enable+start
+    ha_install_repmgr_dropin
     svc_enable_start "$HA_REPMGRD_SERVICE"
 }
 
@@ -634,6 +637,9 @@ join_step_6_start_register() {
         die "'repmgr standby register' failed (see output above)"
     fi
     verbose "  registered as a standby of node $(ha_peer_id) ($(ha_peer_name))"
+    # 0.3.16: the repmgrd unit drop-in (ordering + REPMGRD_OPTS) is
+    # installer-owned - installed before every repmgrd enable+start
+    ha_install_repmgr_dropin
     svc_enable_start "$HA_REPMGRD_SERVICE"
 }
 
@@ -674,9 +680,10 @@ join_step_9_seed_media() {
         || die "media seed failed - the pull needs sshd up on $(ha_peer_ip), the sync
 key in root's authorized_keys there (rrsync-restricted root: $HA_SYNC_DIR) and
 that dir existing on the peer
-(hint: 'fusionpbx-ha.sh --doctor' on $(ha_peer_ip); if the key is rejected:
-journalctl -u sshd -n 20 on $(ha_peer_ip) shows 'invalid key option string' - the
-sync-key line there must be re-rendered by a 0.3.13+ --doctor)"
+(hint: 'fusionpbx-ha.sh --doctor' on $(ha_peer_ip) diagnoses all three; if the
+key is rejected: journalctl -u sshd -n 20 on $(ha_peer_ip) shows 'invalid key
+option string' - re-run that node's join command to re-render the sync-key
+line, the doctor itself never modifies configurations)"
     verbose "  media tree seeded: $HA_SYNC_DIR"
 }
 
@@ -771,10 +778,12 @@ wit_step_4_initdb_tiny() {
     pg_runuser_psql -tAc "SELECT 1" >/dev/null 2>&1 \
         || svc_enable_start "$HA_PG_SERVICE"
 
-    # 0.3.15: a REUSED witness (or one set up by an older script version)
-    # gets the same preload convergence as the data nodes - write when
-    # missing, ONE restart (the fresh-initdb path above already wrote the
-    # config before the first start, so this is a no-op there)
+    # A REUSED witness (an interrupted join resumes here with the database
+    # already answering) must be able to run repmgrd in step 7 - that is
+    # the join contract for BOTH paths: the fresh path above wrote the
+    # preload before the first start, the reuse path converges it after
+    # the start (write + ONE restart + verify, 0.3.15; kept in 0.3.16 -
+    # this is the only preload write point the witness has)
     ha_ensure_repmgr_preload
 
     # the witness's own repmgrd (conninfo host = THIS IP) and the failover
@@ -830,6 +839,9 @@ The witness registers against a running primary - complete --init on the primary
 }
 
 wit_step_7_repmgrd() {
+    # 0.3.16: the repmgrd unit drop-in (ordering + REPMGRD_OPTS) is
+    # installer-owned - installed before every repmgrd enable+start
+    ha_install_repmgr_dropin
     svc_enable_start "$HA_REPMGRD_SERVICE"
 }
 
@@ -942,6 +954,7 @@ rep_step_4_services() {
     haproxy -c -f "$HA_HAPROXY_MAIN" -f "$HA_HAPROXY_CONF_D" >/dev/null 2>&1 \
         || die "haproxy configuration is invalid"
     svc_enable_start "$HA_HAPROXY_SERVICE"
+    ha_install_repmgr_dropin   # 0.3.16: installer-owned unit drop-in
     svc_enable_start "$HA_REPMGRD_SERVICE"
     ha_repoint_dsn
 }
@@ -997,6 +1010,7 @@ prp_step_3_services() {
     haproxy -c -f "$HA_HAPROXY_MAIN" -f "$HA_HAPROXY_CONF_D" >/dev/null 2>&1 \
         || die "haproxy configuration is invalid"
     svc_enable_start "$HA_HAPROXY_SERVICE"
+    ha_install_repmgr_dropin   # 0.3.16: installer-owned unit drop-in
     svc_enable_start "$HA_REPMGRD_SERVICE"
     # a rebuilt primary may have lost the media tree - lsyncd cannot watch
     # a missing dir (regression 0.3.11)
@@ -1132,24 +1146,26 @@ cmd_doctor() {
         # shared_preload_libraries='repmgr' repmgrd dies at startup with
         # exit 1 and the reason ONLY in $HA_REPMGRD_LOG ('unable to write
         # to shared memory') - the journal carries nothing but the log
-        # redirect notice. Doctor converges the CONFIG side itself and
-        # demands the ONE restart it needs (a PostgreSQL restart is a
-        # service decision, not a self-heal)
+        # redirect notice. The setting is INSTALLER-owned: init step 5
+        # writes it on the primary, the witness join writes it in step 4,
+        # a standby inherits it from the clone. A node missing it was
+        # installed by an older script version (or lost the line).
+        # 0.3.16: the doctor is read-only diagnostics - it reports and
+        # names the fix command, it never touches the configuration
         if ha_repmgr_preload_active; then
             _dr_ok "shared_preload_libraries includes repmgr (repmgrd-ready)"
         else
-            _dc_pre_err="$(mktemp "${TMPDIR:-/tmp}/fpbx-ha-doctor-pre.XXXXXX")"
-            if ( ha_repmgr_preload_write ) >"$_dc_pre_err" 2>&1; then
-                _dr_fail "repmgrd cannot run: shared_preload_libraries lacks 'repmgr'
+            case "$HA_NODE_ID" in
+                1) _dc_pre_fix="fusionpbx-ha.sh --init --force (same --node2/--node3 as before)" ;;
+                2) _dc_pre_fix="fusionpbx-ha.sh --repair --force-clone (re-clone inherits the setting)" ;;
+                *) _dc_pre_fix="fusionpbx-ha.sh --repair (witness join step converges it)" ;;
+            esac
+            _dr_fail "repmgrd cannot run: shared_preload_libraries lacks 'repmgr'
        (dies instantly: 'unable to write to shared memory', reason only in $HA_REPMGRD_LOG)
-       The configuration is now written - ONE PostgreSQL restart activates it:
-       systemctl restart $HA_PG_SERVICE
-       then re-run the doctor: repmgrd will come up and automatic failover returns"
-            else
-                _dr_fail "repmgrd cannot run: shared_preload_libraries lacks 'repmgr' and the write failed:
-$(sed 's/^/       /' "$_dc_pre_err" | tail -n 6)"
-            fi
-            rm -f "$_dc_pre_err"
+       The installer always writes this setting - this node predates that
+       installer version or lost the line. Fix on this node:
+       $_dc_pre_fix
+       (the doctor never modifies configurations)"
         fi
 
         # 3. frozen-sync detection (primary without a streaming standby but
@@ -1212,51 +1228,20 @@ Check: systemctl status haproxy $HA_AGENT_UNIT_NAME"
     for _dc_svc in $_dc_set; do
         if svc_active "$_dc_svc" 2>/dev/null; then
             _dr_ok "service $_dc_svc active"
-        elif [ "$_dc_svc" = "$HA_REPMGRD_SERVICE" ] || [ "$_dc_svc" = "$HA_LSYNCD_SERVICE" ]; then
-            # self-heal (0.3.13): on the bench repmgrd was dead after a
-            # node reboot while postgresql was up (the ALT unit can lose
-            # the boot race), and lsyncd was left dead by the 0.3.12
-            # doctor bug that truncated its config. Both are always-on
-            # daemons of a joined node: install the ordering drop-in
-            # (repmgrd only), start back, re-check.
-            #
-            # 0.3.14: (a) never START lsyncd on a stale config - converge
-            # it first (starting on a broken config crash-loops the unit
-            # straight into systemd's start-rate-limit, which then refuses
-            # even the valid restart seconds later - the 0.3.13 bench
-            # trap); (b) reset-failed clears that limiter state before
-            # the start ("start request repeated too quickly"); (c) when
-            # the daemon still refuses to come up, quote the journal tail
-            # INLINE - the reason must be visible in the same run, not
-            # behind a second manual command.
-            [ "$_dc_svc" = "$HA_REPMGRD_SERVICE" ] && ha_install_repmgr_dropin
-            if [ "$_dc_svc" = "$HA_LSYNCD_SERVICE" ] && [ -f "$HA_LSYNCD_CONF" ]; then
-                _dc_lsyn_fix="$HA_ETC_DIR/.lsyncd.conf.doctor"
-                if ha_render "$HA_RES_DIR/lsyncd.conf.lua.tpl" "$_dc_lsyn_fix" \
-                        "SYNC_DIR=$HA_SYNC_DIR" "SYNC_DELAY=$HA_SYNC_DELAY" "PEER_IP=$(ha_peer_ip)" 2>/dev/null; then
-                    cat "$_dc_lsyn_fix" > "$HA_LSYNCD_CONF" 2>/dev/null || true
-                    rm -f "$_dc_lsyn_fix"
-                fi
-            fi
-            systemctl reset-failed "$_dc_svc" 2>/dev/null || true
-            if systemctl start "$_dc_svc" 2>/dev/null && sleep 2 \
-                && svc_active "$_dc_svc" 2>/dev/null; then
-                _dr_ok "service $_dc_svc started (was inactive - check why: journalctl -u $_dc_svc -n 30)"
-            else
-                _dr_fail "service $_dc_svc NOT active and a start attempt failed - journal tail:"
-                journalctl -u "$_dc_svc" -n 15 --no-pager 2>/dev/null | sed 's/^/       /' || true
-                # 0.3.15: after the 'redirecting logging output' notice
-                # EVERYTHING repmgrd says goes to its log_file - the die
-                # reason never reaches the journal. Quote the log tail
-                # right below it (bench: 'unable to write to shared
-                # memory' lived there since the first install)
-                if [ "$_dc_svc" = "$HA_REPMGRD_SERVICE" ] && [ -s "$HA_REPMGRD_LOG" ]; then
-                    error "       repmgrd log tail ($HA_REPMGRD_LOG):"
-                    tail -n 15 "$HA_REPMGRD_LOG" 2>/dev/null | sed 's/^/       /' || true
-                fi
-            fi
         else
-            _dr_fail "service $_dc_svc NOT active"
+            # 0.3.16: read-only diagnostics - no start attempt, no
+            # reset-failed, no config convergence, no drop-in installs:
+            # configurations belong to the installer/repair flows. The
+            # reason must be visible in the SAME run: journal tail inline,
+            # and for repmgrd ALSO the log_file tail - after the
+            # 'redirecting logging output' notice everything repmgrd says
+            # goes to $HA_REPMGRD_LOG, the journal stays silent (0.3.15)
+            _dr_fail "service $_dc_svc NOT active - journal tail:"
+            journalctl -u "$_dc_svc" -n 15 --no-pager 2>/dev/null | sed 's/^/       /' || true
+            if [ "$_dc_svc" = "$HA_REPMGRD_SERVICE" ] && [ -s "$HA_REPMGRD_LOG" ]; then
+                error "       repmgrd log tail ($HA_REPMGRD_LOG):"
+                tail -n 15 "$HA_REPMGRD_LOG" 2>/dev/null | sed 's/^/       /' || true
+            fi
         fi
     done
 
@@ -1278,13 +1263,12 @@ Check: systemctl status haproxy $HA_AGENT_UNIT_NAME"
             [ -f "$HA_SYNC_DIR" ] || [ -d "$HA_SYNC_DIR" ] || _dr_fail "sync dir missing: $HA_SYNC_DIR"
         fi
 
-        # 8b. lsyncd config conformance (data nodes): a config rendered by an
-        # OLDER script version can be silently wrong for the current template
-        # (0.3.12: the peer's forced rrsync-command serves paths RELATIVE to
-        # its restricted root - the pre-0.3.12 absolute target mirrored the
-        # tree into a NESTED dir on the peer). Already-initialized nodes
-        # never re-run init step 14, so the doctor is their convergence
-        # point: re-render from the current template and restart on drift.
+        # 8b. lsyncd config conformance (data nodes): a config rendered by
+        # an OLDER script version can be silently wrong for the current
+        # template (0.3.12: the pre-0.3.12 absolute target mirrored the
+        # tree into a NESTED dir on the peer). 0.3.16: read-only - report
+        # the drift and the fix command; the config belongs to the
+        # installer/repair flows, the doctor never modifies it
         if [ -f "$HA_LSYNCD_CONF" ]; then
             _dc_lsyn_new="$HA_ETC_DIR/.lsyncd.conf.doctor"
             ha_render "$HA_RES_DIR/lsyncd.conf.lua.tpl" "$_dc_lsyn_new" \
@@ -1292,38 +1276,51 @@ Check: systemctl status haproxy $HA_AGENT_UNIT_NAME"
             if cmp -s "$_dc_lsyn_new" "$HA_LSYNCD_CONF"; then
                 _dr_ok "lsyncd config matches the current template"
             else
-                cat "$_dc_lsyn_new" > "$HA_LSYNCD_CONF"
-                # 0.3.14: clear a possible start-rate-limit before the
-                # restart (a unit that crash-looped on the stale config
-                # refuses restarts - "start request repeated too quickly"),
-                # and quote the journal tail inline if it still refuses.
-                systemctl reset-failed "$HA_LSYNCD_SERVICE" 2>/dev/null || true
-                if systemctl restart "$HA_LSYNCD_SERVICE" 2>/dev/null; then
-                    _dr_warn "lsyncd config was stale (older script version) - re-rendered, lsyncd restarted"
-                else
-                    _dr_fail "lsyncd config was stale - re-rendered, but the lsyncd restart failed - journal tail:"
-                    journalctl -u "$HA_LSYNCD_SERVICE" -n 15 --no-pager 2>/dev/null | sed 's/^/       /' || true
-                fi
+                _dr_fail "lsyncd config DIFFERS from the current template
+       (an older script version may mirror the media tree into a wrong place
+       on the peer - the 0.3.12 class). Re-render it on this node:
+       fusionpbx-ha.sh --repair
+       (the doctor never modifies configurations)"
             fi
             rm -f "$_dc_lsyn_new"
         fi
 
-        # 8c. authorized_keys conformance (data nodes): the sync-key line
-        # is written ONCE (join step 2 / init steps 12-14). A line left by
-        # an older script, an interrupted write or a pre-rrsync write can
-        # leave the peer's rsync/lsyncd pushes rejected outright (sshd:
-        # 'invalid key option string'). Same convergence philosophy as 8b:
-        # re-render idempotently, report drift. Root only - a read-only
-        # doctor run by a mere mortal must not die on /root/.ssh perms.
+        # 8c. authorized_keys conformance (data nodes): the sync-key line is
+        # written by the INSTALLER (join steps 2-3 / init steps 12-14). A
+        # line left by an older script version, an interrupted write or a
+        # pre-rrsync write makes the peer's sshd reject the rsync/lsyncd
+        # pushes outright ('invalid key option string' in its sshd log).
+        # 0.3.16: read-only verification - the expected line is rebuilt
+        # the same way the writer builds it, and stray duplicate lines with
+        # the same key blob are counted; nothing is ever written. Root
+        # only - a doctor run by a mere mortal cannot read /root/.ssh.
         if [ -n "${HA_SYNC_PUBLIC_KEY:-}" ] && [ "$(id -u)" = "0" ]; then
             _dc_ak_file="${HA_SYNC_SSH_DIR:-/root/.ssh}/authorized_keys"
-            _dc_ak_sum="$(md5sum "$_dc_ak_file" 2>/dev/null | awk '{print $1}')"
-            ha_write_authorized_keys
-            if [ -n "$_dc_ak_sum" ] \
-                && [ "$(md5sum "$_dc_ak_file" 2>/dev/null | awk '{print $1}')" = "$_dc_ak_sum" ]; then
-                _dr_ok "authorized_keys: sync-key line matches the current pattern"
+            _dc_ak_rrsync="${HA_RRSYNC_INSTALL_DIR:-/usr/local/bin}/rrsync"
+            [ -x "$_dc_ak_rrsync" ] || { cmd_exists rrsync && _dc_ak_rrsync="$(command -v rrsync)"; }
+            if [ ! -x "$_dc_ak_rrsync" ]; then
+                _dr_warn "authorized_keys: cannot verify - rrsync not found (the installer copies it)"
+            elif [ ! -f "$_dc_ak_file" ]; then
+                _dr_fail "authorized_keys missing: $_dc_ak_file - the peer's pushes are rejected preauth"
             else
-                _dr_warn "authorized_keys: sync-key line re-rendered (was stale, broken or missing)"
+                _dc_ak_blob="$(printf '%s' "$HA_SYNC_PUBLIC_KEY" | awk '{print $2}')"
+                _dc_ak_expect="from=\"$(ha_node_ip 1),$(ha_node_ip 2)\",command=\"$_dc_ak_rrsync $HA_SYNC_DIR\",no-pty,no-agent-forwarding,no-X11-forwarding,no-port-forwarding $HA_SYNC_PUBLIC_KEY"
+                _dc_ak_n="$(grep -cF -- "$_dc_ak_blob" "$_dc_ak_file" 2>/dev/null || true)"
+                if grep -qF -- "$_dc_ak_expect" "$_dc_ak_file" 2>/dev/null \
+                        && [ "${_dc_ak_n:-0}" = "1" ]; then
+                    _dr_ok "authorized_keys: sync-key line matches the current pattern"
+                elif [ "${_dc_ak_n:-0}" -gt 1 ] 2>/dev/null; then
+                    _dr_fail "authorized_keys: $_dc_ak_n copies of the sync key (stray stale lines)
+       sshd may refuse the file line outright ('invalid key option string') and
+       the peer's pushes die preauth. Re-run this node's join command:
+       rm $HA_MARKER_FILE && fusionpbx-ha.sh --join TOKEN
+       (the doctor never modifies configurations)"
+                else
+                    _dr_fail "authorized_keys: sync-key line missing or stale - the peer's pushes
+       are rejected preauth. Re-run this node's join command:
+       rm $HA_MARKER_FILE && fusionpbx-ha.sh --join TOKEN
+       (the doctor never modifies configurations)"
+                fi
             fi
         fi
         if cmd_exists sshd; then :; else _dr_warn "cannot verify sshd command"; fi

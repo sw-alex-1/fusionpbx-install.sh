@@ -37,10 +37,9 @@ mkdir -p "$WORK/systemd/repmgr.service.d"   # 0.3.15: drop-in sandbox target
 
 cat > "$FB/systemctl" <<'EOF'
 #!/bin/sh
-# 0.3.15: selective stub - SYSTEMCTL_INACTIVE (space-separated unit list)
-# makes those units report is-active=3 (doctor self-heal branches) and,
-# with SYSTEMCTL_START_FAIL set, their start attempts fail so the FAIL
-# diagnostics (inline journal + repmgrd log tail) become reachable.
+# 0.3.15/0.3.16: selective stub - SYSTEMCTL_INACTIVE (space-separated unit
+# list) makes those units report is-active=3, so the doctor's read-only
+# FAIL branches (inline journal + repmgrd log tails) become reachable.
 # NOTE: the real callers pass flags before the unit ('is-active --quiet
 # repmgr') - the unit is the LAST non-flag argument, not $2
 _unit=""
@@ -54,13 +53,6 @@ case "$1" in
     is-active)
         case " ${SYSTEMCTL_INACTIVE:-} " in
             *" $_unit "*) exit 3 ;;
-        esac
-        exit 0 ;;
-    start)
-        case " ${SYSTEMCTL_INACTIVE:-} " in
-            *" $_unit "*)
-                [ -n "${SYSTEMCTL_START_FAIL:-}" ] && exit "${SYSTEMCTL_START_FAIL}"
-                ;;
         esac
         exit 0 ;;
 esac
@@ -92,9 +84,11 @@ case "$_sql" in
     *sync_state*) echo "${PSQL_SYNCSTATE:-sync}" ;;
     *synchronous_standby_names*) echo "${PSQL_SYNCNAMES:-}" ;;
     # 0.3.15: repmgrd shared memory preload ('-' not ':-' - an EMPTY value
-    # must stay empty so the missing-preload doctor path is testable)
+    # must stay empty so the missing-preload doctor path is testable);
+    # 0.3.16: PSQL_ALTER_LOG records every ALTER SYSTEM the doctor issues
+    # - the read-only contract asserts it stays EMPTY
     *"SHOW shared_preload_libraries"*) echo "${PSQL_PRELOAD-repmgr}" ;;
-    *"ALTER SYSTEM SET shared_preload_libraries"*) exit 0 ;;
+    *"ALTER SYSTEM SET shared_preload_libraries"*) echo alter >>"${PSQL_ALTER_LOG:-/dev/null}" 2>/dev/null; exit 0 ;;
     *"count(*) FROM repmgr.nodes"*) echo "${PSQL_NODES:-3}" ;;
     *"SELECT 1"*) echo 1 ;;
     *"SELECT 1 FROM pg_roles"*) echo 1 ;;
@@ -241,6 +235,22 @@ HA_SYNC_PUBLIC_KEY="ssh-ed25519 AAAAKEY fusionpbx-ha-sync"
 EOF
 sed -i "s|/nonexistent-should-be-overridden|$WORK/storage|" "$WORK/etc/cluster.conf"
 
+# 0.3.16: deterministic rrsync location + a HEALTHY authorized_keys
+# fixture. The doctor verifies the sync-key line READ-ONLY now, so the
+# fixture must exist before any --doctor run; HA_RRSYNC_INSTALL_DIR pins
+# rrsync discovery (never the real /usr/local/bin or the host's rrsync)
+mkdir -p "$WORK/bin" "$WORK/sshdir"
+printf '#!/bin/sh\nexit 0\n' > "$WORK/bin/rrsync"
+chmod 755 "$WORK/bin/rrsync"
+AK_LINE="from=\"10.0.0.11,10.0.0.12\",command=\"$WORK/bin/rrsync $WORK/storage\",no-pty,no-agent-forwarding,no-X11-forwarding,no-port-forwarding ssh-ed25519 AAAAKEY fusionpbx-ha-sync"
+{
+    echo "# fusionpbx-ha: managed block"
+    echo "# BEGIN fusionpbx-ha (managed)"
+    printf '%s\n' "$AK_LINE"
+    echo "# END fusionpbx-ha (managed)"
+} > "$WORK/sshdir/authorized_keys"
+chmod 600 "$WORK/sshdir/authorized_keys"
+
 # run the real script in the sandbox. Args after the environment file.
 ha_cli() {
     (
@@ -268,9 +278,11 @@ ha_cli() {
         export HA_PROMOTE_SH="$WORK/lib/promote.sh"
         export HA_HAPROXY_MAIN="$WORK/haproxy.d/main.cfg"
         export HA_HOSTS_FILE="$WORK/hosts-cli"
-        # 0.3.13: --doctor re-renders the sync-key line - keep it in the
-        # sandbox (never the real /root/.ssh, even when tests run as root)
+        # 0.3.13/0.3.16: authorized_keys are verified read-only - keep the
+        # sandbox paths (never the real /root/.ssh, even when tests run as
+        # root); the rrsync location is pinned for the same reason
         export HA_SYNC_SSH_DIR="$WORK/sshdir"
+        export HA_RRSYNC_INSTALL_DIR="$WORK/bin"
         # cluster-firewall persistence target (0.3.6): sandbox-safe
         export HA_IPTABLES_CONF="$WORK/iptables.rules"
         # default role-agent answers: node1 primary, node2 standby
@@ -506,27 +518,41 @@ report "--doctor witness: no haproxy/agent checks" "$?"
 # ---------------------------------------------------------------------------
 echo "== --doctor: repmgr shared memory preload (regression 0.3.15) =="
 # Bench: repmgrd died instantly (exit 1, journal silent) since the first
-# install - shared_preload_libraries lacked 'repmgr'. The doctor must FAIL
-# with the restart instruction AND converge the config side itself.
-PSQL_PRELOAD="" ha_cli --doctor > "$WORK/out.log" 2>&1; _rc=$?
+# install - shared_preload_libraries lacked 'repmgr'. 0.3.16: the doctor is
+# READ-ONLY diagnostics - it must FAIL with the role-specific fix hint and
+# must NOT issue a single ALTER SYSTEM (the config is installer-owned)
+: > "$WORK/alter.log"
+PSQL_PRELOAD="" PSQL_ALTER_LOG="$WORK/alter.log" ha_cli --doctor > "$WORK/out.log" 2>&1; _rc=$?
 [ "$_rc" != "0" ] && grep -q "repmgrd cannot run" "$WORK/out.log" \
-  && grep -q "systemctl restart postgresql" "$WORK/out.log" \
-  && grep -q "The configuration is now written" "$WORK/out.log"
-report "--doctor: missing preload -> FAIL + config written + restart demanded" "$?" "$(grep -m1 'shared_preload_libraries' "$WORK/out.log")"
+  && grep -q -- "--init --force" "$WORK/out.log" \
+  && grep -q "never modifies configurations" "$WORK/out.log" \
+  && [ ! -s "$WORK/alter.log" ]
+report "--doctor: missing preload -> FAIL + fix hint, NO config write" "$?" "$(grep -m1 'shared_preload_libraries' "$WORK/out.log")"
+
+echo "== --doctor: missing preload - role-specific hints =="
+PSQL_PRELOAD="" FAKE_IP=10.0.0.12 ha_cli --doctor > "$WORK/out.log" 2>&1; _rc=$?
+[ "$_rc" != "0" ] && grep -q -- "--repair --force-clone" "$WORK/out.log"
+report "--doctor: standby node gets the re-clone hint" "$?"
+PSQL_PRELOAD="" FAKE_IP=10.0.0.13 ha_cli --doctor > "$WORK/out.log" 2>&1; _rc=$?
+[ "$_rc" != "0" ] && grep -q -- "--repair (witness" "$WORK/out.log"
+report "--doctor: witness node gets the repair hint" "$?"
 
 echo "== --doctor: healthy preload line =="
 ha_cli --doctor > "$WORK/out.log" 2>&1; _rc=$?
 [ "$_rc" = "0" ] && grep -q "shared_preload_libraries includes repmgr" "$WORK/out.log"
 report "--doctor: preloaded node shows the repmgrd-ready OK line" "$?"
 
-echo "== --doctor: repmgrd log tail quoted on service failure (0.3.15) =="
-# repmgrd writes its die reason to log_file, NOT to the journal - the doctor
-# must quote the log tail right below the journal tail
+echo "== --doctor: repmgrd log tail quoted on service failure (0.3.15/0.3.16) =="
+# repmgrd writes its die reason to log_file, NOT to the journal - when the
+# service is inactive the doctor quotes journal AND log-file tails inline
+# (read-only: no start attempt is made)
 printf '[2026-10-19 12:49:51] [ERROR] unable to write to shared memory\n[2026-10-19 12:49:51] [HINT] ensure "shared_preload_libraries" includes "repmgr"\n' > "$WORK/repmgrd.log"
-SYSTEMCTL_INACTIVE="repmgr" SYSTEMCTL_START_FAIL=1 ha_cli --doctor > "$WORK/out.log" 2>&1; _rc=$?
-[ "$_rc" != "0" ] && grep -q "repmgrd log tail" "$WORK/out.log" \
+SYSTEMCTL_INACTIVE="repmgr" ha_cli --doctor > "$WORK/out.log" 2>&1; _rc=$?
+[ "$_rc" != "0" ] && grep -q "service repmgr NOT active" "$WORK/out.log" \
+  && grep -q "repmgrd log tail" "$WORK/out.log" \
   && grep -q "unable to write to shared memory" "$WORK/out.log"
-report "--doctor: repmgrd log file tail quoted inline on daemon failure" "$?" "$(grep -m1 'repmgrd log tail' "$WORK/out.log")"
+report "--doctor: inactive repmgrd -> FAIL + journal and log-file tails inline" "$?" "$(grep -m1 'repmgrd log tail' "$WORK/out.log")"
+: > "$WORK/repmgrd.log"
 
 echo "== --doctor: lsyncd errors from a DEAD instance ignored (0.3.15) =="
 # Bench: ssh Permission denied during the boot race at 12:49:48 kept the
@@ -553,6 +579,41 @@ ha_cli --doctor > "$WORK/out.log" 2>&1; _rc=$?
 report "--doctor: fresh lsyncd errors (current instance) still warn" "$?"
 : > "$WORK/lsyncd.log"
 : > "$WORK/repmgrd.log"
+
+echo "== --doctor: lsyncd config drift -> FAIL, config NOT rewritten (0.3.16) =="
+# the config belongs to the installer/repair flows: the doctor reports the
+# drift and leaves the file byte-identical (the 0.3.12 doctor truncated it
+# to zero bytes while trying to help)
+printf 'settings = {}\n' > "$WORK/lsyncd.conf.lua"
+_lsyn_sum="$(md5sum "$WORK/lsyncd.conf.lua" 2>/dev/null | awk '{print $1}')"
+ha_cli --doctor > "$WORK/out.log" 2>&1; _rc=$?
+[ "$_rc" != "0" ] && grep -q "lsyncd config DIFFERS from the current template" "$WORK/out.log" \
+  && [ "$(md5sum "$WORK/lsyncd.conf.lua" 2>/dev/null | awk '{print $1}')" = "$_lsyn_sum" ] \
+  && [ ! -e "$WORK/etc/.lsyncd.conf.doctor" ]
+report "--doctor: drifted lsyncd config -> FAIL, file byte-identical after the run" "$?"
+rm -f "$WORK/lsyncd.conf.lua"
+
+echo "== --doctor: authorized_keys verified read-only (0.3.16) =="
+if [ "$(id -u)" = "0" ]; then
+    printf 'garbage\n' > "$WORK/sshdir/authorized_keys"
+    _ak_sum="$(md5sum "$WORK/sshdir/authorized_keys" 2>/dev/null | awk '{print $1}')"
+    ha_cli --doctor > "$WORK/out.log" 2>&1; _rc=$?
+    [ "$_rc" != "0" ] && grep -q "sync-key line missing or stale" "$WORK/out.log" \
+      && [ "$(md5sum "$WORK/sshdir/authorized_keys" 2>/dev/null | awk '{print $1}')" = "_ak_sum" ]
+    report "--doctor: stale authorized_keys -> FAIL, file byte-identical after the run" "$?"
+    # restore the healthy fixture and assert the read-only OK verdict
+    {
+        echo "# fusionpbx-ha: managed block"
+        echo "# BEGIN fusionpbx-ha (managed)"
+        printf '%s\n' "$AK_LINE"
+        echo "# END fusionpbx-ha (managed)"
+    } > "$WORK/sshdir/authorized_keys"
+    ha_cli --doctor > "$WORK/out.log" 2>&1; _rc=$?
+    [ "$_rc" = "0" ] && grep -q "sync-key line matches the current pattern" "$WORK/out.log"
+    report "--doctor: healthy sync-key line -> OK (read-only verification)" "$?"
+else
+    report "--doctor: authorized_keys read-only checks (skipped: not root)" 0
+fi
 
 # ---------------------------------------------------------------------------
 echo "== --print-token =="

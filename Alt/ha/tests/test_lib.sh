@@ -92,8 +92,15 @@ case "$_q" in
     *"SHOW synchronous_standby_names"*) echo "${PSQL_SYNCNAMES:-}" ;;
     # 0.3.15: repmgrd shared memory preload knobs ('-' not ':-' so a test
     # can inject an EMPTY value - an unset var still gets the healthy
-    # default 'repmgr')
-    *"SHOW shared_preload_libraries"*) echo "${PSQL_PRELOAD-repmgr}" ;;
+    # default 'repmgr'). Stateful for ha_ensure_repmgr_preload: once an
+    # ALTER is logged, SHOW reports the merged value (0.3.16 - the
+    # "restart" applied it)
+    *"SHOW shared_preload_libraries"*)
+        if [ -s "${PSQL_ALTER_PRELOAD_LOG:-/dev/null}" ]; then
+            echo "${PSQL_ALTER_VALUE:-repmgr}"
+        else
+            echo "${PSQL_PRELOAD-repmgr}"
+        fi ;;
     *"ALTER SYSTEM SET shared_preload_libraries"*)
         # PSQL_ALTER_PRELOAD_LOG records the SQL for value assertions,
         # PSQL_ALTER_PRELOAD_RC injects a server-side refusal
@@ -475,8 +482,8 @@ echo "== media path form over rrsync (regression 0.3.13) =="
 # sender open ('post-realpath open failed'). The ONLY form valid on every
 # variant is the bare dot - validated_arg skips it entirely ('arg != .'),
 # and '.' resolves to CWD = the peer's restricted tree root. The seed
-# pulls ':.', the lsyncd template pushes to ':.', and --doctor converges
-# configs rendered by older script versions.
+# pulls ':.', the lsyncd template pushes to ':.', and --doctor REPORTS
+# configs that drift from the current template (read-only, 0.3.16).
 echo "$_j9" | grep -Fq '"root@$(ha_peer_ip):."'
 report "join step 9: pulls the rrsync tree root as the bare dot (:.)" $?
 if echo "$_j9" | grep -Fq 'ha_peer_ip):$HA_SYNC_DIR'; then false; else true; fi
@@ -488,10 +495,13 @@ report "lsyncd template: source pins the contents slash" $?
 grep -Fq 'target    = "root@@@PEER_IP@@:."' "$RES/lsyncd.conf.lua.tpl"
 report "lsyncd template: target is the bare dot (:.)" $?
 _dc="$(sed -n '/^cmd_doctor()/,/^}/p' "$CLI")"
+# 0.3.16: the doctor renders the current template and COMPARES - drift is
+# reported, the config is never rewritten and lsyncd is never restarted
 _dc_ck="$(echo "$_dc" | grep -n 'lsyncd.conf.lua.tpl' | head -1 | cut -d: -f1)"
-_dc_rs="$(echo "$_dc" | grep -n 'systemctl restart "$HA_LSYNCD_SERVICE"' | head -1 | cut -d: -f1)"
-[ -n "$_dc_ck" ] && [ -n "$_dc_rs" ] && [ "$_dc_ck" -lt "$_dc_rs" ]
-report "doctor: re-renders a stale lsyncd config and restarts the daemon" $?
+_dc_cmp="$(echo "$_dc" | grep -nF 'cmp -s "$_dc_lsyn_new" "$HA_LSYNCD_CONF"' | head -1 | cut -d: -f1)"
+[ -n "$_dc_ck" ] && [ -n "$_dc_cmp" ] \
+  && ! echo "$_dc" | grep -q 'systemctl restart "$HA_LSYNCD_SERVICE"'
+report "doctor: renders the current lsyncd template, compares, never restarts (0.3.16)" $?
 
 # live rrsync semantics (the same hardened wrapper class ALT ships - skip
 # when the test host has none): the family has TWO arg mappings - newer
@@ -616,6 +626,20 @@ FIX_RECOVERY=f PSQL_PRELOAD="" PSQL_ALTER_PRELOAD_RC=3 \
 echo "$OUT" | grep -q 'refused on a live primary' && echo "$OUT" | grep -q 'stub-injected preload ALTER failure'
 report "write: live primary refusal -> die quoting the real psql error" $? "$OUT"
 
+# ensure (0.3.16 - the only remaining caller is the witness join reuse
+# path): missing preload -> write + ONE restart + verify
+: > "$WORK/preload-ensure.log"
+PSQL_PRELOAD="" PSQL_ALTER_PRELOAD_LOG="$WORK/preload-ensure.log" \
+    HA_PG_PKGLIBDIR="$WORK/pkglib" HA_SYSTEMD_DIR="$WORK/systemd" \
+    lib_run 'ha_ensure_repmgr_preload && echo ensured'
+echo "$OUT" | grep -q '^ensured$' \
+  && [ "$(tail -1 "$WORK/preload-ensure.log")" = "ALTER SYSTEM SET shared_preload_libraries = 'repmgr';" ]
+report "ensure: missing preload -> write + one restart + verify (witness reuse)" $? "$OUT"
+PSQL_PRELOAD="" HA_PG_PKGLIBDIR="$WORK/pkglib" HA_SYSTEMD_DIR="$WORK/systemd" \
+    lib_run 'ha_ensure_repmgr_preload; echo rc=$?'
+echo "$OUT" | grep -q "does not include 'repmgr' after the restart"
+report "ensure: post-restart verification failure is fatal" $? "$OUT"
+
 # pkglibdir override precedence
 HA_PG_PKGLIBDIR="$WORK/pkglib" lib_run 'p=$(ha_pg_pkglibdir); [ "$p" = "$WORK/pkglib" ] && echo ok'
 [ "$OUT" = "ok" ]; report "pkglibdir: HA_PG_PKGLIBDIR override honored" $?
@@ -636,39 +660,47 @@ grep -c '^Environment=REPMGRD_OPTS=$' "$WORK/systemd/repmgr.service.d/fusionpbx-
     && echo "$OUT" | grep -q '^di2$'
 report "drop-in: idempotent - exactly one Environment= line after re-run" $? "$OUT"
 
-# 0.3.15 source contracts: the preload joins the init step-5 one-restart
-# batch BEFORE the restart decision, is verified after it; the register
-# prelude and the witness step converge it; the doctor checks it and quotes
-# the repmgrd LOG FILE (not only the journal) when the daemon dies
+# 0.3.15/0.3.16 source contracts: the preload joins the init step-5
+# one-restart batch BEFORE the restart decision and is verified after it;
+# the witness join writes it (fresh: before the first start; reuse:
+# ha_ensure_repmgr_preload after it). 0.3.16: the doctor CHECKS the
+# preload but never writes it, quotes the repmgrd LOG FILE (not only the
+# journal) when the daemon is down, and stays read-only overall
 _i5="$(sed -n '/^init_step_5_wal_log_hints()/,/^}/p' "$CLI")"
 echo "$_i5" | grep -q 'ha_repmgr_preload_active' && echo "$_i5" | grep -q 'ha_repmgr_preload_write'
 report "init step 5: preload joins the one-restart step (write before restart)" $?
 echo "$_i5" | grep -q 'ha_repmgr_preload_active \\' && echo "$_i5" | grep -q "|| die \"shared_preload_libraries does not include"
 report "init step 5: preload verified after the restart" $?
 _hrp="$(sed -n '/^ha_register_prelude()/,/^}/p' "$LIB")"
-echo "$_hrp" | grep -q 'ha_ensure_repmgr_preload'
-report "register prelude: repmgr preload convergence (resume self-heal)" $?
+if echo "$_hrp" | grep -q 'ha_ensure_repmgr_preload'; then false; else true; fi
+report "register prelude: NO preload convergence (0.3.16 - installer-only)" $?
 _w4="$(sed -n '/^wit_step_4_initdb_tiny()/,/^}/p' "$CLI")"
 echo "$_w4" | grep -q 'ha_repmgr_preload_write' && echo "$_w4" | grep -q 'ha_ensure_repmgr_preload'
 report "witness: preload written before the first start + convergence for a reused witness" $?
-echo "$_dc" | grep -q 'ha_repmgr_preload_active' && echo "$_dc" | grep -q 'ha_repmgr_preload_write'
-report "doctor: preload check + config-side self-heal" $?
+echo "$_dc" | grep -q 'ha_repmgr_preload_active' && ! echo "$_dc" | grep -q 'ha_repmgr_preload_write'
+report "doctor: preload CHECK only - never writes the config (0.3.16)" $?
 echo "$_dc" | grep -q 'HA_REPMGRD_LOG'
 report "doctor: repmgrd log-file tail quoted on service failure" $?
 echo "$_dc" | grep -q "awk '/Startup/{buf=\"\"}"
 report "doctor: lsyncd log errors counted from the CURRENT instance only" $?
 
-# 0.3.13 source contracts: the 0.3.12 doctor truncated the lsyncd config
-# to zero bytes (a missing '$' made cmp/cat/rm read a literal '_dc_lsyn_new'
-# file - 'cat: _dc_lsyn_new: No such file or directory' while the redirect
-# already truncated the real config), and it must converge authorized_keys
-# + self-heal repmgrd/lsyncd.
-if grep -Fq 'cat "$_dc_lsyn_new"' "$CLI" && ! grep -Fq 'cat "_dc_lsyn_new"' "$CLI"; then true; else false; fi
-report "doctor: lsyncd re-render uses the \$_dc_lsyn_new variable (no truncation)" $?
-echo "$_dc" | grep -q 'ha_write_authorized_keys'
-report "doctor: authorized_keys convergence check present" $?
-echo "$_dc" | grep -q 'ha_install_repmgr_dropin'
-report "doctor: repmgrd self-heal installs the boot-ordering drop-in" $?
+# 0.3.13/0.3.16 source contracts: the 0.3.12 doctor truncated the lsyncd
+# config to zero bytes (a missing '$' made cmp/cat/rm read a literal
+# '_dc_lsyn_new' file while the redirect already truncated the real
+# config); 0.3.16 removed the doctor's rewrite ENTIRELY - drift is
+# REPORTED, the config belongs to the installer/repair flows
+if grep -Fq 'cat "$_dc_lsyn_new"' "$CLI" || grep -Fq 'cat "_dc_lsyn_new"' "$CLI"; then false; else true; fi
+report "doctor: lsyncd drift reported - no rewrite, no truncation class (0.3.16)" $?
+if echo "$_dc" | grep -q 'ha_write_authorized_keys'; then false; else true; fi
+report "doctor: authorized_keys verified WITHOUT writing (0.3.16)" $?
+if echo "$_dc" | grep -q 'ha_install_repmgr_dropin'; then false; else true; fi
+report "doctor: no drop-in installation - moved to the installer (0.3.16)" $?
+_dropin_ok=0
+for _dfn in init_step_7_primary_register join_step_6_start_register wit_step_7_repmgrd rep_step_4_services prp_step_3_services; do
+    sed -n "/^${_dfn}()/,/^}/p" "$CLI" | grep -q 'ha_install_repmgr_dropin' || _dropin_ok=1
+done
+[ "$_dropin_ok" = "0" ]
+report "installer/repair: repmgrd unit drop-in installed before every enable+start" $?
 grep -q 'After=$HA_PG_SERVICE.service' "$LIB"
 report "drop-in: repmgrd ordered after local postgresql" $?
 _cj="$(sed -n '/^cmd_join()/,/^}/p' "$CLI")"
@@ -678,20 +710,14 @@ _j3="$(sed -n '/^join_step_3_packages()/,/^}/p' "$CLI")"
 echo "$_j3" | grep -q 'rsync curl' && echo "$_j3" | grep -q 'ha_write_authorized_keys'
 report "join step 3: sync-key line re-rendered once rsync is installed" $?
 
-# 0.3.14: the self-heal must (a) converge the lsyncd config BEFORE starting
-# the daemon (starting on a stale config crash-loops the unit into systemd's
-# start-rate-limit, which then refuses even the valid restart seconds later
-# - the 0.3.13 bench trap), (b) clear that limiter state with reset-failed,
-# and (c) quote the journal tail INLINE when a daemon refuses to come up.
-_dc_sh="$(echo "$_dc" | sed -n '/0.3.14: (a) never START lsyncd/,/journal tail:/p')"
-echo "$_dc_sh" | grep -q 'lsyncd.conf.lua.tpl' && echo "$_dc_sh" | grep -q 'systemctl start'
-report "doctor self-heal: converges the lsyncd config before starting it" $?
-echo "$_dc" | grep -q 'systemctl reset-failed "\$_dc_svc"'
-report "doctor self-heal: clears the start-rate-limit (reset-failed)" $?
+# 0.3.14/0.3.16: the doctor quotes the journal tail INLINE when a service
+# is down; 0.3.16 removed the start attempt / reset-failed / config
+# convergence entirely (read-only diagnostics - configurations belong to
+# the installer/repair flows)
 echo "$_dc" | grep -Fq 'journalctl -u "$_dc_svc" -n 15'
-report "doctor: a failed start quotes the journal tail inline" $?
-echo "$_dc" | grep -Fq 'journalctl -u "$HA_LSYNCD_SERVICE" -n 15'
-report "doctor: a failed lsyncd restart quotes the journal tail inline" $?
+report "doctor: an inactive service quotes the journal tail inline" $?
+if echo "$_dc" | grep -Eq 'systemctl (start|restart|reset-failed|enable) '; then false; else true; fi
+report "doctor: NO service start/restart/reset-failed - read-only (0.3.16)" $?
 
 # ---------------------------------------------------------------------------
 echo "== cluster.conf generation + loading =="

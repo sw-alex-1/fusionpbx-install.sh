@@ -34,7 +34,7 @@ direct (DESIGN.md §5.1, RUNBOOK.md §8).
 | 1 | VM1, VM2 | layer 1: `./pre-install.sh && ./install.sh` | installs a standalone FusionPBX node (layer 1 unchanged) |
 | 2 | VM1 | `./fusionpbx-ha.sh --init --node2 IP --node3 IP` | declares VM1's database the cluster primary, repoints apps to `127.0.0.1:5433`, prints the join **token**, then waits for the other nodes |
 | 3 | VM2, VM3 | `./fusionpbx-ha.sh --join TOKEN` | joins the cluster; role picked automatically by own IP (VM2 → standby — its local DB is replaced by a clone from VM1; VM3 → witness) |
-| 4 | any node | `./fusionpbx-ha.sh --doctor` | full health check, non-zero exit for monitoring |
+| 4 | any node | `./fusionpbx-ha.sh --doctor` | full health check, non-zero exit for monitoring; strictly read-only — it reports drift and names the fix command, it never modifies configs or services (0.3.16) |
 
 Day-2 operations — node failure, repair of a rebuilt node, cluster freeze
 after a double failure, branch upgrade, proxy-only networks — step by step
