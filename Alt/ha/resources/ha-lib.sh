@@ -622,9 +622,16 @@ ha_pg_version_major() {
     cat "$_hpv_dir/PG_VERSION" 2>/dev/null | tr -d ' \r'
 }
 
-# psql as the postgres system user (local socket, peer auth)
+# psql as the postgres system user (local socket, peer auth).
+# synchronous_commit=off (regression 0.3.17): installer/repair SQL sessions
+# must never WAIT for a sync standby - a stale synchronous_standby_names
+# left by the previous cluster (re-install over an installed system, resume
+# after its standby dropped) would otherwise freeze every write transaction
+# while the new standby does not exist yet (it joins only at init step 12).
+# Reads are unaffected; ALTER SYSTEM / pg_reload_conf bypass the WAL commit
+# path, so the option is inert for them.
 pg_runuser_psql() {
-    runuser -u postgres -- psql "$@" 2>/dev/null
+    PGOPTIONS='-c synchronous_commit=off' runuser -u postgres -- psql "$@" 2>/dev/null
 }
 
 # psql over TCP with the fusionpbx application credentials
@@ -901,6 +908,12 @@ ha_fix_repmgr_schema_access() {
     _hfsa_sql="$(mktemp "${TMPDIR:-/tmp}/fpbx-ha-schema.XXXXXX")"
     cat >"$_hfsa_sql" <<HAFIX
 -- fusionpbx-ha: repmgr extension ownership + grants (idempotent)
+-- freeze-proofing (regression 0.3.17): never wait for a sync standby here -
+-- the real bench hung on this very 'ALTER SCHEMA' with a stale
+-- synchronous_standby_names from the previous cluster; the grants commit
+-- locally and replicate as normal WAL traffic (belt-and-braces: the
+-- step-level ha_clear_stale_sync_names runs before this block)
+SET synchronous_commit = off;
 ALTER SCHEMA repmgr OWNER TO $HA_REPMGR_USER;
 GRANT USAGE, CREATE ON SCHEMA repmgr TO $HA_REPMGR_USER;
 GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA repmgr TO $HA_REPMGR_USER;
@@ -959,6 +972,10 @@ The generated SQL is kept at $_hfsa_sql - inspect the error with:
     # same per-user-TMPDIR reason as the hard block above
     _hfsa_opt="$(mktemp "${TMPDIR:-/tmp}/fpbx-ha-schema-opt.XXXXXX")"
     cat >"$_hfsa_opt" <<HAFIX
+-- freeze-proofing (regression 0.3.17): same as the hard block above - a
+-- stale sync-standby wait must never block the installer (this block's
+-- stderr is discarded, a hang here would be completely silent)
+SET synchronous_commit = off;
 GRANT pg_monitor TO $HA_REPMGR_USER;
 GRANT EXECUTE ON FUNCTION pg_catalog.pg_read_file(text, bigint, bigint) TO $HA_REPMGR_USER;
 GRANT EXECUTE ON FUNCTION pg_catalog.pg_read_binary_file(text) TO $HA_REPMGR_USER;
@@ -1099,8 +1116,12 @@ host postgres     postgres   $(ha_node_ip 2)/32  md5"
 # repmgr helpers
 # =============================================================================
 
+# synchronous_commit=off (regression 0.3.17): '* register' writes cluster
+# metadata on the primary (possibly over TCP from the witness/standby join
+# flow while the primary still waits for its own standby) - the same
+# freeze-proofing as pg_runuser_psql
 repmgr_cmd() {
-    runuser -u postgres -- repmgr -f "$HA_REPMGR_CONF" "$@" 2>&1
+    PGOPTIONS='-c synchronous_commit=off' runuser -u postgres -- repmgr -f "$HA_REPMGR_CONF" "$@" 2>&1
 }
 
 # soft cross-node reachability probe: pg_isready when available, silence
@@ -1489,6 +1510,50 @@ $(tail -n 8 "$_hsw_err" | sed 's/^/  /')"
 The file: $_hsw_auto
 ALTER SYSTEM reported:
 $(tail -n 8 "$_hsw_err" | sed 's/^/  /')
+Hint: runuser -u postgres -- psql -c 'SHOW synchronous_standby_names'; check the PostgreSQL log"
+}
+
+# ha_clear_stale_sync_names (regression 0.3.17): the installer's own
+# precondition before its FIRST database write (init steps 4, 7, 10).
+# A synchronous_standby_names left over from a PREVIOUS cluster survives
+# steps 1-6 in postgresql.auto.conf (nothing clears it before step 13!),
+# and the moment its standby is gone - the old walreceiver holds the
+# connection until step 4 changes the repmgr role password and step 5
+# restarts PostgreSQL; the reconnect then fails auth with the OLD password
+# - EVERY commit on the primary freezes forever waiting for a sync standby
+# that will never come back (the new one joins only at step 12). The real
+# bench hung exactly here: the schema-grants psql of step 7 sat on
+# 'ALTER SCHEMA', and the Ctrl-C trace showed 'canceling wait for
+# synchronous replication ... The transaction has already committed
+# locally'. Same policy as ha_ensure_sync (DESIGN.md 11.1 "async until the
+# standby returns") applied BEFORE the installer writes instead of after
+# them; step 13 re-enables sync once the new standby streams.
+# No-op on a clean node (names empty), whenever a standby IS streaming
+# (its acks keep every commit moving) and on a standby / unreachable PG
+# (the caller's own writes produce their own, clearer, error).
+ha_clear_stale_sync_names() {
+    [ "$(pg_runuser_psql -tAc "SELECT pg_is_in_recovery()" | tr -d ' \r')" = "t" ] && return 0
+    _hcssn_cur="$(pg_runuser_psql -tAc "SHOW synchronous_standby_names" | tr -d ' \r')"
+    [ -n "$_hcssn_cur" ] || return 0
+    if [ -n "$(pg_runuser_psql -tAc \
+        "SELECT application_name FROM pg_stat_replication WHERE state='streaming'" \
+        | tr -d ' \r' | grep -v '^$')" ]; then
+        return 0    # a live standby keeps acking sync commits - writes flow
+    fi
+    verbose "  stale synchronous_standby_names='$_hcssn_cur' with no streaming standby -"
+    verbose "  every commit on this primary would freeze (a leftover from the previous"
+    verbose "  cluster); clearing it for the install - step 13 re-enables sync once the"
+    verbose "  new standby streams"
+    ha_sync_names_write local ""
+    # the reload is asynchronous: the clear MUST take effect before the
+    # step's writes start, otherwise they freeze on the stale value
+    _hcssn_try=0
+    while [ "$_hcssn_try" -lt 5 ]; do
+        [ -z "$(pg_runuser_psql -tAc "SHOW synchronous_standby_names" | tr -d ' \r')" ] && return 0
+        _hcssn_try=$((_hcssn_try + 1))
+        sleep 1
+    done
+    die "cannot clear the stale synchronous_standby_names (still set after the reload)
 Hint: runuser -u postgres -- psql -c 'SHOW synchronous_standby_names'; check the PostgreSQL log"
 }
 

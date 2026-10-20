@@ -89,7 +89,17 @@ case "$_q" in
             exit "${PSQL_ALTER_SYNC_RC}"
         fi
         exit 0 ;;
-    *"SHOW synchronous_standby_names"*) echo "${PSQL_SYNCNAMES:-}" ;;
+    *"SHOW synchronous_standby_names"*)
+        # stateful (0.3.17, the preload-stub precedent): once an
+        # ALTER SYSTEM SET synchronous_standby_names is logged
+        # (PSQL_ALTER_SYNC_LOG), SHOW reports THAT value - the reload
+        # applied it; lets ha_clear_stale_sync_names verify its own clear
+        if [ -s "${PSQL_ALTER_SYNC_LOG:-/dev/null}" ]; then
+            sed -n "s/^ALTER SYSTEM SET synchronous_standby_names = '\(.*\)';$/\1/p" \
+                "$PSQL_ALTER_SYNC_LOG" | tail -n 1
+        else
+            echo "${PSQL_SYNCNAMES:-}"
+        fi ;;
     # 0.3.15: repmgrd shared memory preload knobs ('-' not ':-' so a test
     # can inject an EMPTY value - an unset var still gets the healthy
     # default 'repmgr'). Stateful for ha_ensure_repmgr_preload: once an
@@ -402,6 +412,70 @@ PSQL_ALTER_SYNC_RC=3 PSQL_SYNCNAMES='*' lib_run 'ha_sync_names_write local "*" &
 echo "$OUT" | grep -q '^wrote$' \
     && grep -qxF "synchronous_standby_names = '*'" "$WORK/pgdata/postgresql.auto.conf"
 report "B2 fallback: '*' written unquoted (wildcard, not a name)" "$?" "$OUT"
+
+# ---------------------------------------------------------------------------
+echo "== stale sync names clear (regression 0.3.17) =="
+# the real bench: --init --force over the INSTALLED cluster hung at step 7 -
+# the schema-grants 'ALTER SCHEMA' sat in the sync-replication wait forever
+# ('canceling wait for synchronous replication ... already committed
+# locally' after Ctrl-C). synchronous_standby_names survives steps 1-6 in
+# postgresql.auto.conf; the old standby drops once step 4 changes its
+# password (the walreceiver reconnect then fails auth) - and every commit
+# on the primary freezes. The installer must establish its own
+# precondition BEFORE its first write: names set + no streaming standby
+# -> clear (step 13 re-enables sync once the new standby streams).
+
+rm -f "$WORK/alter-clear.log"
+PSQL_SYNCNAMES='"fpbx-ha-2"' PSQL_APPNAME="" PSQL_ALTER_SYNC_LOG="$WORK/alter-clear.log" lib_run '
+    ha_clear_stale_sync_names && echo cleared
+'
+echo "$OUT" | grep -q '^cleared$' && echo "$OUT" | grep -q "would freeze"
+report "stale names + no standby: cleared with an explanation" "$?" "$(echo "$OUT" | tail -1)"
+grep -qF "ALTER SYSTEM SET synchronous_standby_names = '';" "$WORK/alter-clear.log"
+report "stale names + no standby: ALTER SYSTEM clear issued" $?
+
+: > "$WORK/alter-clear.log"
+PSQL_SYNCNAMES="" PSQL_ALTER_SYNC_LOG="$WORK/alter-clear.log" lib_run 'ha_clear_stale_sync_names && echo ok'
+echo "$OUT" | grep -q '^ok$' && [ ! -s "$WORK/alter-clear.log" ]
+report "clean primary (no names): no-op, nothing written" $?
+
+: > "$WORK/alter-clear.log"
+PSQL_SYNCNAMES='"fpbx-ha-2"' PSQL_APPNAME="fpbx-ha-2" PSQL_ALTER_SYNC_LOG="$WORK/alter-clear.log" lib_run 'ha_clear_stale_sync_names && echo ok'
+echo "$OUT" | grep -q '^ok$' && [ ! -s "$WORK/alter-clear.log" ]
+report "streaming standby alive: no-op (its acks keep commits moving)" $?
+
+: > "$WORK/alter-clear.log"
+FIX_RECOVERY=t PSQL_SYNCNAMES='"fpbx-ha-2"' PSQL_ALTER_SYNC_LOG="$WORK/alter-clear.log" lib_run 'ha_clear_stale_sync_names && echo ok'
+echo "$OUT" | grep -q '^ok$' && [ ! -s "$WORK/alter-clear.log" ]
+report "standby node: no-op (grants arrive via replication)" $?
+
+# step contracts: the guard must precede the first write of every
+# database-writing step (a resume enters at any of them with the stale
+# names still in place)
+_s4="$(sed -n '/^init_step_4_pg_prep()/,/^}/p' "$CLI")"
+echo "$_s4" | grep -q 'ha_clear_stale_sync_names'
+report "step 4: stale-names guard before the first DB write" $?
+_s7="$(sed -n '/^init_step_7_primary_register()/,/^}/p' "$CLI")"
+echo "$_s7" | grep -q 'ha_clear_stale_sync_names'
+report "step 7: stale-names guard before the register prelude" $?
+_g7="$(echo "$_s7" | grep -n 'ha_clear_stale_sync_names' | head -1 | cut -d: -f1)"
+_p7="$(echo "$_s7" | grep -n 'ha_register_prelude' | head -1 | cut -d: -f1)"
+[ -n "$_g7" ] && [ -n "$_p7" ] && [ "$_g7" -lt "$_p7" ]
+report "step 7: guard ordered BEFORE the prelude (the bench hang point)" $?
+_s10="$(sed -n '/^init_step_10_repoint_dsn()/,/^}/p' "$CLI")"
+echo "$_s10" | grep -q 'ha_clear_stale_sync_names'
+report "step 10: stale-names guard before the app repoint" $?
+
+# freeze-proof sessions: every installer psql/repmgr session commits
+# locally - a stale sync-standby wait must never block the installer
+# itself (belt-and-braces to the step-level clear)
+_prg="$(sed -n '/^pg_runuser_psql()/,/^}/p' "$LIB")"
+echo "$_prg" | grep -q "PGOPTIONS='-c synchronous_commit=off'"
+report "pg_runuser_psql: synchronous_commit=off (installer commits never wait)" $?
+_rpc="$(sed -n '/^repmgr_cmd()/,/^}/p' "$LIB")"
+echo "$_rpc" | grep -q "PGOPTIONS='-c synchronous_commit=off'"
+report "repmgr_cmd: synchronous_commit=off (register never waits)" $?
+
 
 # CLI source-order contracts: authorized_keys must not wait for step 14
 _s12="$(sed -n '/^init_step_12_wait_standby()/,/^}/p' "$CLI")"
@@ -931,6 +1005,12 @@ report "primary: best-effort block without ON_ERROR_STOP" "$_o"
 # a '-f $TMPDIR_FILE' - on ALT the root TMPDIR is per-user private (mode 0700)
 if grep -q ' -f ' "$HA_TEST_CAPTURE/1.args" "$HA_TEST_CAPTURE/2.args" 2>/dev/null; then _sf=bad; else _sf=ok; fi
 report "primary: SQL fed via stdin, never -f (ALT per-user /tmp)" "$_sf"
+# 0.3.17 regression contract: both blocks open with a local-commit guard -
+# a stale sync-standby wait must never block (or, for the best-effort
+# block, SILENTLY block) the schema grants
+grep -q '^SET synchronous_commit = off;$' "$HA_TEST_CAPTURE/1.sql" 2>/dev/null &&
+grep -q '^SET synchronous_commit = off;$' "$HA_TEST_CAPTURE/2.sql" 2>/dev/null
+report "primary: both SQL blocks commit locally (stale sync-standby proof, 0.3.17)" $?
 echo "$OUT" | grep -q "ownership + grants handed"
 report "primary: verbose summary" $?
 

@@ -255,6 +255,13 @@ init_step_3_packages() {
 }
 
 init_step_4_pg_prep() {
+    # The FIRST installer write to the database. A synchronous_standby_names
+    # left by the previous cluster (re-install / --force over an installed
+    # node) freezes every commit the moment its standby is gone - the old
+    # walreceiver drops right after the password alignment below / the
+    # step 5 restart. Clear it BEFORE writing (regression 0.3.17); step 13
+    # re-enables sync once the new standby streams. No-op on a clean node.
+    ha_clear_stale_sync_names
     ha_write_pgpass data
 
     if ! pg_runuser_psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='$HA_REPMGR_USER'" | grep -q 1; then
@@ -373,6 +380,13 @@ init_step_6_repmgr_conf() {
 }
 
 init_step_7_primary_register() {
+    # The bench hang (regression 0.3.17): with a stale
+    # synchronous_standby_names and the old standby already gone, the
+    # schema grants below sat on 'ALTER SCHEMA' forever ('canceling wait
+    # for synchronous replication' in the Ctrl-C trace). A resume also
+    # enters HERE with steps 1-6 skipped - the guard must precede the
+    # first write of the step.
+    ha_clear_stale_sync_names
     # Self-healing for runs resumed from a state file written by an older
     # script version (pg_hba set / listen_addresses / repmgr.conf keys)
     ha_register_prelude primary
@@ -402,6 +416,10 @@ init_step_9_haproxy() {
 }
 
 init_step_10_repoint_dsn() {
+    # The applications are repointed to THIS primary right below - their
+    # writes must not freeze on a stale sync-standby wait while the new
+    # standby has not joined yet (steps 11/12) (regression 0.3.17)
+    ha_clear_stale_sync_names
     ha_repoint_dsn
 }
 
