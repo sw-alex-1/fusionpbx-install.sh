@@ -115,6 +115,28 @@ VM2 → standby, VM3 → witness. На VM2 локальная база **сти�
 Токен после этого больше не нужен (cluster.conf уже на всех нодах). Забыл
 сохранить / нужно переиздать: `--print-token` на VM1.
 
+### Веб-интерфейс: домен FusionPBX и вход на standby (0.3.20)
+
+Слой 1 создаёт домен FusionPBX из `domain_name=ip_address`
+(`resources/config.sh`) — то есть **домен в БД = IP той ноды, где ставили
+слой 1 первично** (у нас — IP primary). Аутентификация FusionPBX
+привязана к домену (Host-заголовок сверяется с `v_domains`, пользователь
+живёт в своём домене). Поэтому:
+
+* `https://<IP primary>` — вход работает (Host совпадает с доменом);
+* `https://<IP standby>` — «Incorrect Username or Password»: IP standby
+  не является доменом, а свой домен (и свой admin от layer 1) standby
+  потерял вместе с локальной БД — её заменил клон primary (join, шаг 5).
+
+Логин/пароль для UI на ЛЮБОЙ ноде — учётка primary (та, что layer 1
+создал на VM1). Чтобы вход работал и по IP standby — добавьте IP standby
+как **алиас домена**: UI primary → Settings → Domains → домен → Alias
+(или SQL: `INSERT INTO v_domain_aliases (domain_alias_uuid, domain_uuid,
+domain_alias_name, domain_alias_enabled) VALUES (gen_random_uuid(),
+'<domain_uuid>', '<IP standby>', 'true');`). Более правильный
+операционно вариант — ходить на кластер по одному DNS-имени (оно же
+домен), а не по IP нод.
+
 ## 2. Проверка здоровья (регулярная)
 
 ```sh

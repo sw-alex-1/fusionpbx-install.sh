@@ -1095,6 +1095,12 @@ cmd_status() {
 
     verbose ""
     verbose "=== Replication ==="
+    if [ "$HA_NODE_ID" = "3" ]; then
+        # 0.3.20: the witness metadata database never has streaming
+        # standbys - the old output printed an empty "(0 rows)" table as
+        # if something was missing
+        verbose "  witness: no local replication (metadata only - the data nodes hold the stream)"
+    else
     _st_rc=0; ha_local_role_code; _st_rc=$?
     case "$_st_rc" in
         0)
@@ -1110,9 +1116,16 @@ cmd_status() {
             ;;
         *) warn "local PostgreSQL is not reachable" ;;
     esac
+    fi
 
     verbose ""
     verbose "=== Entry point 127.0.0.1:$HA_HAPROXY_PORT ==="
+    if [ "$HA_NODE_ID" = "3" ]; then
+        # 0.3.20: the witness runs no haproxy by design - the old probe
+        # printed "cannot query ... (haproxy down / no primary)" as if
+        # the node was broken
+        verbose "  witness runs no haproxy - use a data node address (node 1 / node 2)"
+    else
     _st_probe="$(pg_psql_app 127.0.0.1 -p "$HA_HAPROXY_PORT" -tAc "SELECT pg_is_in_recovery()" 2>/dev/null | tr -d ' \r')"
     if [ "$_st_probe" = "f" ]; then
         verbose "  OK: connects and reaches the PRIMARY"
@@ -1120,6 +1133,7 @@ cmd_status() {
         warn "entry point reaches a STANDBY - haproxy health checks stale?"
     else
         warn "cannot query through 127.0.0.1:$HA_HAPROXY_PORT (haproxy down / no primary)"
+    fi
     fi
 
     verbose ""
@@ -1179,7 +1193,14 @@ cmd_doctor() {
     # 2. local PostgreSQL
     _dc_rc=0; ha_local_role_code; _dc_rc=$?
     case "$_dc_rc" in
-        0) _dr_ok "local PostgreSQL is up (primary)" ;;
+        0) if [ "$HA_NODE_ID" = "3" ]; then
+               # 0.3.20: the witness runs a standalone metadata database -
+               # labelling it "(primary)" invited confusion with the data
+               # node roles (the bench asked "why is my witness a primary?")
+               _dr_ok "local PostgreSQL is up (witness metadata database)"
+           else
+               _dr_ok "local PostgreSQL is up (primary)"
+           fi ;;
         1) _dr_ok "local PostgreSQL is up (standby)" ;;
         *) _dr_fail "local PostgreSQL is DOWN or unreachable" ;;
     esac
@@ -1213,7 +1234,13 @@ cmd_doctor() {
 
         # 3. frozen-sync detection (primary without a streaming standby but
         # with sync names configured = writes are STALLED)
-        if [ "$_dc_rc" = "0" ]; then
+        # 0.3.20: data nodes only - on the witness this check ran against
+        # its LOCAL metadata database (a standalone primary that never has
+        # streaming standbys) and printed a false "async mode - restore
+        # the peer" alarm on a perfectly healthy cluster
+        if [ "$HA_NODE_ID" = "3" ]; then
+            _dr_ok "witness: replication state lives on the data nodes (no local standbys by design)"
+        elif [ "$_dc_rc" = "0" ]; then
             _dc_streaming="$(pg_runuser_psql -d postgres -tAc "SELECT count(*) FROM pg_stat_replication WHERE state='streaming'" | tr -d ' \r')"
             _dc_syncnames="$(pg_runuser_psql -tAc "SHOW synchronous_standby_names" | tr -d ' \r')"
             if [ "${_dc_streaming:-0}" -ge 1 ] 2>/dev/null; then

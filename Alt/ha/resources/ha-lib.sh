@@ -1608,7 +1608,17 @@ ha_ensure_sync() {
         return 0
     fi
 
-    _hes_target="$(ha_peer_name)"
+    # Regression 0.3.20: the expected sync standby is the PEER OF THE TARGET
+    # HOST, not the peer of the LOCAL node. The standby join calls this FOR
+    # the primary (local=node2, target=node1) and used to expect node 1's
+    # own name as the streaming standby - it never matched, always fell
+    # back to '*' (design question B2) with a confusing warning, and
+    # overwrote the precise name the primary's init step 13 had written.
+    if [ "$_hes_host" = "local" ] || [ "$_hes_host" = "$(ha_node_ip 1)" ]; then
+        _hes_target="$(ha_node_name 2)"
+    else
+        _hes_target="$(ha_node_name 1)"
+    fi
     if ! echo "$_hes_names" | grep -qx "$_hes_target"; then
         warn "streaming standby name is '$_hes_names' (expected '$_hes_target') - using '*' (design question B2 fallback)"
         _hes_target="*"

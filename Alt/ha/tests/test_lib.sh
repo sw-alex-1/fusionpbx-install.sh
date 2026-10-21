@@ -862,6 +862,58 @@ _ci="$(sed -n '/^cmd_init()/,/^}/p' "$CLI")"
 echo "$_ci" | grep -qF 'cannot determine the local PostgreSQL major version'
 report "init: the primary still requires its own database (strict check kept)" $?
 
+# ---------------------------------------------------------------------------
+echo "== sync target name / witness diagnostics (regression 0.3.20) =="
+# the real bench: node 2's join step 11 called ha_ensure_sync FOR the
+# primary and expected the PRIMARY's own name ('fpbx-ha-1') as the
+# streaming standby - never matched, fell back to '*' with a scary
+# warning, and overwrote the precise '"fpbx-ha-2"' the primary's init
+# step 13 had written. The expected standby is the PEER OF THE TARGET
+# HOST (the node that streams from it), not the peer of the caller.
+
+PSQL_SYNCNAMES='"fpbx-ha-2"' PSQL_APPNAME="fpbx-ha-2" lib_run '
+    HA_NODE_ID=2
+    HA_NODE1_NAME="fpbx-ha-1"; HA_NODE1_IP="10.0.0.11"
+    HA_NODE2_NAME="fpbx-ha-2"; HA_NODE2_IP="10.0.0.12"
+    HA_DB_PASSWORD="pw123"
+    ha_ensure_sync 10.0.0.11 && echo ensured
+'
+echo "$OUT" | grep -q '^ensured$' && echo "$OUT" | grep -q "sync mode: ON on 10.0.0.11" \
+    && echo "$OUT" | grep -qF "synchronous_standby_names='\"fpbx-ha-2\"'" \
+    && ! echo "$OUT" | grep -q "using '\*'"
+report "ha_ensure_sync from the standby: its OWN name, no '*' fallback (0.3.20)" "$?" "$(echo "$OUT" | head -3)"
+
+PSQL_SYNCNAMES='"fpbx-ha-2"' PSQL_APPNAME="fpbx-ha-2" lib_run '
+    HA_NODE_ID=1
+    HA_NODE1_NAME="fpbx-ha-1"; HA_NODE1_IP="10.0.0.11"
+    HA_NODE2_NAME="fpbx-ha-2"; HA_NODE2_IP="10.0.0.12"
+    ha_ensure_sync local && echo ensured
+'
+echo "$OUT" | grep -q '^ensured$' && echo "$OUT" | grep -q "sync mode: ON on local" \
+    && ! echo "$OUT" | grep -q "using '\*'"
+report "ha_ensure_sync on the primary: unchanged (peer of local = node 2)" "$?" "$(echo "$OUT" | head -3)"
+
+PSQL_SYNCNAMES='*' PSQL_APPNAME="some-foreign-name" lib_run '
+    HA_NODE_ID=2
+    HA_NODE1_NAME="fpbx-ha-1"; HA_NODE1_IP="10.0.0.11"
+    HA_NODE2_NAME="fpbx-ha-2"; HA_NODE2_IP="10.0.0.12"
+    HA_DB_PASSWORD="pw123"
+    ha_ensure_sync 10.0.0.11 && echo ensured
+'
+echo "$OUT" | grep -q '^ensured$' && echo "$OUT" | grep -q "using '\*'"
+report "ha_ensure_sync: B2 '*' fallback kept for a genuinely foreign name" "$?" "$(echo "$OUT" | head -3)"
+
+_dc20="$(sed -n '/^cmd_doctor()/,/^}/p' "$CLI")"
+echo "$_dc20" | grep -qF 'witness: replication state lives on the data nodes' \
+    && echo "$_dc20" | grep -qF 'witness metadata database' \
+    && echo "$_dc20" | grep -qF 'async mode (no standby streaming)'
+report "doctor: witness sync check -> honest no-local-standbys line (0.3.20)" $?
+
+_dcst="$(sed -n '/^cmd_status()/,/^}/p' "$CLI")"
+echo "$_dcst" | grep -qF 'witness runs no haproxy' \
+    && echo "$_dcst" | grep -qF 'witness: no local replication'
+report "status: witness-aware entry point + replication sections (0.3.20)" $?
+
 # 0.3.14/0.3.16: the doctor quotes the journal tail INLINE when a service
 # is down; 0.3.16 removed the start attempt / reset-failed / config
 # convergence entirely (read-only diagnostics - configurations belong to
