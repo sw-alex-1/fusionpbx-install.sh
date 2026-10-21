@@ -914,6 +914,44 @@ echo "$_dcst" | grep -qF 'witness runs no haproxy' \
     && echo "$_dcst" | grep -qF 'witness: no local replication'
 report "status: witness-aware entry point + replication sections (0.3.20)" $?
 
+# ---------------------------------------------------------------------------
+echo "== failover daemon must never stay dead (regression 0.3.21) =="
+# the real bench: a hard-off primary was survived by a standby whose
+# repmgrd had been STOPPED (an interrupted --repair stops repmgrd/lsyncd
+# at step 2 and restarts them at step 4) - nobody promoted the standby,
+# haproxy honestly refused to route to it (agent 503), total outage until
+# the primary returned. repmgrd is THE failover daemon: a dead one must
+# always come back (Restart=always, no start-rate limit). An explicit
+# 'systemctl stop' (installer flows) is still honored by design.
+
+rm -rf "$WORK/systemd"
+HA_SYSTEMD_DIR="$WORK/systemd" lib_run 'ha_install_repmgr_dropin && echo di'
+echo "$OUT" | grep -q '^di$' \
+    && grep -q '^Restart=always$' "$WORK/systemd/repmgr.service.d/fusionpbx-ha.conf" \
+    && grep -q '^RestartSec=10$' "$WORK/systemd/repmgr.service.d/fusionpbx-ha.conf" \
+    && grep -q '^StartLimitIntervalSec=0$' "$WORK/systemd/repmgr.service.d/fusionpbx-ha.conf"
+report "repmgrd drop-in: Restart=always + no rate limit (0.3.21)" $? "$(echo "$OUT" | tail -1)"
+
+HA_SYSTEMD_DIR="$WORK/systemd" lib_run 'ha_install_lsyncd_dropin && echo dl'
+echo "$OUT" | grep -q '^dl$' \
+    && grep -q '^Restart=on-failure$' "$WORK/systemd/lsyncd.service.d/fusionpbx-ha.conf" \
+    && grep -q '^StartLimitIntervalSec=0$' "$WORK/systemd/lsyncd.service.d/fusionpbx-ha.conf"
+report "lsyncd drop-in: Restart=on-failure + no rate limit (0.3.21)" $? "$(echo "$OUT" | tail -1)"
+
+_lsd_ok=0
+for _lsfn in init_step_14_sync_setup join_step_10_lsyncd_start rep_step_6_lsyncd prp_step_3_services; do
+    sed -n "/^${_lsfn}()/,/^}/p" "$CLI" | grep -q 'ha_install_lsyncd_dropin' || _lsd_ok=1
+done
+[ "$_lsd_ok" = "0" ]
+report "installer/repair: lsyncd drop-in installed before every enable+start" $?
+
+_r2="$(sed -n '/^rep_step_2_stop_services()/,/^}/p' "$CLI")"
+echo "$_r2" | grep -qF 'NOT be promoted automatically if the peer dies'
+report "repair step 2: the stopped-failover state is announced loudly (0.3.21)" $?
+
+echo "$_dc20" | grep -qF 'AUTOMATIC FAILOVER WILL NOT HAPPEN'
+report "doctor: inactive repmgr screams that failover is dead (0.3.21)" $?
+
 # 0.3.14/0.3.16: the doctor quotes the journal tail INLINE when a service
 # is down; 0.3.16 removed the start attempt / reset-failed / config
 # convergence entirely (read-only diagnostics - configurations belong to

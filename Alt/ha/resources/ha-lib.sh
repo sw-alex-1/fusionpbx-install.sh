@@ -176,16 +176,27 @@ ha_install_repmgr_dropin() {
     _hrd_conf="$_hrd_unit_dir/fusionpbx-ha.conf"
     _hrd_tmp="$(mktemp "${TMPDIR:-/tmp}/fpbx-ha-dropin.XXXXXX")"
     cat > "$_hrd_tmp" <<DROPIN
-# fusionpbx-ha: repmgrd unit hardening (ordering 0.3.13, env 0.3.15)
+# fusionpbx-ha: repmgrd unit hardening (ordering 0.3.13, env 0.3.15,
+# auto-restart 0.3.21: repmgrd is THE failover daemon - the bench sat
+# through a primary outage with repmgrd stopped on the standby: nobody
+# promoted it, total outage; a dead daemon must never stay dead)
 [Unit]
 After=$HA_PG_SERVICE.service
 Wants=$HA_PG_SERVICE.service
+StartLimitIntervalSec=0
 
 [Service]
 # the ALT unit references \${REPMGRD_OPTS} in ExecStart but
 # /etc/sysconfig/repmgr ships the variable commented out - defining it as
 # empty keeps the command line identical and the warning gone
 Environment=REPMGRD_OPTS=
+# 0.3.21: repmgrd exits if the local database is not reachable within
+# reconnect_attempts*reconnect_interval (a boot race with a slow standby
+# replay is enough) - bring it back until PostgreSQL answers. An explicit
+# 'systemctl stop' (installer/repair flows) is still honored: Restart
+# never overrides deliberate stops
+Restart=always
+RestartSec=10
 DROPIN
     if ! mkdir -p "$_hrd_unit_dir" 2>/dev/null; then
         rm -f "$_hrd_tmp"
@@ -203,7 +214,46 @@ DROPIN
     }
     rm -f "$_hrd_tmp"
     systemctl daemon-reload 2>/dev/null || true
-    verbose "  repmgrd unit drop-in installed: $_hrd_conf (ordering + REPMGRD_OPTS)"
+    verbose "  repmgrd unit drop-in installed: $_hrd_conf (ordering + REPMGRD_OPTS + auto-restart)"
+    return 0
+}
+
+# 0.3.21: lsyncd gets the same treatment - a silently dead lsyncd means
+# quiet media divergence between the nodes. Restart=on-failure (lsyncd
+# exits non-zero on failure) + no start-rate limit, so a dead daemon is
+# always brought back. Deliberate 'systemctl stop' (repair flows) is
+# still honored.
+ha_install_lsyncd_dropin() {
+    _hld_unit_dir="${HA_SYSTEMD_DIR}/${HA_LSYNCD_SERVICE}.service.d"
+    _hld_conf="$_hld_unit_dir/fusionpbx-ha.conf"
+    _hld_tmp="$(mktemp "${TMPDIR:-/tmp}/fpbx-ha-dropin.XXXXXX")"
+    cat > "$_hld_tmp" <<DROPIN
+# fusionpbx-ha: lsyncd unit hardening (auto-restart 0.3.21 - a silently
+# dead lsyncd means quiet media divergence between the data nodes)
+[Unit]
+StartLimitIntervalSec=0
+
+[Service]
+Restart=on-failure
+RestartSec=10
+DROPIN
+    if ! mkdir -p "$_hld_unit_dir" 2>/dev/null; then
+        rm -f "$_hld_tmp"
+        warn "cannot create $_hld_unit_dir - lsyncd keeps its stock unit"
+        return 1
+    fi
+    if [ -f "$_hld_conf" ] && cmp -s "$_hld_tmp" "$_hld_conf"; then
+        rm -f "$_hld_tmp"
+        return 0
+    fi
+    install -m 644 "$_hld_tmp" "$_hld_conf" 2>/dev/null || {
+        rm -f "$_hld_tmp"
+        warn "cannot write $_hld_conf - lsyncd keeps its previous drop-in"
+        return 1
+    }
+    rm -f "$_hld_tmp"
+    systemctl daemon-reload 2>/dev/null || true
+    verbose "  lsyncd unit drop-in installed: $_hld_conf (auto-restart)"
     return 0
 }
 

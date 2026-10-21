@@ -484,6 +484,7 @@ init_step_14_sync_setup() {
             || warn "ssh-keyscan failed for $(ha_node_ip 2) - first sync will use accept-new (TOFU)"
     fi
     ha_render_lsyncd_conf "$(ha_node_ip 2)"
+    ha_install_lsyncd_dropin
     svc_enable_start "$HA_LSYNCD_SERVICE"
 }
 
@@ -724,6 +725,7 @@ line, the doctor itself never modifies configurations)"
 
 join_step_10_lsyncd_start() {
     ha_render_lsyncd_conf "$(ha_peer_ip)"
+    ha_install_lsyncd_dropin
     svc_enable_start "$HA_LSYNCD_SERVICE"
 }
 
@@ -926,6 +928,13 @@ Cases:
 rep_step_2_stop_services() {
     svc_stop "$HA_LSYNCD_SERVICE"
     svc_stop "$HA_REPMGRD_SERVICE"
+    # 0.3.21: crash-window honesty (bench: a repair that died between
+    # this step and rep_step_4 left repmgrd stopped - the next primary
+    # outage had NOBODY to promote the standby, total outage). An
+    # interrupted repair must be re-run before this node can fail over.
+    warn "repmgrd and lsyncd are now STOPPED - until this repair"
+    warn "completes (re-run the same command to resume), this node will"
+    warn "NOT be promoted automatically if the peer dies"
 }
 
 rep_step_3_rejoin_or_clone() {
@@ -1008,6 +1017,7 @@ rep_step_5_seed_media() {
 
 rep_step_6_lsyncd() {
     ha_render_lsyncd_conf "$(ha_peer_ip)"
+    ha_install_lsyncd_dropin
     svc_enable_start "$HA_LSYNCD_SERVICE"
 }
 
@@ -1059,6 +1069,7 @@ prp_step_3_services() {
     # a missing dir (regression 0.3.11)
     ha_ensure_sync_dir
     ha_render_lsyncd_conf "$(ha_peer_ip)"
+    ha_install_lsyncd_dropin
     svc_enable_start "$HA_LSYNCD_SERVICE"
     verbose "  all services re-verified"
 }
@@ -1306,7 +1317,14 @@ Check: systemctl status haproxy $HA_AGENT_UNIT_NAME"
             # and for repmgrd ALSO the log_file tail - after the
             # 'redirecting logging output' notice everything repmgrd says
             # goes to $HA_REPMGRD_LOG, the journal stays silent (0.3.15)
-            _dr_fail "service $_dc_svc NOT active - journal tail:"
+            # 0.3.21: for repmgrd the consequence must be unmistakable -
+            # the bench sat through a primary outage with repmgrd stopped
+            # (nobody promoted the standby, total outage)
+            if [ "$_dc_svc" = "$HA_REPMGRD_SERVICE" ]; then
+                _dr_fail "service repmgr NOT active: AUTOMATIC FAILOVER WILL NOT HAPPEN - journal tail:"
+            else
+                _dr_fail "service $_dc_svc NOT active - journal tail:"
+            fi
             journalctl -u "$_dc_svc" -n 15 --no-pager 2>/dev/null | sed 's/^/       /' || true
             if [ "$_dc_svc" = "$HA_REPMGRD_SERVICE" ] && [ -s "$HA_REPMGRD_LOG" ]; then
                 error "       repmgrd log tail ($HA_REPMGRD_LOG):"
