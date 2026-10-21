@@ -753,6 +753,76 @@ ha_local_role_code() {
 
 ha_local_is_primary() { ha_local_role_code; [ $? -eq 0 ]; }
 
+# Wait for the local PostgreSQL to answer a trivial query (up to 60 x 1s).
+# Used by the repair flow around rejoin/clone, where PostgreSQL is bounced
+# and must be back before the next step touches it.
+ha_pg_wait_answer() {
+    _hpwa_try=0
+    while [ "$_hpwa_try" -lt 60 ]; do
+        pg_runuser_psql -tAc "SELECT 1" >/dev/null 2>&1 && return 0
+        sleep 1
+        _hpwa_try=$((_hpwa_try + 1))
+    done
+    return 1
+}
+
+# 0.3.22: classify the LOCAL node for the repair rejoin. repmgr 5.5 refuses
+# 'node rejoin' on a running database ("database is still running in state
+# 'in archive recovery'" / "cannot be executed on a running node") - the
+# bench repair died exactly there on a perfectly HEALTHY standby that only
+# needed its services restarted. 'attached' is returned ONLY when the local
+# database is in recovery AND its WAL receiver is connected to the given
+# peer (= the current primary, verified by the repair preflight): such a
+# node must not be stopped/rewound at all. Anything else - a running stale
+# primary from before a failover, a standby on a dead or wrong upstream, a
+# database without a receiver - is 'diverged' and needs the rejoin.
+# Pure string logic (testable): the caller collects the psql output.
+ha_rejoin_plan_classify() {
+    _hrpc_in_recovery="$1"    # pg_is_in_recovery(): t / f / '' (unreachable)
+    _hrpc_sender="$2"         # pg_stat_wal_receiver.sender_host ('' = none)
+    _hrpc_peer_ip="$3"
+    if [ "$_hrpc_in_recovery" = "t" ] && [ "$_hrpc_sender" = "$_hrpc_peer_ip" ]; then
+        echo "attached"
+    else
+        echo "diverged"
+    fi
+}
+
+# Collector half of the classifier: reads the local PostgreSQL state and
+# hands it to ha_rejoin_plan_classify. The database must be RUNNING and
+# answering (the repair flow guarantees that before calling).
+ha_rejoin_plan() {
+    _hrp_peer_ip="$1"
+    _hrp_in_recovery="$(pg_runuser_psql -tAc "SELECT pg_is_in_recovery()" 2>/dev/null | tr -d ' \r')"
+    _hrp_sender="$(pg_runuser_psql -tAc "SELECT sender_host FROM pg_stat_wal_receiver" 2>/dev/null | head -n 1 | tr -d ' \r')"
+    ha_rejoin_plan_classify "${_hrp_in_recovery:-?}" "${_hrp_sender:-}" "$_hrp_peer_ip"
+}
+
+# 0.3.22: 'repmgr node rejoin' may (re)start PostgreSQL itself via pg_ctl,
+# i.e. OUTSIDE systemd - the service would sit 'inactive' while postgres
+# runs, every later doctor run would fail the 'service postgresql active'
+# check and a future 'systemctl start postgresql' would fight the orphan.
+# Bring the node back under systemd management: if repmgr started it, stop
+# it via pg_ctl (as the postgres user) and start it via systemctl; if it
+# did not come up at all, a plain systemctl start is enough.
+ha_pg_adopt_after_rejoin() {
+    if ! pg_runuser_psql -tAc "SELECT 1" >/dev/null 2>&1; then
+        systemctl start "$HA_PG_SERVICE" \
+            || die "PostgreSQL did not start after the rejoin - re-run with --force-clone"
+        ha_pg_wait_answer \
+            || die "PostgreSQL is not answering after the rejoin - re-run with --force-clone"
+        return 0
+    fi
+    if ! svc_active "$HA_PG_SERVICE"; then
+        verbose "  PostgreSQL was started outside systemd (by repmgr) - moving it back under systemd"
+        runuser -u postgres -- pg_ctl -D "$(ha_pg_data_dir)" stop -m fast -w -t 300 >/dev/null 2>&1
+        systemctl start "$HA_PG_SERVICE" \
+            || die "PostgreSQL did not start under systemd after the rejoin - re-run with --force-clone"
+        ha_pg_wait_answer \
+            || die "PostgreSQL is not answering after the rejoin - re-run with --force-clone"
+    fi
+}
+
 # -----------------------------------------------------------------------------
 # listen_addresses (regression 0.3.2): layer 1 leaves PostgreSQL loopback-only
 # ('localhost'), but the cluster needs the node IP - repmgr register/repmgrd

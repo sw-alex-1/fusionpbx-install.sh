@@ -74,6 +74,9 @@ if [ -z "$_q" ] && [ -z "$_f" ]; then
 fi
 case "$_q" in
     *pg_is_in_recovery*) echo "${FIX_RECOVERY-f}" ;;
+    # 0.3.22: WAL-receiver probe of the repair-rejoin classifier
+    # (sender_host; empty = no receiver row)
+    *pg_stat_wal_receiver*) echo "${PSQL_WAL_SENDER:-}" ;;
     *pg_extension*) echo "${FIX_EXT:-1}" ;;
     *listen_addresses*) echo "${FIX_LISTEN:-*}" ;;
     *"ALTER SYSTEM SET synchronous_standby_names"*)
@@ -147,6 +150,10 @@ cat > "$WORK/fakebin/systemctl" <<'EOF'
 case "$*" in
     *firewalld*) exit "${FIREWALLD_ACTIVE:-1}" ;;
     is-enabled*) exit "${SYSTEMCTL_IS_ENABLED_RC:-0}" ;;
+    # 0.3.22: is-active postgresql honors SYSTEMCTL_PG_ACTIVE (default 0 =
+    # active) - lets the rejoin-adoption test simulate a PG started by
+    # repmgr OUTSIDE systemd (unit inactive while postgres answers)
+    is-active*postgresql*) exit "${SYSTEMCTL_PG_ACTIVE:-0}" ;;
     *) exit 0 ;;
 esac
 EOF
@@ -951,6 +958,85 @@ report "repair step 2: the stopped-failover state is announced loudly (0.3.21)" 
 
 echo "$_dc20" | grep -qF 'AUTOMATIC FAILOVER WILL NOT HAPPEN'
 report "doctor: inactive repmgr screams that failover is dead (0.3.21)" $?
+
+# ---------------------------------------------------------------------------
+echo "== repair rejoin on a running database (regression 0.3.22) =="
+# the real bench: node 2 was a perfectly HEALTHY standby (streaming from
+# the primary) and --repair died at step 3 - repmgr 5.5 refuses
+# 'node rejoin' on a RUNNING node ("database is still running in state
+# 'in archive recovery' / cannot be executed on a running node"), and the
+# interrupted repair left repmgrd+lsyncd stopped (the 0.3.21 crash window
+# became real again). The repair must classify the local node FIRST: an
+# attached standby keeps its replication running (no rejoin at all, only
+# the metadata record is refreshed); only a diverged node is stopped and
+# rewound - and afterwards adopted back under systemd, because 'node
+# rejoin' may (re)start PostgreSQL itself via pg_ctl, outside systemd.
+
+lib_run '
+    ha_rejoin_plan_classify t 10.0.0.11 10.0.0.11
+    ha_rejoin_plan_classify t 10.0.0.12 10.0.0.11
+    ha_rejoin_plan_classify t "" 10.0.0.11
+    ha_rejoin_plan_classify f 10.0.0.11 10.0.0.11
+    ha_rejoin_plan_classify "" "" 10.0.0.11
+'
+[ "$OUT" = "attached
+diverged
+diverged
+diverged
+diverged" ]
+report "ha_rejoin_plan_classify: truth table - attached ONLY in recovery + peer (0.3.22)" $?
+
+FIX_RECOVERY=t PSQL_WAL_SENDER=10.0.0.11 lib_run 'ha_rejoin_plan 10.0.0.11'
+[ "$OUT" = "attached" ]
+report "ha_rejoin_plan: standby streaming from the peer -> attached" $?
+
+FIX_RECOVERY=t PSQL_WAL_SENDER=10.0.0.99 lib_run 'ha_rejoin_plan 10.0.0.11'
+[ "$OUT" = "diverged" ]
+report "ha_rejoin_plan: streaming from a wrong host -> diverged (rewind)" $?
+
+FIX_RECOVERY=t PSQL_WAL_SENDER= lib_run 'ha_rejoin_plan 10.0.0.11'
+[ "$OUT" = "diverged" ]
+report "ha_rejoin_plan: no WAL receiver -> diverged (rewind)" $?
+
+FIX_RECOVERY=f PSQL_WAL_SENDER=10.0.0.11 lib_run 'ha_rejoin_plan 10.0.0.11'
+[ "$OUT" = "diverged" ]
+report "ha_rejoin_plan: running as a stale primary -> diverged (rewind)" $?
+
+_r3c="$(sed -n '/^rep_step_3_rejoin_or_clone()/,/^}/p' "$CLI")"
+echo "$_r3c" | grep -q 'ha_rejoin_plan ' \
+    && echo "$_r3c" | grep -qF 'rejoin not needed, replication left running'
+report "repair step 3: an attached standby skips the rejoin entirely" $?
+
+_r3c_div="$(printf '%s\n' "$_r3c" | sed -n '/local database diverged/,/pg_rewind applied/p')"
+_r3c_stop="$(printf '%s\n' "$_r3c_div" | grep -n 'svc_stop "\$HA_PG_SERVICE"' | head -n 1 | cut -d: -f1)"
+_r3c_rejoin="$(printf '%s\n' "$_r3c_div" | grep -n 'node rejoin --force-rewind' | head -n 1 | cut -d: -f1)"
+[ -n "$_r3c_stop" ] && [ -n "$_r3c_rejoin" ] && [ "$_r3c_stop" -lt "$_r3c_rejoin" ]
+report "repair step 3: a diverged node is stopped BEFORE 'node rejoin' (0.3.22)" $?
+
+echo "$_r3c" | grep -q 'ha_pg_adopt_after_rejoin'
+report "repair step 3: systemd re-adoption after the rejoin (pg_ctl-started PG)" $?
+
+echo "$_r3c" | grep -qF 'automatic failover returns at step 4'
+report "repair step 3 (resume): re-announces that repmgrd is still stopped" $?
+
+# 'node rejoin' started PostgreSQL via pg_ctl: postgres ANSWERS on the
+# socket but the unit is inactive -> moved back under systemd
+SYSTEMCTL_PG_ACTIVE=3 lib_run '
+    HA_PG_SERVICE=postgresql
+    ha_pg_adopt_after_rejoin && echo adopted
+'
+echo "$OUT" | grep -q '^adopted$' && echo "$OUT" | grep -qF 'outside systemd'
+report "ha_pg_adopt_after_rejoin: pg_ctl-started PG moved back under systemd" $?
+
+_cj22="$(sed -n '/^cmd_join()/,/^}/p' "$CLI")"
+echo "$_cj22" | grep -q 'ha_install_repmgr_dropin' \
+    && echo "$_cj22" | grep -q 'ha_install_lsyncd_dropin'
+report "join: unit drop-ins converged outside the resumable sequence (0.3.22)" $?
+
+_cr22="$(sed -n '/^cmd_repair()/,/^}/p' "$CLI")"
+echo "$_cr22" | grep -q 'ha_install_repmgr_dropin' \
+    && echo "$_cr22" | grep -q 'ha_install_lsyncd_dropin'
+report "repair: unit drop-ins converged outside the resumable sequence (0.3.22)" $?
 
 # 0.3.14/0.3.16: the doctor quotes the journal tail INLINE when a service
 # is down; 0.3.16 removed the start attempt / reset-failed / config

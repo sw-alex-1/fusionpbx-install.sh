@@ -938,6 +938,12 @@ rep_step_2_stop_services() {
 }
 
 rep_step_3_rejoin_or_clone() {
+    # 0.3.22: a RESUMED repair skips step 2 - and with it the loud warning
+    # that the failover daemon is down. If this run begins with repmgrd
+    # still stopped, say so again (it restarts at step 4).
+    if ha_state_step_is_done 2 && ! svc_active "$HA_REPMGRD_SERVICE"; then
+        warn "repmgrd is still stopped (repair step 2) - automatic failover returns at step 4"
+    fi
     # repmgr.conf + promote.sh first: 'repmgr standby clone/register' and
     # 'repmgr node rejoin' below all read the configuration file, which may
     # be missing on a rebuilt node with a restored cluster.conf (12.1)
@@ -974,24 +980,43 @@ rep_step_3_rejoin_or_clone() {
         fi
         verbose "  re-cloned and registered as a standby of $(ha_peer_name)"
     else
+        # 0.3.22: repmgr 5.5 REFUSES 'node rejoin' on a running database
+        # ("database is still running in state 'in archive recovery'" /
+        # "cannot be executed on a running node") - the bench repair died
+        # right here on a perfectly HEALTHY standby that only needed its
+        # services restarted. Classify the local node FIRST:
+        #   - attached standby of the current primary: no rejoin at all,
+        #     only the metadata record is refreshed (register --force) -
+        #     the replication keeps streaming through the repair;
+        #   - anything else (a stale primary from before a failover, a
+        #     standby on a dead/wrong upstream): STOP PostgreSQL, rejoin
+        #     with pg_rewind, then make sure systemd tracks it again
+        #     (repmgr may have (re)started it via pg_ctl).
         if ! svc_active "$HA_PG_SERVICE"; then
             systemctl start "$HA_PG_SERVICE" || die "local PostgreSQL does not start - re-run with --force-clone"
-            _r3c_try=0
-            while [ "$_r3c_try" -lt 60 ]; do
-                pg_runuser_psql -tAc "SELECT 1" >/dev/null 2>&1 && break
-                sleep 1
-                _r3c_try=$((_r3c_try + 1))
-            done
+            ha_pg_wait_answer || die "local PostgreSQL is not answering - re-run with --force-clone"
         fi
         pg_runuser_psql -tAc "SELECT 1" >/dev/null 2>&1 \
             || die "local PostgreSQL is not answering - re-run with --force-clone"
-        _r3c_out="$(repmgr_cmd node rejoin --force-rewind -h "$(ha_peer_ip)")"
-        if [ $? -ne 0 ]; then
-            echo "$_r3c_out"
-            die "node rejoin failed (see output above).
+        if [ "$(ha_rejoin_plan "$(ha_peer_ip)")" = "attached" ]; then
+            _r3c_out="$(repmgr_cmd standby register --upstream-node-id="$(ha_peer_id)" --force)"
+            if [ $? -ne 0 ]; then
+                echo "$_r3c_out"
+                die "'repmgr standby register' failed (see output above)"
+            fi
+            verbose "  already a healthy standby of $(ha_peer_name) - rejoin not needed, replication left running"
+        else
+            verbose "  local database diverged from $(ha_peer_name) - stopping it for the rejoin (pg_rewind)"
+            svc_stop "$HA_PG_SERVICE"
+            _r3c_out="$(repmgr_cmd node rejoin --force-rewind -h "$(ha_peer_ip)")"
+            if [ $? -ne 0 ]; then
+                echo "$_r3c_out"
+                die "node rejoin failed (see output above).
 If the local PGDATA is damaged beyond rewind, re-run with: --repair --force-clone"
+            fi
+            ha_pg_adopt_after_rejoin
+            verbose "  rejoined as a standby of $(ha_peer_name) (pg_rewind applied)"
         fi
-        verbose "  rejoined as a standby of $(ha_peer_name) (pg_rewind applied)"
     fi
 }
 
@@ -1597,6 +1622,17 @@ Maintenance of a joined node is done with: fusionpbx-ha.sh --repair"
         ha_write_authorized_keys
     fi
 
+    # 0.3.22: unit drop-ins are installer-owned but live OUTSIDE the
+    # resumable step sequence - a join resumed past its service step
+    # (state file written by an older script) would keep the PREVIOUS
+    # drop-in content forever (the bench: a standby that never received
+    # Restart=always sat through a primary outage with repmgrd dead after
+    # a boot race). Converge them here on every join run - both installers
+    # are content-aware and idempotent; a daemon-reload never starts or
+    # stops anything.
+    ha_install_repmgr_dropin
+    [ "$HA_NODE_ID" != "3" ] && ha_install_lsyncd_dropin
+
     if [ "$HA_NODE_ID" = "3" ]; then
         ha_run_sequence "join-witness" \
             wit_step_1_preflight \
@@ -1640,6 +1676,13 @@ A rebuilt node joins with: fusionpbx-ha.sh --join TOKEN
     # rules and re-applies the whitelist WITHOUT the cluster ports
     # (regression 0.3.6)
     ha_ensure_cluster_firewall
+
+    # 0.3.22: same convergence as cmd_join - a repair RESUMED past its
+    # service step (steps 4/6 done by an older script) must not leave a
+    # stale unit drop-in behind: the failover daemon's Restart=always is
+    # exactly what a boot-race kill relies on to come back.
+    ha_install_repmgr_dropin
+    [ "$HA_NODE_ID" != "3" ] && ha_install_lsyncd_dropin
 
     if [ "$HA_NODE_ID" = "3" ]; then
         ha_run_sequence "repair-witness" \
