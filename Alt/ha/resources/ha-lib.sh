@@ -478,9 +478,20 @@ ha_state_finish() {
 ha_join_state_freshen() {
     _hjsf_conf="$1"    # the freshly unpacked token's cluster.conf
     [ -f "$HA_STATE_FILE" ] || return 0
-    cmp -s "$_hjsf_conf" "$HA_CLUSTER_CONF" 2>/dev/null && return 0
-    warn "the saved join state belongs to a DIFFERENT cluster generation"
-    warn "  (the token's secrets differ from $HA_CLUSTER_CONF) -"
+    if [ -f "$HA_CLUSTER_CONF" ] && cmp -s "$_hjsf_conf" "$HA_CLUSTER_CONF" 2>/dev/null; then
+        return 0
+    fi
+    if [ -f "$HA_CLUSTER_CONF" ]; then
+        warn "the saved join state belongs to a DIFFERENT cluster generation"
+        warn "  (the token's secrets differ from $HA_CLUSTER_CONF) -"
+    else
+        # 0.3.19: the state was written by an attempt that died BEFORE step 2
+        # unpacked the token (or /etc/fusionpbx-ha was wiped afterwards) -
+        # there is no cluster.conf to resume against. cmp of a missing file
+        # reads as 'differs', which printed a misleading 'secrets differ'.
+        warn "the saved join state has no cluster to belong to"
+        warn "  ($HA_CLUSTER_CONF is missing - wiped or rebuilt node?) -"
+    fi
     warn "  discarding it and re-joining from step 1 (local DB wiped + re-cloned)"
     rm -f "$HA_STATE_FILE" 2>/dev/null || true
     return 0

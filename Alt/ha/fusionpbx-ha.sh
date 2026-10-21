@@ -517,11 +517,24 @@ The token was issued for a different cluster/network."
         ha_read_layer1_conf \
             || die "layer 1 is not installed on this node (no readable $HA_L1_CONF).
 Run the standard installer first (see the repository README)."
-        _jsp_ver="$(ha_pg_version_major)" \
-            || die "no local PostgreSQL cluster found (PG_VERSION missing) - run layer 1 first"
-        [ "$_jsp_ver" = "$HA_PG_VERSION" ] \
-            || die "PostgreSQL major version mismatch: local $_jsp_ver, cluster $HA_PG_VERSION
+        # Regression 0.3.19: a standby does not NEED a local database -
+        # step 5 wipes whatever is here and clones the primary. PG_VERSION
+        # is absent on a wiped/rebuilt node or after a join that died between
+        # the step-5 wipe and the re-clone; demanding it here dead-ended
+        # exactly that recovery: the fresh re-join after the 0.3.18 state
+        # discard died with a misleading 'run layer 1 first' while layer 1
+        # was fine (and --force did not help - step 1 dies regardless of
+        # the state file). Layer 1 is proven by $HA_L1_CONF above; the
+        # server packages of the cluster's major are installed by step 3.
+        # Only a REAL conflict of an EXISTING local cluster is fatal.
+        if _jsp_ver="$(ha_pg_version_major)"; then
+            [ "$_jsp_ver" = "$HA_PG_VERSION" ] \
+                || die "PostgreSQL major version mismatch: local $_jsp_ver, cluster $HA_PG_VERSION
 The cluster was initialized with PostgreSQL $HA_PG_VERSION."
+        else
+            verbose "  no local data directory ($(ha_pg_data_dir)) -"
+            verbose "  the local database will be cloned from the primary at step 5"
+        fi
     fi
 
     if [ "$HA_NODE_ID" != "3" ]; then

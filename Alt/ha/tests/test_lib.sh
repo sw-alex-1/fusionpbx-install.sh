@@ -824,6 +824,8 @@ rm -f "$WORK/etc/cluster.conf"
 lib_run "ha_join_state_freshen $WORK/token.conf && echo ok"
 echo "$OUT" | grep -q '^ok$' && [ ! -f "$WORK/etc/.installer-state" ]
 report "state without an on-disk conf: garbage, discarded" $?
+echo "$OUT" | grep -q "no cluster to belong to" && ! echo "$OUT" | grep -q "DIFFERENT"
+report "missing conf: the real reason stated (wiped node), not 'secrets differ' (0.3.19)" $?
 
 # cmd_join contract: the freshen check runs BEFORE the 0.3.13 resume
 # convergence and BEFORE the sequence - a mismatched state must never
@@ -833,6 +835,32 @@ _c13="$(echo "$_cj" | grep -n 'Resume convergence (0.3.13)' | head -1 | cut -d: 
 _seqj="$(echo "$_cj" | grep -n 'ha_run_sequence ' | head -1 | cut -d: -f1)"
 [ -n "$_f18" ] && [ -n "$_c13" ] && [ -n "$_seqj" ] && [ "$_f18" -lt "$_c13" ] && [ "$_f18" -lt "$_seqj" ]
 report "cmd_join: freshen BEFORE the resume convergence and the sequence" $?
+
+# ---------------------------------------------------------------------------
+echo "== standby join without a local database (regression 0.3.19) =="
+# the real bench (0.3.18 follow-up): node 2's join died mid-step-5 (the
+# PGDATA wipe happened, the re-clone did not), then /etc/fusionpbx-ha was
+# deleted by accident. The 0.3.18 freshen did its job (state discarded,
+# fresh join from step 1) - and step 1 killed the recovery with 'no local
+# PostgreSQL cluster found (PG_VERSION missing) - run layer 1 first'
+# while layer 1 was fine. A standby NEVER needs a local database: step 5
+# clones it. Preflight must only reject a REAL version conflict - and
+# the primary keeps its strict check (its local DB becomes the cluster).
+
+_j1="$(sed -n '/^join_step_1_preflight()/,/^}/p' "$CLI")"
+if echo "$_j1" | grep -qF 'no local PostgreSQL cluster found'; then false; else true; fi
+report "join step 1: an empty/missing data directory is no longer fatal" $?
+echo "$_j1" | grep -qF 'the local database will be cloned from the primary at step 5'
+report "join step 1: the wiped node is told the DB is re-cloned (not 'run layer 1')" $?
+echo "$_j1" | grep -qF 'PostgreSQL major version mismatch'
+report "join step 1: a real major-version conflict still dies" $?
+echo "$_j1" | grep -qF 'layer 1 is not installed on this node'
+report "join step 1: the layer-1 requirement itself is untouched" $?
+echo "$_j1" | grep -q 'if _jsp_ver="$(ha_pg_version_major)"'
+report "join step 1: version still checked when a local cluster exists" $?
+_ci="$(sed -n '/^cmd_init()/,/^}/p' "$CLI")"
+echo "$_ci" | grep -qF 'cannot determine the local PostgreSQL major version'
+report "init: the primary still requires its own database (strict check kept)" $?
 
 # 0.3.14/0.3.16: the doctor quotes the journal tail INLINE when a service
 # is down; 0.3.16 removed the start attempt / reset-failed / config
