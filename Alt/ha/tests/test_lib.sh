@@ -200,6 +200,18 @@ exit 0
 EOF
 chmod +x "$WORK/fakebin/rsync"
 
+# stubs sudo + visudo (0.3.24): present so ha_install_sudoers renders its
+# drop-in even on hosts without the real sudo; visudo accepts anything
+cat > "$WORK/fakebin/sudo" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+cat > "$WORK/fakebin/visudo" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+chmod +x "$WORK/fakebin/sudo" "$WORK/fakebin/visudo"
+
 # stub pg_isready (0.3.6): PG_ISREADY_RC + PG_ISREADY_OUT control the
 # verdict; without PG_ISREADY_OUT the stub answers like the real tool
 # ("... - accepting connections" / "... - no response")
@@ -1113,6 +1125,39 @@ report "ha_seed_pull: a healthy pull succeeds silently on the first try" $?
 echo "$_dc" | grep -qF 'no hung rrsync instance (media sync lock free)' \
     && echo "$_dc" | grep -qF "Another instance of rrsync"
 report "doctor: a long-lived rrsync instance warns as a media-sync blocker (0.3.23)" $?
+
+# ---------------------------------------------------------------------------
+echo "== the failover is not over until the apps are back (regression 0.3.24) =="
+# the bench failover test: promote in ~30s end to end (repmgrd consensus
+# with the witness, promote.sh cleared the sync names, agent 200, haproxy
+# routing, entry point OK with the APP credentials) - and the applications
+# still hung: a hard power-off sends no TCP RST, so php-fpm workers and
+# FreeSWITCH sat on sockets to the dead peer retransmitting for
+# tcp_retries2 (~15-30 minutes) - an endless web-UI spinner and phones
+# stuck in 'sip: auth'. promote.sh now restarts the local apps AFTER a
+# successful promote (try-restart via sudoers, restart-only verbs,
+# tolerant when sudo is absent).
+
+rm -rf "$WORK/lib" "$WORK/sudoers"
+HA_LIB_DIR="$WORK/lib" HA_SUDOERS_DIR="$WORK/sudoers" lib_run 'ha_install_promote_sh'
+[ -x "$WORK/lib/promote.sh" ] && grep -qF 'sudo -n systemctl try-restart' "$WORK/lib/promote.sh" \
+    && grep -q 'for _psh_svc in' "$WORK/lib/promote.sh" \
+    && grep -qF 'angie' "$WORK/lib/promote.sh" && grep -qF 'freeswitch' "$WORK/lib/promote.sh" \
+    && ! grep -q '@@' "$WORK/lib/promote.sh"
+report "ha_install_promote_sh: renders executable, app list resolved (0.3.24)" $? "$(cat "$WORK/lib/promote.sh" 2>/dev/null | head -c 80)"
+
+HA_SUDOERS_DIR="$WORK/sudoers" lib_run 'ha_install_sudoers'
+[ -f "$WORK/sudoers/fusionpbx-ha" ] && grep -q 'FUSIONPBX_HA_APPS' "$WORK/sudoers/fusionpbx-ha" \
+    && grep -qF '/usr/bin/systemctl try-restart php*-fpm' "$WORK/sudoers/fusionpbx-ha" \
+    && grep -qF '/usr/bin/systemctl try-restart angie' "$WORK/sudoers/fusionpbx-ha" \
+    && grep -qF '/usr/bin/systemctl try-restart freeswitch' "$WORK/sudoers/fusionpbx-ha" \
+    && grep -q 'postgres ALL=(root) NOPASSWD: FUSIONPBX_HA_PGCTL, FUSIONPBX_HA_APPS' "$WORK/sudoers/fusionpbx-ha"
+report "sudoers: restart-only app verbs for the promote wrapper (0.3.24)" $?
+
+_ps24="$(cat "$RES/promote.sh.tpl")"
+echo "$_ps24" | grep -qF 'if /usr/bin/repmgr standby promote' \
+    && echo "$_ps24" | grep -qF 'exit 0' && echo "$_ps24" | grep -qF 'exit 1'
+report "promote.sh: promote exit code propagates (no silent success on failure)" $?
 
 # 0.3.14/0.3.16: the doctor quotes the journal tail INLINE when a service
 # is down; 0.3.16 removed the start attempt / reset-failed / config

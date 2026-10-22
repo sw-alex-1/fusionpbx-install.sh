@@ -15,6 +15,19 @@
 # value is cleared by editing postgresql.auto.conf + SIGHUP (the pattern
 # recommended by repmgr for synchronous replication). The reloaded empty
 # value becomes effective the moment the node is promoted.
+#
+# WHY THE APP RESTART (changelog 0.3.24): a hard power-off of the old
+# primary never sends TCP RST - the local applications (php-fpm workers,
+# FreeSWITCH) sit on sockets to the dead node retransmitting for
+# tcp_retries2 (~15-30 minutes). The bench failover test: promote
+# successful in ~30s, haproxy routing, role-agent 200, entry point OK
+# with the app credentials - and still an endless web-UI spinner plus
+# phones stuck in 'sip: auth' on requests caught mid-flight. try-restart
+# (restarts only what is active) drops the stale sockets; the apps
+# reconnect through 127.0.0.1:<haproxy> immediately. Runs via the
+# installer's sudoers drop-in (restart-only verbs); when sudo is missing
+# the promote still succeeds - the apps then heal only when their
+# sockets time out.
 
 REPMGR_CONF="${REPMGR_CONF:-/etc/repmgr/repmgr.conf}"
 
@@ -37,4 +50,14 @@ else
     echo "fusionpbx-ha promote.sh: WARNING: cannot locate postgresql.auto.conf (writes may stall until repaired)" >&2
 fi
 
-exec /usr/bin/repmgr standby promote -f "$REPMGR_CONF"
+# Promote FIRST (the failover itself), then bring the local applications
+# back - never the other way around.
+if /usr/bin/repmgr standby promote -f "$REPMGR_CONF"; then
+    for _psh_svc in @@APP_SERVICES@@; do
+        if ! sudo -n systemctl try-restart "$_psh_svc" >/dev/null 2>&1; then
+            echo "fusionpbx-ha promote.sh: WARNING: could not restart $_psh_svc - requests caught mid-flight to the dead peer hang until TCP timeout" >&2
+        fi
+    done
+    exit 0
+fi
+exit 1

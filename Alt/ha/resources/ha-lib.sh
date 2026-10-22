@@ -1016,11 +1016,16 @@ ha_install_sudoers() {
     _hisd_file="$_hisd_dir/fusionpbx-ha"
     cat > "$_hisd_file" <<'EOSUDO'
 # fusionpbx-ha: managed file - repmgrd (User=postgres) controls the local
-# PostgreSQL service (repmgr node rejoin / clone edge paths).
+# PostgreSQL service (repmgr node rejoin / clone edge paths) and, after a
+# successful promote (0.3.24), drops the local applications' dead sockets
+# to the failed peer (restart-only verbs - no start/stop privilege).
 Cmnd_Alias FUSIONPBX_HA_PGCTL = /usr/bin/systemctl start postgresql, \
     /usr/bin/systemctl stop postgresql, /usr/bin/systemctl restart postgresql, \
     /usr/bin/systemctl reload postgresql, /usr/bin/systemctl status postgresql
-postgres ALL=(root) NOPASSWD: FUSIONPBX_HA_PGCTL
+Cmnd_Alias FUSIONPBX_HA_APPS = /usr/bin/systemctl try-restart php*-fpm, \
+    /usr/bin/systemctl try-restart angie, \
+    /usr/bin/systemctl try-restart freeswitch
+postgres ALL=(root) NOPASSWD: FUSIONPBX_HA_PGCTL, FUSIONPBX_HA_APPS
 EOSUDO
     chmod 440 "$_hisd_file" 2>/dev/null || true
     if cmd_exists visudo; then
@@ -1511,9 +1516,20 @@ inspect the unit:  systemctl status $HA_AGENT_UNIT_NAME -n 30 --no-pager"
 
 ha_install_promote_sh() {
     mkdir -p "$HA_LIB_DIR" 2>/dev/null
-    install -m 0755 "$HA_RES_DIR/promote.sh.tpl" "$HA_PROMOTE_SH" \
-        || die "cannot install promote.sh"
-    verbose "  promote wrapper installed: $HA_PROMOTE_SH"
+    # 0.3.24: after a successful promote the wrapper restarts the local
+    # applications - their sockets to the hard-powered-off peer die
+    # WITHOUT TCP RST and hang retransmitting for tcp_retries2 (~15-30
+    # minutes; the bench failover: promote OK in 30s, but an endless
+    # web-UI spinner and 'sip: auth' phones until the apps were
+    # restarted). Render the concrete service list - the php-fpm unit
+    # name is port-specific (detected the same way ha_repoint_dsn does).
+    _hips_apps="angie freeswitch"
+    _hips_php="$(ha_detect_php_fpm)"
+    [ -n "$_hips_php" ] && _hips_apps="$_hips_php $_hips_apps"
+    ha_render "$HA_RES_DIR/promote.sh.tpl" "$HA_PROMOTE_SH" \
+        "APP_SERVICES=$_hips_apps"
+    chmod 0755 "$HA_PROMOTE_SH" 2>/dev/null || true
+    verbose "  promote wrapper installed: $HA_PROMOTE_SH (post-promote app restart: $_hips_apps)"
 }
 
 # =============================================================================

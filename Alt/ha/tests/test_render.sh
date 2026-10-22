@@ -129,9 +129,24 @@ check_line "$HA_PROMOTE_SH" "postgresql.auto.conf" "clears sync names in postgre
 check_line "$HA_PROMOTE_SH" "synchronous_standby_names = ''" "sets synchronous_standby_names to empty"
 check_absent "$HA_PROMOTE_SH" "ALTER SYSTEM SET" "no ALTER SYSTEM (impossible on a standby in recovery)"
 check_line "$HA_PROMOTE_SH" "pg_reload_conf" "reloads configuration"
-check_line "$HA_PROMOTE_SH" "exec /usr/bin/repmgr standby promote" "delegates to repmgr promote"
+check_line "$HA_PROMOTE_SH" "if /usr/bin/repmgr standby promote" "delegates to repmgr promote (exit code preserved)"
 sh -n "$HA_PROMOTE_SH"
 report "promote.sh passes sh -n" $?
+# 0.3.24: post-promote application restart - see the 0.3.24 bench story
+# (hard power-off sends no RST; app sockets to the dead peer hang for
+# tcp_retries2 ~15-30 minutes)
+check_line "$HA_PROMOTE_SH" 'for _psh_svc in' "restarts the local app services"
+check_line "$HA_PROMOTE_SH" 'sudo -n systemctl try-restart' "app restart via sudoers, try-restart verb (restart-only)"
+check_line "$HA_PROMOTE_SH" 'angie' "app list: angie"
+check_line "$HA_PROMOTE_SH" 'freeswitch' "app list: freeswitch"
+check_line "$HA_PROMOTE_SH" 'could not restart' "restart failure is a warning, never a failed promote"
+if grep -q '@@' "$HA_PROMOTE_SH"; then false; else true; fi
+report "promote.sh rendered with no unresolved placeholders" $?
+_ps_cl="$(grep -n "synchronous_standby_names = ''" "$HA_PROMOTE_SH" | head -1 | cut -d: -f1)"
+_ps_pr="$(grep -n 'repmgr standby promote' "$HA_PROMOTE_SH" | head -1 | cut -d: -f1)"
+_ps_rs="$(grep -n 'sudo -n systemctl try-restart' "$HA_PROMOTE_SH" | head -1 | cut -d: -f1)"
+[ -n "$_ps_cl" ] && [ -n "$_ps_pr" ] && [ -n "$_ps_rs" ] && [ "$_ps_cl" -lt "$_ps_pr" ] && [ "$_ps_pr" -lt "$_ps_rs" ]
+report "promote.sh order: clear sync names -> promote -> restart apps" $?
 
 echo "== role-agent and systemd unit =="
 python3 -m py_compile "$RES/role-agent.py"
