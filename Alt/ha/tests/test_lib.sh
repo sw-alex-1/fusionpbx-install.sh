@@ -1050,6 +1050,17 @@ _r3c_rejoin="$(printf '%s\n' "$_r3c_div" | grep -n 'node rejoin --force-rewind' 
 [ -n "$_r3c_stop" ] && [ -n "$_r3c_rejoin" ] && [ "$_r3c_stop" -lt "$_r3c_rejoin" ]
 report "repair step 3: a diverged node is stopped BEFORE 'node rejoin' (0.3.22)" $?
 
+# the real bench 22.10 (old primary returning after the first successful
+# failover): 'node rejoin --force-rewind -h <peer>' connected as the OS user
+# (postgres) to the peer's 'postgres' database - repmgr builds that connection
+# from CLI options only and, unlike 'witness register', does not backfill
+# user/dbname from repmgr.conf; the .pgpass postgres entry let the wrong
+# connection authenticate, then get_primary_node_id() died on the missing
+# repmgr.nodes relation. The rejoin must carry the same explicit identity
+# the clone command has always used (-U repmgr -d repmgr).
+printf '%s\n' "$_r3c_div" | grep -qF 'node rejoin --force-rewind -h "$(ha_peer_ip)" -U "$HA_REPMGR_USER" -d "$HA_REPMGR_DB"'
+report "repair step 3: 'node rejoin' carries -U/-d (repmgr DB, not libpq defaults) (0.3.25)" $?
+
 echo "$_r3c" | grep -q 'ha_pg_adopt_after_rejoin'
 report "repair step 3: systemd re-adoption after the rejoin (pg_ctl-started PG)" $?
 

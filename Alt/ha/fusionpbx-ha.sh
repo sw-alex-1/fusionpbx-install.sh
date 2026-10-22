@@ -987,7 +987,22 @@ rep_step_3_rejoin_or_clone() {
         else
             verbose "  local database diverged from $(ha_peer_name) - stopping it for the rejoin (pg_rewind)"
             svc_stop "$HA_PG_SERVICE"
-            _r3c_out="$(repmgr_cmd node rejoin --force-rewind -h "$(ha_peer_ip)")"
+            # 0.3.25: repmgr builds the 'node rejoin' upstream connection from
+            # the COMMAND LINE ONLY (repmgr-client.c: initialize_conninfo_params
+            # (&source_conninfo, false) - no defaults, unlike 'witness register',
+            # which backfills user+dbname from repmgr.conf). With a bare
+            # '-h <peer>' libpq fell back to the OS user (postgres) and its
+            # default database (also postgres) - the .pgpass postgres entry
+            # even let md5 auth pass, so repmgr queried repmgr.nodes in the
+            # peer's 'postgres' database and died:
+            #   ERROR: get_primary_node_id(): unable to execute query
+            #   ERROR: отношение "repmgr.nodes" не существует
+            #   HINT: check the provided database connection string is for a
+            #         "repmgr" database
+            # (first real exercise of the diverged branch: the bench repairs
+            # of 0.3.22/0.3.23 all took the 'attached' path). Give the rejoin
+            # the same explicit identity the clone command has always used.
+            _r3c_out="$(repmgr_cmd node rejoin --force-rewind -h "$(ha_peer_ip)" -U "$HA_REPMGR_USER" -d "$HA_REPMGR_DB")"
             if [ $? -ne 0 ]; then
                 echo "$_r3c_out"
                 die "node rejoin failed (see output above).
