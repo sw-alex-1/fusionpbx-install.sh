@@ -179,6 +179,27 @@ EOF
 
 chmod +x "$WORK/fakebin/psql" "$WORK/fakebin/runuser" "$WORK/fakebin/systemctl" "$WORK/fakebin/curl"
 
+# stub rsync (0.3.23): every call is counted in $RSYNC_CALLS_FILE, its full
+# command line appended to $RSYNC_ARGS_FILE; the first RSYNC_FAIL_FIRST
+# calls exit 13 printing $RSYNC_OUT on stderr - emulates the peer-side
+# rrsync lock refusal relayed over ssh ("errors with program diagnostics")
+cat > "$WORK/fakebin/rsync" <<'EOF'
+#!/bin/sh
+_n=0
+if [ -n "${RSYNC_CALLS_FILE:-}" ]; then
+    _n="$(cat "$RSYNC_CALLS_FILE" 2>/dev/null || echo 0)"
+    _n=$((_n + 1))
+    echo "$_n" > "$RSYNC_CALLS_FILE"
+fi
+[ -n "${RSYNC_ARGS_FILE:-}" ] && printf '%s\n' "$*" >> "$RSYNC_ARGS_FILE"
+if [ -n "${RSYNC_CALLS_FILE:-}" ] && [ "$_n" -le "${RSYNC_FAIL_FIRST:-0}" ]; then
+    [ -n "${RSYNC_OUT:-}" ] && printf '%s\n' "$RSYNC_OUT" >&2
+    exit 13
+fi
+exit 0
+EOF
+chmod +x "$WORK/fakebin/rsync"
+
 # stub pg_isready (0.3.6): PG_ISREADY_RC + PG_ISREADY_OUT control the
 # verdict; without PG_ISREADY_OUT the stub answers like the real tool
 # ("... - accepting connections" / "... - no response")
@@ -541,9 +562,9 @@ echo "$_s14" | grep -q 'ha_ensure_sync_dir'
 report "init step 14: media dir ensured (kept)" $?
 _j9="$(sed -n '/^join_step_9_seed_media()/,/^}/p' "$CLI")"
 _jr9="$(echo "$_j9" | grep -n 'ha_ensure_sync_dir' | head -1 | cut -d: -f1)"
-_rs9="$(echo "$_j9" | grep -n 'rsync ' | head -1 | cut -d: -f1)"
+_rs9="$(echo "$_j9" | grep -n 'ha_seed_pull' | head -1 | cut -d: -f1)"
 [ -n "$_jr9" ] && [ -n "$_rs9" ] && [ "$_jr9" -lt "$_rs9" ]
-report "join step 9: local media dir ensured before the seed rsync" $?
+report "join step 9: local media dir ensured before the seed pull" $?
 _p3="$(sed -n '/^prp_step_3_services()/,/^}/p' "$CLI")"
 _pd3="$(echo "$_p3" | grep -n 'ha_ensure_sync_dir' | head -1 | cut -d: -f1)"
 _pl3="$(echo "$_p3" | grep -n 'ha_render_lsyncd_conf' | head -1 | cut -d: -f1)"
@@ -565,12 +586,16 @@ echo "== media path form over rrsync (regression 0.3.13) =="
 # and '.' resolves to CWD = the peer's restricted tree root. The seed
 # pulls ':.', the lsyncd template pushes to ':.', and --doctor REPORTS
 # configs that drift from the current template (read-only, 0.3.16).
-echo "$_j9" | grep -Fq '"root@$(ha_peer_ip):."'
-report "join step 9: pulls the rrsync tree root as the bare dot (:.)" $?
-if echo "$_j9" | grep -Fq 'ha_peer_ip):$HA_SYNC_DIR'; then false; else true; fi
-report "join step 9: no absolute \$HA_SYNC_DIR remote spec left" $?
-if echo "$_j9" | grep -Fq '"root@$(ha_peer_ip):/"'; then false; else true; fi
-report "join step 9: the 0.3.12 ':/' form is gone (dies on the ALT rrsync)" $?
+# 0.3.23: the rsync invocation moved into ha_seed_pull (ha-lib) - the
+# form contracts follow it there; the runtime args are asserted in the
+# 0.3.23 section via the rsync stub
+_sl="$(sed -n '/^ha_seed_pull()/,/^}/p' "$LIB")"
+echo "$_sl" | grep -Fq '"root@${_hsp_peer_ip}:."'
+report "seed pull: the rrsync tree root as the bare dot (:.) (0.3.13, lib)" $?
+if echo "$_sl" | grep -Fq 'peer_ip}:$HA_SYNC_DIR'; then false; else true; fi
+report "seed pull: no absolute \$HA_SYNC_DIR remote spec left" $?
+if echo "$_sl" | grep -Fq '"root@${_hsp_peer_ip}:/"'; then false; else true; fi
+report "seed pull: the 0.3.12 ':/' form is gone (dies on the ALT rrsync)" $?
 grep -Fq 'source    = "@@SYNC_DIR@@/"' "$RES/lsyncd.conf.lua.tpl"
 report "lsyncd template: source pins the contents slash" $?
 grep -Fq 'target    = "root@@@PEER_IP@@:."' "$RES/lsyncd.conf.lua.tpl"
@@ -1037,6 +1062,57 @@ _cr22="$(sed -n '/^cmd_repair()/,/^}/p' "$CLI")"
 echo "$_cr22" | grep -q 'ha_install_repmgr_dropin' \
     && echo "$_cr22" | grep -q 'ha_install_lsyncd_dropin'
 report "repair: unit drop-ins converged outside the resumable sequence (0.3.22)" $?
+
+# ---------------------------------------------------------------------------
+echo "== media seed vs the rrsync directory lock (regression 0.3.23) =="
+# the real bench: the 0.3.22 repair on the standby died at step 5 -
+# 'rrsync error: Another instance of rrsync is already accessing this
+# directory' (rsync exit 13). Upstream rsync 3.2.7's rrsync takes an
+# exclusive NON-BLOCKING flock ON THE SYNC DIRECTORY ITSELF: any other
+# LIVE instance for that directory blocks every new one until its
+# process dies - a hung leftover of an interrupted sync session (the
+# outage-day chaos: hard power-off, killed lsyncd mid-push) holds the
+# lock indefinitely. The bench's NEXT repair run seeded fine - the
+# holder died in between (sshd reaped it). The pull now retries (the
+# lock dies WITH its process), names the lock conflict when it sees
+# one, and the die message explains the kill-the-holder remedy; the
+# doctor warns about a long-lived rrsync instance on the local node.
+
+rm -f "$WORK/rsync.calls" "$WORK/rsync.args"
+RSYNC_CALLS_FILE="$WORK/rsync.calls" RSYNC_ARGS_FILE="$WORK/rsync.args" \
+RSYNC_FAIL_FIRST=2 RSYNC_OUT="rsync: error (transient)" HA_SEED_RETRY_SLEEP=0 \
+HA_SYNC_KEY="$WORK/k" HA_KNOWN_HOSTS="$WORK/kh" HA_SYNC_DIR="/var/lib/freeswitch/storage" \
+lib_run 'ha_seed_pull 10.0.0.11 && echo seeded'
+echo "$OUT" | grep -q '^seeded$' && [ "$(cat "$WORK/rsync.calls")" = "3" ] \
+    && echo "$OUT" | grep -qF 'seed succeeded on attempt 3/5'
+report "ha_seed_pull: rides out a transient failure (3rd attempt wins) (0.3.23)" $? "$(echo "$OUT" | tail -1)"
+
+grep -qF -- '-a --delete' "$WORK/rsync.args" \
+    && grep -qF 'root@10.0.0.11:.' "$WORK/rsync.args"
+report "ha_seed_pull: archive+delete pull of the bare-dot tree root (runtime form)" $?
+
+rm -f "$WORK/rsync.calls"
+RSYNC_CALLS_FILE="$WORK/rsync.calls" HA_SEED_ATTEMPTS=2 HA_SEED_RETRY_SLEEP=0 \
+RSYNC_FAIL_FIRST=99 \
+RSYNC_OUT="/usr/local/bin/rrsync error: Another instance of rrsync is already accessing this directory." \
+HA_SYNC_KEY="$WORK/k" HA_KNOWN_HOSTS="$WORK/kh" HA_SYNC_DIR="/var/lib/freeswitch/storage" \
+lib_run 'ha_seed_pull 10.0.0.11'
+_rc23=$?
+[ "$_rc23" != "0" ] && echo "$OUT" | grep -qF 'media seed failed after 2 attempts' \
+    && echo "$OUT" | grep -qF 'locked by another rrsync instance (attempt 1/2)' \
+    && echo "$OUT" | grep -qF 'ps ax | grep rrsync'
+report "ha_seed_pull: exhaustion dies with the hung-instance remedy" "$?"
+
+rm -f "$WORK/rsync.calls"
+RSYNC_CALLS_FILE="$WORK/rsync.calls" HA_SYNC_KEY="$WORK/k" HA_KNOWN_HOSTS="$WORK/kh" \
+HA_SYNC_DIR="/var/lib/freeswitch/storage" lib_run 'ha_seed_pull 10.0.0.11 && echo seeded'
+echo "$OUT" | grep -q '^seeded$' && [ "$(cat "$WORK/rsync.calls")" = "1" ] \
+    && ! echo "$OUT" | grep -q 'attempt'
+report "ha_seed_pull: a healthy pull succeeds silently on the first try" $?
+
+echo "$_dc" | grep -qF 'no hung rrsync instance (media sync lock free)' \
+    && echo "$_dc" | grep -qF "Another instance of rrsync"
+report "doctor: a long-lived rrsync instance warns as a media-sync blocker (0.3.23)" $?
 
 # 0.3.14/0.3.16: the doctor quotes the journal tail INLINE when a service
 # is down; 0.3.16 removed the start attempt / reset-failed / config

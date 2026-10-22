@@ -696,30 +696,9 @@ join_step_9_seed_media() {
     verbose "  pulling the media tree from $(ha_peer_name) (seed BEFORE the sync"
     verbose "  daemon starts - protects the peer copy from being wiped by an"
     verbose "  empty local tree; DESIGN.md 10.2)"
-    # The peer's forced rrsync-command carries NO -absolute flag, and the
-    # hardened rrsync family has TWO incompatible client-path mappings:
-    # newer builds PREPEND the restricted root onto a leading-slash arg,
-    # but the ALT-shipped snapshot LSTRIPS the slash and serves the rest
-    # against its CWD (= the restricted root - rrsync chdirs first). On
-    # that ALT build neither pre-0.3.13 form can ever work: ':/' arrives
-    # as '' and realpath('') = CWD = the root ITSELF, which fails the
-    # startswith(dir + '/') containment check - die "unsafe arg: /
-    # ['', ...]" (the 0.3.13 bench death); the absolute form doubles into
-    # $HA_SYNC_DIR/$HA_SYNC_DIR/ and the sender open dies ENOENT
-    # ('post-realpath open failed' - the 0.3.11/0.3.12 bench death). The
-    # ONLY client form valid on every rrsync variant is the bare dot:
-    # validated_arg skips it entirely ('arg != .'), and '.' resolves to
-    # CWD = the peer's restricted tree root (regression 0.3.13).
-    rsync -a --delete \
-        -e "ssh -i $HA_SYNC_KEY -o UserKnownHostsFile=$HA_KNOWN_HOSTS -o StrictHostKeyChecking=accept-new -o BatchMode=yes" \
-        "root@$(ha_peer_ip):." "$HA_SYNC_DIR/" \
-        || die "media seed failed - the pull needs sshd up on $(ha_peer_ip), the sync
-key in root's authorized_keys there (rrsync-restricted root: $HA_SYNC_DIR) and
-that dir existing on the peer
-(hint: 'fusionpbx-ha.sh --doctor' on $(ha_peer_ip) diagnoses all three; if the
-key is rejected: journalctl -u sshd -n 20 on $(ha_peer_ip) shows 'invalid key
-option string' - re-run that node's join command to re-render the sync-key
-line, the doctor itself never modifies configurations)"
+    # the pull itself (why the remote spec is the bare dot + the 0.3.23
+    # rrsync-lock retries) lives in ha-lib: ha_seed_pull
+    ha_seed_pull "$(ha_peer_ip)"
     verbose "  media tree seeded: $HA_SYNC_DIR"
 }
 
@@ -1446,6 +1425,26 @@ Check: systemctl status haproxy $HA_AGENT_UNIT_NAME"
             else
                 _dr_ok "inotify budget sufficient (${_dc_files} directories watched)"
             fi
+        fi
+
+        # 8d. hung rrsync instance (0.3.23): upstream rsync 3.2.7's rrsync
+        # takes an EXCLUSIVE NON-BLOCKING flock on the sync directory itself
+        # - every media transfer to/from this node (the peer's lsyncd
+        # pushes, a repairing node's seed pull) dies 'Another instance of
+        # rrsync is already accessing this directory' while any other LIVE
+        # instance holds it, and a HUNG leftover of an interrupted sync
+        # session (crashes/reboots mid-transfer) holds the lock until its
+        # process dies. Transfers are seconds-lived; one older than 10
+        # minutes and idle is almost certainly hung.
+        _dc_rrsync_old="$(ps -eo etimes,args 2>/dev/null | awk -v d="$HA_SYNC_DIR" \
+            '$0 ~ /[r]rsync/ && index($0, d) > 0 && $1 > 600 {print $1; exit}')"
+        if [ -n "$_dc_rrsync_old" ]; then
+            _dr_warn "an rrsync instance has been alive for ${_dc_rrsync_old}s (normally seconds)
+       if no large media transfer is running right now, it is hung: every
+       media sync to/from this node fails with 'Another instance of rrsync'
+       until it is killed (the flock dies with the process)"
+        else
+            _dr_ok "no hung rrsync instance (media sync lock free)"
         fi
     fi
 

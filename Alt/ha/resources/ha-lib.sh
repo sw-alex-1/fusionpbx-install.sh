@@ -1346,6 +1346,63 @@ ha_ensure_sync_dir() {
         || warn "cannot chown $HA_SYNC_DIR to ${HA_SYNC_DIR_OWNER:-angie:angie} - set HA_SYNC_DIR_OWNER if this port uses a different FreeSWITCH user"
 }
 
+# 0.3.23: the standby media-seed pull, WITH RETRIES. The peer-side rrsync
+# (upstream rsync 3.2.7 'lock_or_die') takes an EXCLUSIVE NON-BLOCKING
+# flock ON THE SYNC DIRECTORY ITSELF - any other LIVE rrsync instance for
+# that directory (a hung leftover of an interrupted sync session: node
+# crashes/reboots mid-transfer, killed lsyncd with its ssh session stuck)
+# makes the new instance die 'Another instance of rrsync is already
+# accessing this directory' and rsync exits 13. The flock is held by the
+# PROCESS, not by a lock file: it dies with its owner - retries ride out
+# transient holders (sshd eventually reaps its hung child - exactly how
+# the bench recovered between two repair runs), and the die message
+# points at a hung one. The rrsync '-no-lock' flag exists but is
+# deliberately NOT used: the lock also protects the mirror from
+# overlapping writers.
+# The remote spec stays the BARE DOT - the only client form valid on
+# every hardened rrsync variant ('.' = CWD = the peer's restricted tree
+# root; ':/' dies 'unsafe arg' on the ALT build, the absolute form
+# doubles into a nested dir and dies ENOENT - the 0.3.11/0.3.12/0.3.13
+# bench deaths, DESIGN.md 6.3).
+ha_seed_pull() {
+    _hsp_peer_ip="$1"
+    _hsp_attempts="${HA_SEED_ATTEMPTS:-5}"
+    _hsp_sleep="${HA_SEED_RETRY_SLEEP:-15}"
+    _hsp_n=0
+    while [ "$_hsp_n" -lt "$_hsp_attempts" ]; do
+        _hsp_n=$((_hsp_n + 1))
+        _hsp_out="$(rsync -a --delete \
+            -e "ssh -i $HA_SYNC_KEY -o UserKnownHostsFile=$HA_KNOWN_HOSTS -o StrictHostKeyChecking=accept-new -o BatchMode=yes" \
+            "root@${_hsp_peer_ip}:." "$HA_SYNC_DIR/" 2>&1)"
+        if [ $? -eq 0 ]; then
+            if [ "$_hsp_n" -gt 1 ]; then
+                verbose "  seed succeeded on attempt $_hsp_n/$_hsp_attempts"
+            fi
+            return 0
+        fi
+        [ -n "$_hsp_out" ] && echo "$_hsp_out"
+        if printf '%s\n' "$_hsp_out" | grep -q 'Another instance of rrsync'; then
+            warn "the peer's media directory is locked by another rrsync instance (attempt $_hsp_n/$_hsp_attempts)"
+            if [ "$_hsp_n" -lt "$_hsp_attempts" ]; then
+                verbose "  a hung rrsync process on $_hsp_peer_ip may be holding the lock - the lock dies with the process"
+            fi
+        fi
+        if [ "$_hsp_n" -lt "$_hsp_attempts" ]; then
+            verbose "  retrying in ${_hsp_sleep}s ..."
+            sleep "$_hsp_sleep"
+        fi
+    done
+    die "media seed failed after $_hsp_attempts attempts - the pull needs sshd up on $_hsp_peer_ip, the sync
+key in root's authorized_keys there (rrsync-restricted root: $HA_SYNC_DIR),
+that dir existing on the peer and no other rrsync instance holding its lock
+(hint: 'fusionpbx-ha.sh --doctor' on $_hsp_peer_ip diagnoses the peer; on
+'Another instance of rrsync' a hung rrsync process on $_hsp_peer_ip holds the
+lock - 'ps ax | grep rrsync' there shows it, kill the stale instance and the
+lock dies with it; if the key is rejected: journalctl -u sshd -n 20 on
+$_hsp_peer_ip shows 'invalid key option string' - re-run that node's join
+command to re-render the sync-key line)"
+}
+
 ha_write_authorized_keys() {
     _hak_sshdir="${HA_SYNC_SSH_DIR:-/root/.ssh}"
     mkdir -p "$_hak_sshdir"
