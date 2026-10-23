@@ -17,9 +17,28 @@ listen postgres_primary
     # the 1-minute client/server timeouts from the main config defaults.
     timeout client 1d
     timeout server 1d
-    timeout connect 10s
+    # 0.3.26: a LAN backend answers in milliseconds; the old 10s only
+    # stretched the failover window when the backend IP was dead-but-silent
+    # (hard power cut, no RST).
+    timeout connect 3s
     option httpchk
     http-check send meth GET uri /primary
-    default-server inter 3s fall 2 rise 1 check port @@AGENT_PORT@@
+    # 0.3.26: rise 2 - a backend must pass TWO consecutive /primary checks
+    # before entering rotation (boot-race anti-flap; the promote path costs
+    # +3s, noise next to the ~30s failover itself).
+    #
+    # 0.3.26 CRITICAL: on-marked-down shutdown-sessions. Without it haproxy
+    # keeps ESTABLISHED sessions to a backend that just left rotation: a
+    # session pinned to a node that is no longer the primary (or died by
+    # power cut) lives on until system TCP timeouts. mod_pgsql NEVER
+    # reconnects on a query error - the socket is healthy, the server merely
+    # refuses writes - so the 23.10 cold boot left FreeSWITCH on the primary
+    # PERMANENTLY read-only ("cannot execute UPDATE in a read-only
+    # transaction") while every NEW connection through 5433 worked fine.
+    # Killing the sessions on marked-down hands the application an instant
+    # RST -> it reconnects through 127.0.0.1:<port> to the CURRENT primary
+    # within seconds. One lever, two observed scenarios: the 0.3.24 15-min
+    # hang (sockets to a power-cut peer) and the 23.10 read-only zombie.
+    default-server inter 3s fall 2 rise 2 check port @@AGENT_PORT@@ on-marked-down shutdown-sessions
     server @@NODE1_NAME@@ @@NODE1_IP@@:5432 check
     server @@NODE2_NAME@@ @@NODE2_IP@@:5432 check

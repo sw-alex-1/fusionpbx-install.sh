@@ -202,6 +202,24 @@ php-fpm/angie/FreeSWITCH (`try-restart` через sudoers) — сокеты к 
 принудительно (перезагрузка телефона / вкл-выкл учётки) или подожди
 следующего цикла.
 
+**Read-only-зомби после холодной загрузки (урок стенда, 23.10 / 0.3.26):**
+если после загрузки кластера FreeSWITCH на primary отказывает в записи
+(`в транзакции в режиме "только чтение" нельзя выполнить UPDATE` в fs_cli,
+например на update sip_subscriptions), при том что свежий коннект через
+5433 той же учёткой пишет, — core-пул FS держит сессию, застрявшую в окне
+загрузки на бэкенде, неспособном принимать записи; haproxy такую сессию
+не убивал, а FS по ошибке запроса не реконнектится (сокет жив — сервер
+отказывает в записи). Лечение: `systemctl restart freeswitch` на
+пострадавшей ноде, телефон перерегистрировать принудительно. С 0.3.26
+`on-marked-down shutdown-sessions` убивает такие сессии автоматически в
+момент ухода бэкенда из ротации. Точное окно загрузки ищется журналами:
+`journalctl -b -u haproxy --no-pager | grep -E 'UP|DOWN'`;
+`journalctl -b -u fusionpbx-ha-agent --no-pager`; на standby —
+`select pid, client_addr, backend_start, state from pg_stat_activity
+where datname='fusionpbx' and client_addr='<IP ноды с пострадавшим FS>'`
+(долгоживущая сессия со временем старта ≈ загрузка = зомби); промоуты —
+`repmgr -f /etc/repmgr/repmgr.conf cluster event --limit 20`.
+
 **После аварии:** проверь `--status` на живой ноде (она теперь primary, witness
 running), сделай пробный звонок. Упавшую ноду верни по §5 — она вернётся уже
 standby; вернуть ей роль primary можно плановым `repmgr switchover` (когда всё
