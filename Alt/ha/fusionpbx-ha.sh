@@ -368,6 +368,7 @@ init_step_6_repmgr_conf() {
     ha_render_repmgr_conf primary
     ha_install_promote_sh
     ha_install_sudoers
+    ha_install_pg_boot_guard
     # the standby's media seed (join step 9) pulls $HA_SYNC_DIR over rrsync
     # the moment it starts streaming - LONG before init reaches the media
     # sync setup (step 14) that used to be the dir's only creator: on the
@@ -577,6 +578,7 @@ join_step_2_unpack() {
         ha_render_repmgr_conf standby
         ha_install_promote_sh
         ha_install_sudoers
+        ha_install_pg_boot_guard
         verbose "  repmgr configuration written: $HA_REPMGR_CONF (role: standby)"
     else
         # defensive branch - the dispatcher routes node 3 to the wit_* steps;
@@ -929,6 +931,7 @@ rep_step_3_rejoin_or_clone() {
     ha_render_repmgr_conf standby
     ha_install_promote_sh
     ha_install_sudoers
+    ha_install_pg_boot_guard
     _r3c_pgdata="$(ha_pg_data_dir)"
     if [ "$HA_FORCE_CLONE" = "true" ] || [ ! -f "$_r3c_pgdata/PG_VERSION" ]; then
         _r3c_mode="clone"
@@ -1317,6 +1320,21 @@ Check: systemctl status haproxy $HA_AGENT_UNIT_NAME"
                 *) _dr_fail "role-agent $_dc_ip unreachable ($_dc_code)" ;;
             esac
         done
+    fi
+
+    # 6b. boot guard (0.3.27, data nodes only): files present = a hard-
+    # crashed primary cannot boot as a competing primary. Reported
+    # regardless of the local PG state: a BLOCKED boot is exactly the
+    # state where this check must say so (the journal carries the verdict;
+    # haproxy on this node keeps serving the applications from the peer).
+    if [ "$HA_NODE_ID" != "3" ]; then
+        if [ -f "${HA_SYSTEMD_DIR}/${HA_PG_SERVICE}.service.d/fusionpbx-ha.conf" ] \
+            && [ -x "${HA_LIB_DIR}/pg-boot-guard.sh" ] \
+            && [ -f "${HA_ETC_DIR}/boot-guard.conf" ]; then
+            _dr_ok "PostgreSQL boot guard installed (a crashed primary cannot boot as a competing primary)"
+        else
+            _dr_warn "PostgreSQL boot guard NOT installed - a hard-crashed primary will boot as a competing primary (re-run this node's install command)"
+        fi
     fi
 
     # 7. services

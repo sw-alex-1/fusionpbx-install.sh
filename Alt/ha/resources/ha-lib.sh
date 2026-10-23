@@ -1039,6 +1039,85 @@ EOSUDO
 }
 
 # -----------------------------------------------------------------------------
+# 0.3.27: PostgreSQL boot guard (see resources/pg-boot-guard.sh for the
+# verdict table). A hard-power-cut PRIMARY has no standby.signal and would
+# boot as a COMPETING primary (the 22.10 bench split-brain); repmgr never
+# demotes an old primary, so the only safe gate is ExecStartPre - the guard
+# blocks the start while the peer's primary is alive and the blocked node's
+# haproxy keeps serving the applications from the surviving primary.
+# Three managed files: the script (/usr/lib), the rendered SECRET-FREE conf
+# (/etc/fusionpbx-ha, 644 - the guard runs as root via the unit's '+'
+# prefix and must never need cluster.conf, which is 600 root-only) and the
+# postgresql.service drop-in. Data nodes only; inert until repmgr.conf
+# exists, and a standby (standby.signal) always boots unconditionally.
+# -----------------------------------------------------------------------------
+ha_install_pg_boot_guard() {
+    _hibg_dir="${HA_BOOT_GUARD_DIR:-$HA_LIB_DIR}"
+    _hibg_dst="$_hibg_dir/pg-boot-guard.sh"
+    if [ -f "$HA_RES_DIR/pg-boot-guard.sh" ]; then
+        install -D -m 0755 "$HA_RES_DIR/pg-boot-guard.sh" "$_hibg_dst" 2>/dev/null \
+            || { warn "cannot install $_hibg_dst - this node boots unguarded"; return 1; }
+    elif [ ! -x "$_hibg_dst" ]; then
+        warn "pg-boot-guard.sh source missing - this node boots unguarded"
+        return 1
+    fi
+    if [ "$HA_NODE_ID" = "1" ]; then
+        _hibg_peer="$(ha_node_ip 2)"
+    else
+        _hibg_peer="$(ha_node_ip 1)"
+    fi
+    _hibg_conf="$HA_ETC_DIR/boot-guard.conf"
+    _hibg_tmp="$(mktemp "${TMPDIR:-/tmp}/fpbx-ha-guard.XXXXXX")"
+    sed -e "s|@@PEER_IP@@|$_hibg_peer|g" \
+        -e "s|@@PGDATA@@|$(ha_pg_data_dir)|g" \
+        -e "s|@@PG_PORT@@|$HA_PG_PORT|g" \
+        -e "s|@@AGENT_PORT@@|$HA_AGENT_PORT|g" \
+        -e "s|@@ATTEMPTS@@|${HA_BOOT_GUARD_ATTEMPTS:-15}|g" \
+        -e "s|@@SLEEP@@|${HA_BOOT_GUARD_SLEEP:-2}|g" \
+        -e "s|@@REPMGR_USER@@|$HA_REPMGR_USER|g" \
+        -e "s|@@REPMGR_DB@@|$HA_REPMGR_DB|g" \
+        -e "s|@@REPMGR_CONF@@|$HA_REPMGR_CONF|g" \
+        "$HA_RES_DIR/boot-guard.conf.tpl" > "$_hibg_tmp" || { rm -f "$_hibg_tmp"; return 1; }
+    if ! cmp -s "$_hibg_tmp" "$_hibg_conf" 2>/dev/null; then
+        install -m 0644 "$_hibg_tmp" "$_hibg_conf" 2>/dev/null \
+            || { rm -f "$_hibg_tmp"; warn "cannot write $_hibg_conf - this node boots unguarded"; return 1; }
+        verbose "  boot guard config written: $_hibg_conf (peer: $_hibg_peer)"
+    fi
+    rm -f "$_hibg_tmp"
+
+    _hibg_unit_dir="${HA_SYSTEMD_DIR}/${HA_PG_SERVICE}.service.d"
+    _hibg_unit_conf="$_hibg_unit_dir/fusionpbx-ha.conf"
+    _hibg_unit_tmp="$(mktemp "${TMPDIR:-/tmp}/fpbx-ha-dropin.XXXXXX")"
+    cat > "$_hibg_unit_tmp" <<DROPIN
+# fusionpbx-ha: PostgreSQL boot guard (0.3.27) - a hard-power-cut PRIMARY
+# has no standby.signal and would boot as a competing primary; ExecStartPre
+# refuses the start while the peer's primary is alive (runs as root via the
+# '+' prefix; rendered secret-free config: /etc/fusionpbx-ha/boot-guard.conf).
+[Service]
+ExecStartPre=+/usr/lib/fusionpbx-ha/pg-boot-guard.sh
+DROPIN
+    if ! mkdir -p "$_hibg_unit_dir" 2>/dev/null; then
+        rm -f "$_hibg_unit_tmp"
+        warn "cannot create $_hibg_unit_dir - this node boots unguarded"
+        return 1
+    fi
+    if [ -f "$_hibg_unit_conf" ] && cmp -s "$_hibg_unit_tmp" "$_hibg_unit_conf"; then
+        rm -f "$_hibg_unit_tmp"
+        verbose "  boot guard drop-in up to date: $_hibg_unit_conf"
+        return 0
+    fi
+    install -m 644 "$_hibg_unit_tmp" "$_hibg_unit_conf" 2>/dev/null || {
+        rm -f "$_hibg_unit_tmp"
+        warn "cannot write $_hibg_unit_conf - this node boots unguarded"
+        return 1
+    }
+    rm -f "$_hibg_unit_tmp"
+    systemctl daemon-reload 2>/dev/null || true
+    verbose "  boot guard drop-in installed: $_hibg_unit_conf (crashed primary cannot boot as a competing primary)"
+    return 0
+}
+
+# -----------------------------------------------------------------------------
 # repmgr extension schema access (regression 0.3.3, stand feedback: 'init'
 # step 7 dies with "permission denied for schema repmgr" / "нет доступа к
 # схеме repmgr"). CREATE EXTENSION runs as the postgres SUPERUSER (local
@@ -1179,7 +1258,7 @@ ha_register_prelude() {
     ha_fix_repmgr_schema_access
     case "$_hrp_role" in
         witness) ha_write_pgpass witness; ha_write_pg_hba witness ;;
-        *)       ha_write_pgpass data; ha_write_pg_hba data; ha_install_sudoers; ha_install_promote_sh ;;
+        *)       ha_write_pgpass data; ha_write_pg_hba data; ha_install_sudoers; ha_install_promote_sh; ha_install_pg_boot_guard ;;
     esac
     systemctl reload "$HA_PG_SERVICE" 2>/dev/null \
         || pg_runuser_psql -c "SELECT pg_reload_conf();" >/dev/null 2>&1 || true
@@ -1641,7 +1720,8 @@ ha_detect_php_fpm() {
 #   an INVALID line in postgresql.auto.conf - the server would have
 #   refused to RESTART. A hyphenated name must be double-quoted INSIDE the
 #   value: '"fpbx-ha-2"'. Plain identifiers, '' (async clear) and '*'
-#   (any standby, B2 fallback) pass through unchanged.
+#   (any standby - the historical B2 wildcard; nothing has produced it
+#   since 0.3.27, the primitive keeps passing it through untouched).
 #
 # ha_sync_names_write <host> <value-or-empty> - the ONLY writer for
 # synchronous_standby_names (regression 0.3.9):
@@ -1657,8 +1737,10 @@ ha_detect_php_fpm() {
 # ha_ensure_sync <primary-host|local>:
 #   - a streaming standby exists  -> synchronous_standby_names='<standby
 #     node name>' (double-quoted by ha_sync_names_gucval when it contains
-#     '-'; fallback '*' when the name does not match - see design open
-#     question B2), verify sync_state=sync
+#     '-'), verify sync_state=sync; a NAME MISMATCH falls back to ASYNC
+#     ('' - 0.3.27, design question B2 resolved: the old '*' wildcard
+#     froze every commit the moment that oddly-named standby
+#     disconnected - '' can never freeze a commit)
 #   - no streaming standby        -> synchronous_standby_names='' (async:
 #     writes continue; DESIGN.md 11.1 "async until the standby returns")
 # =============================================================================
@@ -1813,8 +1895,18 @@ ha_ensure_sync() {
         _hes_target="$(ha_node_name 1)"
     fi
     if ! echo "$_hes_names" | grep -qx "$_hes_target"; then
-        warn "streaming standby name is '$_hes_names' (expected '$_hes_target') - using '*' (design question B2 fallback)"
-        _hes_target="*"
+        # 0.3.27 (design question B2 resolved): fall back to ASYNC, never to
+        # '*' - with '*' every commit waits for a sync standby, so the moment
+        # that oddly-named standby disconnects, ALL writes on the primary
+        # freeze (the 22.10 bench 13:54 boot: a stale primary came up with a
+        # leftover synchronous_standby_names='*' and no streaming standby -
+        # WRITES FROZEN). '' is the already-documented policy (11.1: async
+        # until the standby returns) and can never freeze a commit.
+        warn "streaming standby name is '$_hes_names' (expected '$_hes_target') -"
+        warn "falling back to ASYNC (writes continue; the exact name matters only for RPO=0)"
+        ha_sync_names_write "$_hes_host" ""
+        verbose "  sync mode: OFF on $_hes_host (standby name mismatch - async fallback, 0.3.27)"
+        return 0
     fi
     ha_sync_names_write "$_hes_host" "$_hes_target"
 

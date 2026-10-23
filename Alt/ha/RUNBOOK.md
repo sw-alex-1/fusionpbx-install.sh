@@ -244,6 +244,18 @@ standby; вернуть ей роль primary можно плановым `repmg
 `--doctor` показывает проблемы репликации. Токен не нужен — вся информация о
 кластере уже в `/etc/fusionpbx-ha/cluster.conf` на самой ноде.
 
+**С 0.3.27 жёстко упавшая primary больше НЕ грузится competing- primary:**
+boot guard (ExecStartPre у postgresql.service на дата-нодах) при загрузке
+спрашивает пира: если его агент/БД подтверждают живую primary — локальный
+PostgreSQL не стартует вовсе (журнал: `journalctl -b -u postgresql`,
+«refusing to start a competing primary … run fusionpbx-ha.sh --repair»).
+Это безопасное состояние: веб и телефония ЭТОЙ ноды продолжают работать —
+её haproxy маршрутизирует на выжившую primary. Не запускай PostgreSQL
+вручную — просто выполни `--repair` ниже. Standby (standby.signal) и
+непроклонированная нода грузятся как раньше, без задержек; единственная
+цена — до ~30 с ожидания, если пир вообще не отвечает (одновременная
+загрузка всего кластера / единственная выжившая нода).
+
 ```sh
 ./fusionpbx-ha.sh --repair                  # обычный случай: данные на диске уцелели
 ./fusionpbx-ha.sh --repair --force-clone    # PGDATA мусор / новый диск: полная переклонировка

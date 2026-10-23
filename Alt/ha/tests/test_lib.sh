@@ -944,8 +944,10 @@ PSQL_SYNCNAMES='*' PSQL_APPNAME="some-foreign-name" lib_run '
     HA_DB_PASSWORD="pw123"
     ha_ensure_sync 10.0.0.11 && echo ensured
 '
-echo "$OUT" | grep -q '^ensured$' && echo "$OUT" | grep -q "using '\*'"
-report "ha_ensure_sync: B2 '*' fallback kept for a genuinely foreign name" "$?" "$(echo "$OUT" | head -3)"
+echo "$OUT" | grep -q '^ensured$' && echo "$OUT" | grep -q "falling back to ASYNC" \
+    && echo "$OUT" | grep -q "sync mode: OFF on 10.0.0.11" \
+    && ! echo "$OUT" | grep -q "using '\*'"
+report "ha_ensure_sync: foreign standby name -> ASYNC fallback, never '*' (0.3.27)" "$?" "$(echo "$OUT" | head -3)"
 
 _dc20="$(sed -n '/^cmd_doctor()/,/^}/p' "$CLI")"
 echo "$_dc20" | grep -qF 'witness: replication state lives on the data nodes' \
@@ -1620,6 +1622,128 @@ lib_run "ha_load_cluster_conf >/dev/null; ha_ensure_cluster_firewall; echo rc=\$
 echo "$OUT" | grep -q "iptables not available" && echo "$OUT" | grep -q "^rc=0$"
 report "fw: missing iptables -> warn, not fatal" $? "$OUT"
 mv "$WORK/iptables.hidden" "$WORK/fakebin/iptables"
+
+# ---------------------------------------------------------------------------
+echo "== pg boot guard (0.3.27) =="
+
+# standalone script behavior: stubbed curl/psql + a rendered-style conf
+mkdir -p "$WORK/guardbin" "$WORK/guarddata" "$WORK/guardetc"
+cat > "$WORK/guardbin/curl" <<'EOF'
+#!/bin/sh
+printf '%s' "${GUARD_CURL_CODE:-000}"
+EOF
+cat > "$WORK/guardbin/psql" <<'EOF'
+#!/bin/sh
+for _a in "$@"; do
+    case "$_a" in
+        *pg_is_in_recovery*)
+            if [ "${GUARD_PG_STATE:-down}" = "down" ]; then
+                echo "psql: error: connection refused" >&2
+                exit 2
+            fi
+            printf '%s' "${GUARD_PG_STATE}"
+            exit 0 ;;
+    esac
+done
+exit 0
+EOF
+chmod +x "$WORK/guardbin/curl" "$WORK/guardbin/psql"
+
+GUARD_CONF="$WORK/guardetc/boot-guard.conf"
+cat > "$GUARD_CONF" <<EOF
+BG_PEER_IP="10.0.0.12"
+BG_PGDATA="$WORK/guarddata"
+BG_PG_PORT="5432"
+BG_AGENT_PORT="8008"
+BG_ATTEMPTS="2"
+BG_SLEEP="0"
+BG_PG_PASSFILE="/nonexistent"
+BG_REPMGR_USER="repmgr"
+BG_REPMGR_DB="repmgr"
+BG_REPMGR_CONF_PATH="$WORK/guardetc/repmgr.conf"
+EOF
+: > "$WORK/guardetc/repmgr.conf"
+
+guard_run() {
+    OUT=$(PG_BOOT_GUARD_CONF="$GUARD_CONF" PATH="$WORK/guardbin:$PATH" \
+        sh "$RES/pg-boot-guard.sh" 2>&1)
+    return $?
+}
+
+# a standby boot is always unconditional (a standby can never write)
+touch "$WORK/guarddata/standby.signal"
+guard_run
+if [ $? -eq 0 ] && [ -z "$OUT" ]; then _g=0; else _g=1; fi
+report "guard: standby.signal -> silent allow" "$_g" "$OUT"
+rm -f "$WORK/guarddata/standby.signal"
+
+# an unclustered node (fresh init: no repmgr.conf yet) probes nothing
+rm -f "$WORK/guardetc/repmgr.conf"
+guard_run
+if [ $? -eq 0 ] && [ -z "$OUT" ]; then _g=0; else _g=1; fi
+report "guard: no repmgr.conf -> silent allow (first init pays no probe delay)" "$_g" "$OUT"
+: > "$WORK/guardetc/repmgr.conf"
+
+# peer role agent 200 = a live primary exists -> BLOCK + repair hint
+GUARD_CURL_CODE=200 GUARD_PG_STATE=down guard_run; _g_rc=$?
+if [ "$_g_rc" = "1" ] && echo "$OUT" | grep -q "refusing to start a competing primary" \
+    && echo "$OUT" | grep -q -- "--repair"; then _g=0; else _g=1; fi
+report "guard: peer agent 200 -> BLOCK (a crashed primary cannot return as primary)" "$_g" "$OUT"
+
+# agent silent but the peer's PostgreSQL answers 'not in recovery' -> BLOCK
+GUARD_CURL_CODE=000 GUARD_PG_STATE=f guard_run; _g_rc=$?
+if [ "$_g_rc" = "1" ] && echo "$OUT" | grep -q "refusing to start a competing primary"; then _g=0; else _g=1; fi
+report "guard: peer PG not-in-recovery (agent broken/silent) -> BLOCK" "$_g" "$OUT"
+
+# peer PostgreSQL in recovery = a standby waiting for its primary -> ALLOW
+GUARD_CURL_CODE=000 GUARD_PG_STATE=t guard_run
+if [ $? -eq 0 ] && echo "$OUT" | grep -q "standby in recovery - starting as its primary"; then _g=0; else _g=1; fi
+report "guard: peer standby in recovery -> ALLOW as its primary" "$_g" "$OUT"
+
+# peer entirely unreachable for the whole loop -> sole-survivor ALLOW
+GUARD_CURL_CODE=000 GUARD_PG_STATE=down guard_run
+if [ $? -eq 0 ] && echo "$OUT" | grep -q "starting as the sole node"; then _g=0; else _g=1; fi
+report "guard: peer unreachable -> sole survivor ALLOW with the partition warning" "$_g" "$OUT"
+
+# a missing conf must never brick the boot
+OUT=$(PG_BOOT_GUARD_CONF="/nonexistent-guard.conf" sh "$RES/pg-boot-guard.sh" 2>&1)
+if [ $? -eq 0 ] && [ -z "$OUT" ]; then _g=0; else _g=1; fi
+report "guard: missing conf -> silent allow (never bricks the boot)" "$_g" "$OUT"
+
+# installer: script + rendered secret-free conf + unit drop-in
+HA_LIB_DIR="$WORK/lib" HA_SYSTEMD_DIR="$WORK/systemd" lib_run '
+    HA_NODE_ID=1
+    HA_NODE1_IP="10.0.0.11"; HA_NODE2_IP="10.0.0.12"
+    HA_PG_PORT="5432"; HA_AGENT_PORT="8008"
+    HA_REPMGR_USER="repmgr"; HA_REPMGR_DB="repmgr"
+    HA_REPMGR_CONF="$WORK/etc/repmgr.conf"
+    ha_install_pg_boot_guard >/dev/null && echo rc0
+'
+_g_files=1
+if [ -x "$WORK/lib/pg-boot-guard.sh" ] \
+    && grep -q '^BG_PEER_IP="10.0.0.12"$' "$WORK/etc/boot-guard.conf" \
+    && ! grep -q 'PASSWORD' "$WORK/etc/boot-guard.conf" \
+    && grep -q '^ExecStartPre=+/usr/lib/fusionpbx-ha/pg-boot-guard.sh$' \
+        "$WORK/systemd/${HA_PG_SERVICE:-postgresql}.service.d/fusionpbx-ha.conf" \
+    && echo "$OUT" | grep -q '^rc0$'; then _g_files=0; fi
+report "guard install: script + secret-free rendered conf (peer of node 1 = node 2) + ExecStartPre=+ drop-in" "$_g_files" "$OUT"
+
+HA_LIB_DIR="$WORK/lib" HA_SYSTEMD_DIR="$WORK/systemd" lib_run '
+    HA_NODE_ID=1
+    HA_NODE1_IP="10.0.0.11"; HA_NODE2_IP="10.0.0.12"
+    HA_PG_PORT="5432"; HA_AGENT_PORT="8008"
+    HA_REPMGR_USER="repmgr"; HA_REPMGR_DB="repmgr"
+    HA_REPMGR_CONF="$WORK/etc/repmgr.conf"
+    ha_install_pg_boot_guard
+'
+echo "$OUT" | grep -q "boot guard drop-in up to date"
+report "guard install: idempotent (no churn on a healthy node)" "$?" "$(echo "$OUT" | head -2)"
+
+# doctor contract: the guard presence is reported on the data nodes
+_dc27="$(sed -n '/^cmd_doctor()/,/^}/p' "$CLI")"
+echo "$_dc27" | grep -qF 'PostgreSQL boot guard installed' \
+    && echo "$_dc27" | grep -qF 'will boot as a competing primary'
+report "doctor: boot guard presence check (0.3.27)" $?
 
 # ---------------------------------------------------------------------------
 echo
