@@ -193,10 +193,13 @@ if [ "$_ar_rc" -ne 0 ]; then
     # pg_rewind failure: capture the verbose standalone rewind while the
     # state is still reproducible - the journal gets the debug repmgr
     # never shows
-    log "rejoin failed (output above) - capturing 'pg_rewind -v --debug' for the journal"
+    # 0.3.31: pg_rewind has no '-v' option - the old debug capture died
+    # "invalid option -- v" and captured nothing (26.10: the journal held
+    # no rewind detail at all); --debug alone prints the real trace
+    log "rejoin failed (output above) - capturing 'pg_rewind --debug' for the journal"
     runuser -u postgres -- pg_rewind -D "$BG_PGDATA" \
         --source-server="host=$BG_PEER_IP port=$BG_PG_PORT user=$BG_REPMGR_USER dbname=$BG_REPMGR_DB" \
-        -v --debug 2>&1 || true
+        --debug 2>&1 || true
     log "retrying the rejoin once (pg_rewind is re-runnable)"
     _ar_out="$(ar_rejoin)"
     _ar_rc=$?

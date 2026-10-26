@@ -77,6 +77,17 @@ case "$_q" in
     # 0.3.22: WAL-receiver probe of the repair-rejoin classifier
     # (sender_host; empty = no receiver row)
     *pg_stat_wal_receiver*) echo "${PSQL_WAL_SENDER:-}" ;;
+    # 0.3.31: replay-advancement sampling of the same classifier -
+    # PSQL_REPLAY_SEQ is a space-separated list, every call returns the
+    # next element (counter file PSQL_REPLAY_COUNT); beyond the list ->
+    # empty (= frozen replay)
+    *pg_last_wal_replay_lsn*)
+        if [ -n "${PSQL_REPLAY_SEQ:-}" ]; then
+            _c="${PSQL_REPLAY_COUNT:?}"
+            _n=1; [ -f "$_c" ] && _n=$(( $(cat "$_c") + 1 ))
+            echo "$_n" > "$_c"
+            echo "$_n" | awk -v _s="$PSQL_REPLAY_SEQ" -v _i="$_n" 'BEGIN { _k = split(_s, _a, " "); print _a[_i] }'
+        fi ;;
     *pg_extension*) echo "${FIX_EXT:-1}" ;;
     *listen_addresses*) echo "${FIX_LISTEN:-*}" ;;
     *"ALTER SYSTEM SET synchronous_standby_names"*)
@@ -126,6 +137,10 @@ case "$_q" in
         fi
         exit 0 ;;
     *"SELECT application_name FROM pg_stat_replication"*) echo "${PSQL_APPNAME:-}" ;;
+    # 0.3.31: the classifier's peer probe - does the PRIMARY see our
+    # application_name in state='streaming'? ('-' not ':-': an EMPTY
+    # value is a legitimate "the peer answered: no" test injection)
+    *"SELECT 1 FROM pg_stat_replication WHERE application_name"*) echo "${PSQL_PEER_STREAM-1}" ;;
     *"SELECT sync_state FROM pg_stat_replication"*) echo "${PSQL_SYNCSTATE:-sync}" ;;
     *"SELECT 1"*) echo 1 ;;
     *) : ;;
@@ -1014,20 +1029,26 @@ echo "== repair rejoin on a running database (regression 0.3.22) =="
 # rejoin' may (re)start PostgreSQL itself via pg_ctl, outside systemd.
 
 lib_run '
-    ha_rejoin_plan_classify t 10.0.0.11 10.0.0.11
-    ha_rejoin_plan_classify t 10.0.0.12 10.0.0.11
-    ha_rejoin_plan_classify t "" 10.0.0.11
-    ha_rejoin_plan_classify f 10.0.0.11 10.0.0.11
-    ha_rejoin_plan_classify "" "" 10.0.0.11
+    ha_rejoin_plan_classify t 10.0.0.11 10.0.0.11 yes no
+    ha_rejoin_plan_classify t 10.0.0.11 10.0.0.11 no yes
+    ha_rejoin_plan_classify t 10.0.0.11 10.0.0.11 no no
+    ha_rejoin_plan_classify t 10.0.0.11 10.0.0.11 unknown no
+    ha_rejoin_plan_classify t 10.0.0.12 10.0.0.11 yes yes
+    ha_rejoin_plan_classify t "" 10.0.0.11 yes yes
+    ha_rejoin_plan_classify f 10.0.0.11 10.0.0.11 yes yes
+    ha_rejoin_plan_classify "" "" 10.0.0.11 yes yes
 '
 [ "$OUT" = "attached
+attached
+diverged
+attached
 diverged
 diverged
 diverged
 diverged" ]
-report "ha_rejoin_plan_classify: truth table - attached ONLY in recovery + peer (0.3.22)" $?
+report "ha_rejoin_plan_classify: truth table - attached ONLY in recovery + peer + the peer sees us replicating (0.3.22/0.3.31)" $?
 
-FIX_RECOVERY=t PSQL_WAL_SENDER=10.0.0.11 lib_run 'ha_rejoin_plan 10.0.0.11'
+FIX_RECOVERY=t PSQL_WAL_SENDER=10.0.0.11 HA_DB_PASSWORD="pw123" lib_run 'ha_rejoin_plan 10.0.0.11'
 [ "$OUT" = "attached" ]
 report "ha_rejoin_plan: standby streaming from the peer -> attached" $?
 
@@ -1042,6 +1063,28 @@ report "ha_rejoin_plan: no WAL receiver -> diverged (rewind)" $?
 FIX_RECOVERY=f PSQL_WAL_SENDER=10.0.0.11 lib_run 'ha_rejoin_plan 10.0.0.11'
 [ "$OUT" = "diverged" ]
 report "ha_rejoin_plan: running as a stale primary -> diverged (rewind)" $?
+
+# 0.3.31, the 26.10 bench zombie: the receiver is connected to the peer,
+# the peer does NOT see us streaming and replay is FROZEN (two identical
+# samples) - the standby replayed its own WAL past the peer's fork point
+# and can never catch up; only a pg_rewind rejoin fixes it. The 0.3.22
+# classifier called this 'attached' and every --repair skipped the rejoin
+rm -f "$WORK/replay.count"
+FIX_RECOVERY=t PSQL_WAL_SENDER=10.0.0.11 PSQL_PEER_STREAM= HA_DB_PASSWORD="pw123" \
+    PSQL_REPLAY_SEQ="0/D2514E0 0/D2514E0" PSQL_REPLAY_COUNT="$WORK/replay.count" \
+    HA_REJOIN_ADVANCE_SLEEP=0 lib_run 'ha_rejoin_plan 10.0.0.11'
+[ "$OUT" = "diverged" ]
+report "ha_rejoin_plan: connected but stuck (peer: no streaming, replay frozen) -> diverged (0.3.31)" $?
+
+# the same shape, but replay visibly advances: a healthy catchup (the
+# peer shows 'catchup'/'startup' while the standby works through the
+# backlog) - must NOT be interrupted by a rejoin
+rm -f "$WORK/replay.count"
+FIX_RECOVERY=t PSQL_WAL_SENDER=10.0.0.11 PSQL_PEER_STREAM= HA_DB_PASSWORD="pw123" \
+    PSQL_REPLAY_SEQ="0/D200000 0/D2514E0" PSQL_REPLAY_COUNT="$WORK/replay.count" \
+    HA_REJOIN_ADVANCE_SLEEP=0 lib_run 'ha_rejoin_plan 10.0.0.11'
+[ "$OUT" = "attached" ]
+report "ha_rejoin_plan: catching up (peer: not yet streaming, replay advancing) -> attached (0.3.31)" $?
 
 _r3c="$(sed -n '/^rep_step_3_rejoin_or_clone()/,/^}/p' "$CLI")"
 echo "$_r3c" | grep -q 'ha_rejoin_plan ' \
@@ -1375,9 +1418,15 @@ grep -qF 'DO $hfx$' "$HA_TEST_CAPTURE/1.sql" 2>/dev/null &&
 grep -qF '$hfx$;' "$HA_TEST_CAPTURE/1.sql" 2>/dev/null
 report "primary: DO dollar-tags survive the heredoc" $?
 grep -q "GRANT pg_monitor TO repmgr;" "$HA_TEST_CAPTURE/2.sql" 2>/dev/null &&
-grep -q "pg_catalog.pg_ls_archivepg_wal" "$HA_TEST_CAPTURE/2.sql" &&
-grep -q "pg_catalog.pg_read_binary_file(text, bigint, bigint)" "$HA_TEST_CAPTURE/2.sql"
-report "primary: pg_monitor + pg_rewind EXECUTE grants" $?
+grep -q "pg_ls_dir" "$HA_TEST_CAPTURE/2.sql" 2>/dev/null &&
+grep -q "pg_read_binary_file" "$HA_TEST_CAPTURE/2.sql" 2>/dev/null &&
+grep -qF "GRANT EXECUTE ON FUNCTION %s TO repmgr" "$HA_TEST_CAPTURE/2.sql" 2>/dev/null
+report "primary: pg_monitor + pg_rewind EXECUTE grants - every pg_ls_dir/pg_stat_file/pg_read_file/pg_read_binary_file overload (0.3.31)" $?
+grep -qF 'DO $hfw$' "$HA_TEST_CAPTURE/2.sql" 2>/dev/null &&
+grep -qF '$hfw$;' "$HA_TEST_CAPTURE/2.sql" 2>/dev/null
+report "primary: rewind-grants DO dollar-tags survive the heredoc" $?
+grep -q "EXCEPTION WHEN OTHERS THEN" "$HA_TEST_CAPTURE/2.sql" 2>/dev/null
+report "primary: rewind-grants DO block is per-statement tolerant" $?
 grep -qF '$HA_' "$HA_TEST_CAPTURE/1.sql" 2>/dev/null && _e=found || _e=ok
 grep -qF '$HA_' "$HA_TEST_CAPTURE/2.sql" 2>/dev/null && _e=found
 report "primary: no unexpanded shell variables in the SQL" "$_e"
@@ -2014,7 +2063,8 @@ if [ "$_g_rc" = "0" ] && echo "$OUT" | grep -q "AUTO-REJOIN COMPLETE" \
     && echo "$OUT" | grep -q "synchronous replication re-enabled"; then _g=0; fi
 report "auto-rejoin: happy path (rejoin + adopt + daemons + sync on the peer)" "$_g" "$(echo "$OUT" | tail -3)"
 
-# a failing rejoin: capture pg_rewind -v --debug (the open mystery),
+# a failing rejoin: capture the pg_rewind debug trace (0.3.31: pg_rewind
+# has no '-v' - the old capture died "invalid option" and logged nothing),
 # retry once, then give up and leave PostgreSQL DOWN (the safe state)
 : > "$WORK/ar-repmgr.log"; : > "$WORK/ar-rewind.log"; : > "$WORK/ar-sysctl.log"
 AR_PEER_HISTORY="$(printf '2\t0/3000000\t\n3\t0/5000000\tfailover')" \
@@ -2024,9 +2074,10 @@ AR_CURL_CODE=200 AR_PEER_RECOVERY="" AR_CTL_STATE="in production" ar_run; _g_rc=
 _g=1
 if [ "$_g_rc" = "1" ] && echo "$OUT" | grep -q "REJOIN FAILED" \
     && [ "$(grep -c 'node rejoin' "$WORK/ar-repmgr.log")" = "2" ] \
-    && grep -q -- '-v --debug' "$WORK/ar-rewind.log" \
+    && grep -q -- '--debug' "$WORK/ar-rewind.log" \
+    && ! grep -qE '(^| )-v( |$)' "$WORK/ar-rewind.log" \
     && ! grep -q '^start postgresql$' "$WORK/ar-sysctl.log"; then _g=0; fi
-report "auto-rejoin: failed rejoin -> rewind debug captured, one retry, PG left down" "$_g" "$(echo "$OUT" | tail -3)"
+report "auto-rejoin: failed rejoin -> rewind --debug captured (no invalid -v), one retry, PG left down" "$_g" "$(echo "$OUT" | tail -3)"
 
 # installer contract: the auto-rejoin script + unit + new conf keys
 HA_LIB_DIR="$WORK/lib" HA_SYSTEMD_DIR="$WORK/systemd" lib_run '

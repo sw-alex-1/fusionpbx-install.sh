@@ -810,30 +810,90 @@ ha_pg_start_tracked() {
 # bench repair died exactly there on a perfectly HEALTHY standby that only
 # needed its services restarted. 'attached' is returned ONLY when the local
 # database is in recovery AND its WAL receiver is connected to the given
-# peer (= the current primary, verified by the repair preflight): such a
-# node must not be stopped/rewound at all. Anything else - a running stale
+# peer (= the current primary, verified by the repair preflight) AND the
+# peer actually counts us as a replicating standby (0.3.31): such a node
+# must not be stopped/rewound at all. Anything else - a running stale
 # primary from before a failover, a standby on a dead or wrong upstream, a
-# database without a receiver - is 'diverged' and needs the rejoin.
+# database without a receiver, and the 26.10 zombie below - is 'diverged'
+# and needs the rejoin.
 # Pure string logic (testable): the caller collects the psql output.
+#
+# 0.3.31 forensics: a receiver CONNECTED to the peer proved nothing. The
+# 26.10 bench: the stale primary's auto-rejoin pg_rewind failed (missing
+# EXECUTE grants, see ha_fix_repmgr_schema_access) - but the rejoin
+# attempt had already recreated standby.signal, so the boot's own
+# postgresql start brought the node up as a "standby" that had replayed
+# its OWN timeline-4 WAL past the fork point where the peer promoted to
+# timeline 5. That continuation WAL exists nowhere in the cluster: the
+# receiver connected, the peer's walsender sat in 'startup' forever,
+# replay never advanced, sync never re-engaged ("no streaming standby")
+# - while this classifier kept saying 'attached' (receiver connected) and
+# every --repair skipped the rejoin. The verdict now needs the PEER's
+# word for it: attached = the peer reports our application_name with
+# state='streaming', OR replay is visibly advancing (a healthy catchup -
+# the peer shows 'catchup'/'startup' for minutes after a long downtime).
 ha_rejoin_plan_classify() {
-    _hrpc_in_recovery="$1"    # pg_is_in_recovery(): t / f / '' (unreachable)
-    _hrpc_sender="$2"         # pg_stat_wal_receiver.sender_host ('' = none)
+    _hrpc_in_recovery="$1"      # pg_is_in_recovery(): t / f / '' (unreachable)
+    _hrpc_sender="$2"           # pg_stat_wal_receiver.sender_host ('' = none)
     _hrpc_peer_ip="$3"
+    _hrpc_peer_streaming="$4"   # yes / no / unknown (the peer probe failed)
+    _hrpc_replay_advancing="$5" # yes / no (two pg_last_wal_replay_lsn samples)
     if [ "$_hrpc_in_recovery" = "t" ] && [ "$_hrpc_sender" = "$_hrpc_peer_ip" ]; then
-        echo "attached"
-    else
-        echo "diverged"
+        # probe verdict unknown (transient failure): keep the 0.3.22
+        # local-only verdict - the repair preflight just proved the peer
+        # alive, and an interrupted rejoin on a healthy standby costs
+        # more than a retry on the next --repair
+        if [ "$_hrpc_peer_streaming" != "no" ]; then
+            echo "attached"
+            return 0
+        fi
+        # the peer answered and does NOT see us streaming: attached only
+        # while replay still advances (catchup in progress); frozen = the
+        # diverged-WAL zombie above - only a pg_rewind rejoin fixes it
+        if [ "$_hrpc_replay_advancing" = "yes" ]; then
+            echo "attached"
+        else
+            echo "diverged"
+        fi
+        return 0
     fi
+    echo "diverged"
 }
 
-# Collector half of the classifier: reads the local PostgreSQL state and
-# hands it to ha_rejoin_plan_classify. The database must be RUNNING and
-# answering (the repair flow guarantees that before calling).
+# Collector half of the classifier: reads the local PostgreSQL state, asks
+# the PEER whether it sees us streaming, samples replay advancement when
+# the answer is 'not yet', and hands it all to ha_rejoin_plan_classify.
+# The database must be RUNNING and answering (the repair flow guarantees
+# that before calling).
 ha_rejoin_plan() {
     _hrp_peer_ip="$1"
     _hrp_in_recovery="$(pg_runuser_psql -tAc "SELECT pg_is_in_recovery()" 2>/dev/null | tr -d ' \r')"
     _hrp_sender="$(pg_runuser_psql -tAc "SELECT sender_host FROM pg_stat_wal_receiver" 2>/dev/null | head -n 1 | tr -d ' \r')"
-    ha_rejoin_plan_classify "${_hrp_in_recovery:-?}" "${_hrp_sender:-}" "$_hrp_peer_ip"
+    _hrp_peer_streaming="unknown"
+    _hrp_replay_advancing="no"
+    if [ "$_hrp_in_recovery" = "t" ] && [ "$_hrp_sender" = "$_hrp_peer_ip" ]; then
+        # 0.3.31: ask the current primary whether WE are a streaming
+        # standby of it (the repair preflight just proved it alive). A
+        # non-zero rc = the probe itself failed -> 'unknown', the
+        # local-only verdict stands.
+        if _hrp_probe="$(pg_psql_superuser "$_hrp_peer_ip" -tAc \
+                "SELECT 1 FROM pg_stat_replication WHERE application_name='$(ha_node_name "${HA_NODE_ID:-1}")' AND state='streaming'")"; then
+            _hrp_peer_streaming="no"
+            echo "$_hrp_probe" | grep -q 1 && _hrp_peer_streaming="yes"
+        fi
+        if [ "$_hrp_peer_streaming" = "no" ]; then
+            # not (yet) streaming: healthy catchup or the stuck zombie?
+            # sample the replay LSN - advancement = a catchup in progress
+            _hrp_lsn1="$(pg_runuser_psql -tAc "SELECT pg_last_wal_replay_lsn()" 2>/dev/null | tr -d ' \r')"
+            sleep "${HA_REJOIN_ADVANCE_SLEEP:-4}"
+            _hrp_lsn2="$(pg_runuser_psql -tAc "SELECT pg_last_wal_replay_lsn()" 2>/dev/null | tr -d ' \r')"
+            if [ -n "$_hrp_lsn1" ] && [ -n "$_hrp_lsn2" ] && [ "$_hrp_lsn1" != "$_hrp_lsn2" ]; then
+                _hrp_replay_advancing="yes"
+            fi
+        fi
+    fi
+    ha_rejoin_plan_classify "${_hrp_in_recovery:-?}" "${_hrp_sender:-}" "$_hrp_peer_ip" \
+        "$_hrp_peer_streaming" "$_hrp_replay_advancing"
 }
 
 # 0.3.22: 'repmgr node rejoin' may (re)start PostgreSQL itself via pg_ctl,
@@ -1298,7 +1358,17 @@ The generated SQL is kept at $_hfsa_sql - inspect the error with:
 
     # best-effort role grants: silent on purpose (a changed signature in a
     # future PostgreSQL major must not block a registration); stdin for the
-    # same per-user-TMPDIR reason as the hard block above
+    # same per-user-TMPDIR reason as the hard block above.
+    #
+    # 0.3.31 forensics: the fixed-signature list never included pg_ls_dir -
+    # and pg_rewind's very first step against the source server (building
+    # the file list) died "permission denied for function pg_ls_dir" the
+    # first time pg_rewind ever really executed (26.10 bench: 0.3.30 had
+    # just fixed the TMPDIR wrapper failure that had been masking it; both
+    # the boot auto-rejoin and the manual --repair failed on the grants).
+    # Fixed-signature GRANTs are also fragile across PostgreSQL majors, so
+    # the DO block below grants EVERY pg_catalog overload of the file
+    # access functions pg_rewind/repmgr use, whatever the server major is.
     _hfsa_opt="$(mktemp "${TMPDIR:-/tmp}/fpbx-ha-schema-opt.XXXXXX")"
     cat >"$_hfsa_opt" <<HAFIX
 -- freeze-proofing (regression 0.3.17): same as the hard block above - a
@@ -1306,13 +1376,33 @@ The generated SQL is kept at $_hfsa_sql - inspect the error with:
 -- stderr is discarded, a hang here would be completely silent)
 SET synchronous_commit = off;
 GRANT pg_monitor TO $HA_REPMGR_USER;
-GRANT EXECUTE ON FUNCTION pg_catalog.pg_read_file(text, bigint, bigint) TO $HA_REPMGR_USER;
-GRANT EXECUTE ON FUNCTION pg_catalog.pg_read_binary_file(text) TO $HA_REPMGR_USER;
-GRANT EXECUTE ON FUNCTION pg_catalog.pg_read_binary_file(text, bigint, bigint) TO $HA_REPMGR_USER;
-GRANT EXECUTE ON FUNCTION pg_catalog.pg_stat_file(text) TO $HA_REPMGR_USER;
-GRANT EXECUTE ON FUNCTION pg_catalog.pg_stat_file(text, boolean) TO $HA_REPMGR_USER;
-GRANT EXECUTE ON FUNCTION pg_catalog.pg_ls_waldir() TO $HA_REPMGR_USER;
-GRANT EXECUTE ON FUNCTION pg_catalog.pg_ls_archivepg_wal() TO $HA_REPMGR_USER;
+-- non-superuser pg_rewind (the documented PG13+ recipe): the file list
+-- comes from pg_ls_dir + pg_stat_file, block data via pg_read_binary_file,
+-- the timeline history via pg_read_file. One DO block, every overload -
+-- a missing EXECUTE only surfaces when a rejoin actually needs rewind,
+-- which is exactly the worst possible moment (26.10).
+DO \$hfw\$
+DECLARE r RECORD;
+BEGIN
+    FOR r IN
+        SELECT p.oid::regprocedure AS fn
+          FROM pg_catalog.pg_proc p
+         WHERE p.pronamespace = 'pg_catalog'::regnamespace
+           AND p.proname IN ('pg_ls_dir',
+                             'pg_stat_file',
+                             'pg_read_file',
+                             'pg_read_binary_file',
+                             'pg_ls_waldir',
+                             'pg_ls_archive_statusdir')
+    LOOP
+        BEGIN
+            EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO $HA_REPMGR_USER', r.fn);
+        EXCEPTION WHEN OTHERS THEN
+            NULL;
+        END;
+    END LOOP;
+END
+\$hfw\$;
 HAFIX
     pg_runuser_psql -d "$HA_REPMGR_DB" <"$_hfsa_opt" >/dev/null || true
     rm -f "$_hfsa_opt"
