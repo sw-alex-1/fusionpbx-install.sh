@@ -1,0 +1,23 @@
+# fusionpbx-ha: automatic rejoin of a stale primary at boot (0.3.29).
+# Runs the standalone /usr/lib/fusionpbx-ha/pg-auto-rejoin.sh (shared
+# secret-free config: /etc/fusionpbx-ha/boot-guard.conf). Data nodes
+# only - the installer never places this unit on a witness.
+[Unit]
+Description=fusionpbx-ha: automatic rejoin of a stale primary at boot
+Documentation=file:///usr/lib/fusionpbx-ha/pg-auto-rejoin.sh
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/fusionpbx-ha/boot-guard.conf
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/fusionpbx-ha/pg-auto-rejoin.sh
+TimeoutStartSec=1800
+# One attempt per boot, no Restart: a rejoin that keeps failing must not
+# loop over the data directory. A refusal/failure leaves the SAFE blocked
+# state of the boot guard (PostgreSQL down, the applications served from
+# the peer via haproxy) and a loud journal entry; the next boot retries,
+# a human can always run 'fusionpbx-ha.sh --repair'.
+
+[Install]
+WantedBy=multi-user.target

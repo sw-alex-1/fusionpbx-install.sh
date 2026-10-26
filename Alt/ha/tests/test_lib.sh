@@ -1809,6 +1809,249 @@ echo "$_rr328" | grep -qF 'ha_pg_start_for_classification' \
     && ! echo "$_rr328" | grep -qF 'systemctl start "$HA_PG_SERVICE"'
 report "repair step 3: local starts go through the guard-aware helpers" $?
 
+# ---------------------------------------------------------------------------
+# 0.3.29: the boot-time AUTOMATIC REJOIN (pg-auto-rejoin.sh) - behavioral
+# scenarios on PATH stubs (the same style as the boot guard harness)
+# ---------------------------------------------------------------------------
+mkdir -p "$WORK/arbin" "$WORK/ardata/pg_wal" "$WORK/arconf"
+: > "$WORK/arconf/repmgr.conf"
+: > "$WORK/ardata/pg_wal/000000030000000000000005"
+
+cat > "$WORK/arbin/curl" <<'EOF'
+#!/bin/sh
+case "$2" in *:8008/*) exit 0 ;; esac
+exit 0
+EOF
+# curl stub: '-w %{http_code}' prints the code on stdout
+cat > "$WORK/arbin/curl" <<'EOF'
+#!/bin/sh
+echo "${AR_CURL_CODE:-000}"
+exit 0
+EOF
+
+cat > "$WORK/arbin/psql" <<'EOF'
+#!/bin/sh
+# peer calls carry -h, local calls (via the runuser stub) do not
+for _a in "$@"; do
+    case "$_a" in -h) _peer=1 ;; esac
+done
+if [ "${_peer:-0}" = "1" ]; then
+    echo "PEER $*" >> "$AR_PSQL_LOG"
+    case "$*" in
+        *pg_is_in_recovery*) printf '%s' "${AR_PEER_RECOVERY:-}"; exit 0 ;;
+        *pg_control_checkpoint*) printf '%s' "${AR_PEER_TLI:-4}"; exit 0 ;;
+        *pg_read_file*) printf '%b' "${AR_PEER_HISTORY:-}"; exit 0 ;;
+        *"SELECT state FROM pg_stat_replication"*) printf '%s' "${AR_PEER_STREAM:-streaming}"; exit 0 ;;
+        *"SELECT sync_state FROM pg_stat_replication"*) printf '%s' "${AR_PEER_SYNC:-sync}"; exit 0 ;;
+        *"ALTER SYSTEM"*) exit 0 ;;
+        *pg_reload_conf*) exit 0 ;;
+    esac
+    exit 0
+fi
+echo "LOCAL $*" >> "$AR_PSQL_LOG"
+case "$*" in
+    *pg_is_in_recovery*) printf 't'; exit 0 ;;
+    *) exit 0 ;;
+esac
+EOF
+
+cat > "$WORK/arbin/systemctl" <<'EOF'
+#!/bin/sh
+echo "$@" >> "$AR_SYSCTL"
+if [ "$1" = "is-active" ]; then
+    echo "${AR_IS_ACTIVE:-inactive}"
+    exit 0
+fi
+exit 0
+EOF
+
+cat > "$WORK/arbin/runuser" <<'EOF'
+#!/bin/sh
+# strip '-u <user> --' then exec the rest
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -u) shift 2 ;;
+        --) shift; break ;;
+        *) break ;;
+    esac
+done
+exec "$@"
+EOF
+
+cat > "$WORK/arbin/pg_controldata" <<'EOF'
+#!/bin/sh
+[ "${AR_CTL_RC:-0}" = "1" ] && exit 1
+echo "pg_control version number:            1600"
+echo "Database cluster state:               ${AR_CTL_STATE:-in production}"
+echo "Latest checkpoint's TimeLineID:       ${AR_CTL_TLI:-3}"
+echo "Latest checkpoint location:           ${AR_CTL_LSN:-0/5001000}"
+exit 0
+EOF
+
+cat > "$WORK/arbin/repmgr" <<'EOF'
+#!/bin/sh
+echo "repmgr $*" >> "$AR_REPMGR_LOG"
+printf '%b' "${AR_REJOIN_OUT:-}"
+exit "${AR_REJOIN_RC:-0}"
+EOF
+
+cat > "$WORK/arbin/pg_rewind" <<'EOF'
+#!/bin/sh
+echo "pg_rewind $*" >> "$AR_REWIND_LOG"
+exit 0
+EOF
+
+cat > "$WORK/arbin/pg_ctl" <<'EOF'
+#!/bin/sh
+echo "pg_ctl $*" >> "$AR_PGCTL_LOG"
+exit 0
+EOF
+chmod +x "$WORK/arbin/"*
+# the stub log paths are exported once for the whole harness
+export AR_PSQL_LOG="$WORK/ar-psql.log" AR_SYSCTL="$WORK/ar-sysctl.log" \
+       AR_REPMGR_LOG="$WORK/ar-repmgr.log" AR_REWIND_LOG="$WORK/ar-rewind.log" \
+       AR_PGCTL_LOG="$WORK/ar-pgctl.log"
+
+AR_CONF="$WORK/arconf/boot-guard.conf"
+cat > "$AR_CONF" <<EOF
+BG_PEER_IP="10.0.0.12"
+BG_PGDATA="$WORK/ardata"
+BG_PG_PORT="5432"
+BG_AGENT_PORT="8008"
+BG_ATTEMPTS="2"
+BG_SLEEP="0"
+BG_PG_PASSFILE="/nonexistent"
+BG_REPMGR_USER="repmgr"
+BG_REPMGR_DB="repmgr"
+BG_REPMGR_CONF_PATH="$WORK/arconf/repmgr.conf"
+BG_REPAIR_FLAG="/run/fusionpbx-ha/repair-start.flag"
+BG_NODE_ROLE="data"
+BG_NODE_NAME="fpbx-ha-1"
+BG_PG_SERVICE="postgresql"
+BG_REPMGRD_SERVICE="repmgr"
+BG_LSYNCD_SERVICE="lsyncd"
+BG_REJOIN_ATTEMPTS="2"
+BG_REJOIN_SLEEP="0"
+BG_MAX_GAP_MB="128"
+EOF
+
+ar_run() {
+    OUT=$(PG_AUTO_REJOIN_CONF="$AR_CONF" PATH="$WORK/arbin:$PATH" \
+        sh "$RES/pg-auto-rejoin.sh" 2>&1)
+    return $?
+}
+
+# a standby boot pays nothing (the guard lets it start unconditionally)
+: > "$WORK/ardata/standby.signal"
+AR_CURL_CODE=200 ar_run
+if [ $? -eq 0 ] && [ -z "$OUT" ]; then _g=0; else _g=1; fi
+report "auto-rejoin: standby.signal -> silent exit (nothing to do)" "$_g" "$OUT"
+rm -f "$WORK/ardata/standby.signal"
+
+# a node that is not clustered yet pays nothing either
+mv "$WORK/arconf/repmgr.conf" "$WORK/arconf/repmgr.conf.off"
+AR_CURL_CODE=200 ar_run
+if [ $? -eq 0 ] && [ -z "$OUT" ]; then _g=0; else _g=1; fi
+report "auto-rejoin: no repmgr.conf -> silent exit" "$_g" "$OUT"
+mv "$WORK/arconf/repmgr.conf.off" "$WORK/arconf/repmgr.conf"
+
+# the peer is a standby waiting for US - the guard's 'peer in recovery'
+# verdict owns the start, not us
+AR_CURL_CODE=000 AR_PEER_RECOVERY=t ar_run
+if [ $? -eq 0 ] && [ -z "$OUT" ]; then _g=0; else _g=1; fi
+report "auto-rejoin: peer in recovery -> silent exit (we are its primary)" "$_g" "$OUT"
+
+# peer unreachable for the whole loop -> not ours to decide (the guard's
+# sole-survivor loop owns the start)
+AR_CURL_CODE=000 AR_PEER_RECOVERY="" ar_run
+if [ $? -eq 0 ] && [ -z "$OUT" ]; then _g=0; else _g=1; fi
+report "auto-rejoin: peer unreachable -> silent exit (sole-survivor is the guard's call)" "$_g" "$OUT"
+
+# a damaged local cluster is force-clone territory - NEVER automatic
+AR_CURL_CODE=200 AR_PEER_RECOVERY="" AR_CTL_RC=1 ar_run; _g_rc=$?
+if [ "$_g_rc" = "1" ] && echo "$OUT" | grep -q "REFUSING" && echo "$OUT" | grep -q -- "--repair"; then _g=0; else _g=1; fi
+report "auto-rejoin: unreadable pg_controldata -> REFUSE (manual --repair)" "$_g" "$(echo "$OUT" | tail -3)"
+
+# an ex-standby that lost its standby.signal is not a stale primary - a
+# human must classify it
+AR_CURL_CODE=200 AR_PEER_RECOVERY="" AR_CTL_RC=0 AR_CTL_STATE="in archive recovery" ar_run; _g_rc=$?
+if [ "$_g_rc" = "1" ] && echo "$OUT" | grep -q "not a former primary"; then _g=0; else _g=1; fi
+report "auto-rejoin: cluster state not 'in production' -> REFUSE" "$_g" "$(echo "$OUT" | tail -3)"
+
+# the peer must have forked FROM our timeline (we hold no history it lacks)
+AR_PEER_HISTORY="$(printf '2\t0/3000000\t\n2\t0/4000000\t')" \
+AR_CURL_CODE=200 AR_PEER_RECOVERY="" AR_CTL_STATE="in production" ar_run; _g_rc=$?
+if [ "$_g_rc" = "1" ] && echo "$OUT" | grep -q "timeline mismatch"; then _g=0; else _g=1; fi
+report "auto-rejoin: peer history not forked from our timeline -> REFUSE" "$_g" "$(echo "$OUT" | tail -3)"
+
+# a big fork-point gap smells like a partition with async writes on our
+# side - an automatic rewind could eat unreplicated data
+AR_PEER_HISTORY="$(printf '2\t0/3000000\t\n3\t0/1000000\tfailover')" \
+AR_CTL_LSN="0/9001000" \
+AR_CURL_CODE=200 AR_PEER_RECOVERY="" AR_CTL_STATE="in production" ar_run; _g_rc=$?
+if [ "$_g_rc" = "1" ] && echo "$OUT" | grep -q "unreplicated"; then _g=0; else _g=1; fi
+report "auto-rejoin: fork gap over budget -> REFUSE (a human must decide)" "$_g" "$(echo "$OUT" | tail -3)"
+
+# HAPPY PATH: single failover topology, small gap -> unattended rejoin +
+# systemd adopt + daemons + sync back on the peer
+: > "$WORK/ar-psql.log"; : > "$WORK/ar-sysctl.log"; : > "$WORK/ar-repmgr.log"
+AR_PEER_HISTORY="$(printf '2\t0/3000000\t\n3\t0/5000000\tfailover')" \
+AR_CTL_LSN="0/5001000" AR_PEER_TLI=4 AR_PEER_STREAM=streaming AR_PEER_SYNC=sync \
+AR_IS_ACTIVE="inactive" AR_REJOIN_RC=0 \
+AR_CURL_CODE=200 AR_PEER_RECOVERY="" AR_CTL_STATE="in production" ar_run; _g_rc=$?
+_g=1
+if [ "$_g_rc" = "0" ] && echo "$OUT" | grep -q "AUTO-REJOIN COMPLETE" \
+    && grep -q "node rejoin --force-rewind -h 10.0.0.12 -U repmgr -d repmgr" "$WORK/ar-repmgr.log" \
+    && grep -q '^stop postgresql$' "$WORK/ar-sysctl.log" \
+    && grep -q '^reset-failed postgresql$' "$WORK/ar-sysctl.log" \
+    && grep -q '^start postgresql$' "$WORK/ar-sysctl.log" \
+    && grep -q '^restart repmgr$' "$WORK/ar-sysctl.log" \
+    && grep -q '^restart lsyncd$' "$WORK/ar-sysctl.log" \
+    && grep -q 'ALTER SYSTEM SET synchronous_standby_names' "$WORK/ar-psql.log" \
+    && grep -q 'pg_reload_conf' "$WORK/ar-psql.log" \
+    && echo "$OUT" | grep -q "synchronous replication re-enabled"; then _g=0; fi
+report "auto-rejoin: happy path (rejoin + adopt + daemons + sync on the peer)" "$_g" "$(echo "$OUT" | tail -3)"
+
+# a failing rejoin: capture pg_rewind -v --debug (the open mystery),
+# retry once, then give up and leave PostgreSQL DOWN (the safe state)
+: > "$WORK/ar-repmgr.log"; : > "$WORK/ar-rewind.log"; : > "$WORK/ar-sysctl.log"
+AR_PEER_HISTORY="$(printf '2\t0/3000000\t\n3\t0/5000000\tfailover')" \
+AR_CTL_LSN="0/5001000" AR_IS_ACTIVE="inactive" \
+AR_REJOIN_RC=1 AR_REJOIN_OUT='pg_rewind: error: unable to open temporary file\\n' \
+AR_CURL_CODE=200 AR_PEER_RECOVERY="" AR_CTL_STATE="in production" ar_run; _g_rc=$?
+_g=1
+if [ "$_g_rc" = "1" ] && echo "$OUT" | grep -q "REJOIN FAILED" \
+    && [ "$(grep -c 'node rejoin' "$WORK/ar-repmgr.log")" = "2" ] \
+    && grep -q -- '-v --debug' "$WORK/ar-rewind.log" \
+    && ! grep -q '^start postgresql$' "$WORK/ar-sysctl.log"; then _g=0; fi
+report "auto-rejoin: failed rejoin -> rewind debug captured, one retry, PG left down" "$_g" "$(echo "$OUT" | tail -3)"
+
+# installer contract: the auto-rejoin script + unit + new conf keys
+HA_LIB_DIR="$WORK/lib" HA_SYSTEMD_DIR="$WORK/systemd" lib_run '
+    HA_NODE_ID=1
+    HA_NODE1_IP="10.0.0.11"; HA_NODE2_IP="10.0.0.12"
+    HA_PG_PORT="5432"; HA_AGENT_PORT="8008"
+    HA_REPMGR_USER="repmgr"; HA_REPMGR_DB="repmgr"
+    HA_REPMGR_CONF="$WORK/etc/repmgr.conf"
+    ha_install_pg_boot_guard >/dev/null 2>&1
+'
+_g=1
+if [ -x "$WORK/lib/pg-auto-rejoin.sh" ] \
+    && grep -q '^ExecStart=/usr/lib/fusionpbx-ha/pg-auto-rejoin.sh$' "$WORK/systemd/fusionpbx-ha-auto-rejoin.service" \
+    && grep -q '^WantedBy=multi-user.target$' "$WORK/systemd/fusionpbx-ha-auto-rejoin.service" \
+    && grep -q '^BG_NODE_NAME="fpbx-ha-1"$' "$WORK/etc/boot-guard.conf" \
+    && grep -q '^BG_REJOIN_ATTEMPTS="45"$' "$WORK/etc/boot-guard.conf" \
+    && grep -q '^BG_MAX_GAP_MB="128"$' "$WORK/etc/boot-guard.conf" \
+    && grep -q '^BG_PG_SERVICE="postgresql"$' "$WORK/etc/boot-guard.conf" \
+    && ! grep -q 'PASSWORD' "$WORK/etc/boot-guard.conf"; then _g=0; fi
+report "auto-rejoin install: script + unit + rendered conf keys (secret-free)" "$_g" "$(echo "$OUT" | head -3)"
+
+# doctor contract: the automatic rejoin is reported on the data nodes
+_dc329="$(sed -n '/^cmd_doctor()/,/^}/p' "$CLI")"
+echo "$_dc329" | grep -qF 'automatic rejoin enabled' \
+    && echo "$_dc329" | grep -qF 'AUTOMATIC REJOIN is not enabled'
+report "doctor: automatic rejoin presence check (0.3.29)" $?
+
 # doctor contract: the guard presence is reported on the data nodes
 _dc27="$(sed -n '/^cmd_doctor()/,/^}/p' "$CLI")"
 echo "$_dc27" | grep -qF 'PostgreSQL boot guard installed' \

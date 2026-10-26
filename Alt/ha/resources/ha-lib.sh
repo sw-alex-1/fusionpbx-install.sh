@@ -52,6 +52,8 @@ HA_PG_SERVICE="${HA_PG_SERVICE:-postgresql}"
 HA_REPMGRD_SERVICE="${HA_REPMGRD_SERVICE:-repmgr}"
 HA_HAPROXY_SERVICE="${HA_HAPROXY_SERVICE:-haproxy}"
 HA_LSYNCD_SERVICE="${HA_LSYNCD_SERVICE:-lsyncd}"
+# 0.3.29: the boot-time automatic rejoin unit (see pg-auto-rejoin.sh)
+HA_AUTO_REJOIN_UNIT="${HA_AUTO_REJOIN_UNIT:-fusionpbx-ha-auto-rejoin}"
 
 # Cluster value defaults: they carry the FIRST steps of a fresh --init, which
 # run BEFORE cluster.conf exists (it is generated in step 2). cluster.conf
@@ -1081,10 +1083,15 @@ EOSUDO
 # demotes an old primary, so the only safe gate is ExecStartPre - the guard
 # blocks the start while the peer's primary is alive and the blocked node's
 # haproxy keeps serving the applications from the surviving primary.
-# Three managed files: the script (/usr/lib), the rendered SECRET-FREE conf
-# (/etc/fusionpbx-ha, 644 - the guard runs as root via the unit's '+'
-# prefix and must never need cluster.conf, which is 600 root-only) and the
-# postgresql.service drop-in. Data nodes only; inert until repmgr.conf
+# 0.3.29: the same installer places the AUTOMATIC REJOIN - a oneshot unit
+# running at every data-node boot; when the guard's own inputs say "stale
+# primary, peer verifiably primary, clean single-failover topology, small
+# fork gap" it rejoins via pg_rewind unattended (resources/pg-auto-rejoin.sh
+# for the verdict/gate table; NEVER force-clones or promotes).
+# Managed files: the two scripts (/usr/lib), the rendered SECRET-FREE conf
+# (/etc/fusionpbx-ha, 644 - both run as root and must never need cluster.conf,
+# which is 600 root-only), the postgresql.service drop-in and the
+# fusionpbx-ha-auto-rejoin unit. Data nodes only; inert until repmgr.conf
 # exists, and a standby (standby.signal) always boots unconditionally.
 # -----------------------------------------------------------------------------
 ha_install_pg_boot_guard() {
@@ -1102,6 +1109,8 @@ ha_install_pg_boot_guard() {
     else
         _hibg_peer="$(ha_node_ip 1)"
     fi
+    _hibg_nodename="$(ha_node_name "${HA_NODE_ID:-1}")"
+    : "${_hibg_nodename:=fpbx-ha-1}"
     _hibg_conf="$HA_ETC_DIR/boot-guard.conf"
     _hibg_tmp="$(mktemp "${TMPDIR:-/tmp}/fpbx-ha-guard.XXXXXX")"
     sed -e "s|@@PEER_IP@@|$_hibg_peer|g" \
@@ -1113,6 +1122,13 @@ ha_install_pg_boot_guard() {
         -e "s|@@REPMGR_USER@@|$HA_REPMGR_USER|g" \
         -e "s|@@REPMGR_DB@@|$HA_REPMGR_DB|g" \
         -e "s|@@REPMGR_CONF@@|$HA_REPMGR_CONF|g" \
+        -e "s|@@NODE_NAME@@|$_hibg_nodename|g" \
+        -e "s|@@PG_SERVICE@@|$HA_PG_SERVICE|g" \
+        -e "s|@@REPMGRD_SERVICE@@|$HA_REPMGRD_SERVICE|g" \
+        -e "s|@@LSYNCD_SERVICE@@|$HA_LSYNCD_SERVICE|g" \
+        -e "s|@@REJOIN_ATTEMPTS@@|${HA_AUTO_REJOIN_ATTEMPTS:-45}|g" \
+        -e "s|@@REJOIN_SLEEP@@|${HA_AUTO_REJOIN_SLEEP:-2}|g" \
+        -e "s|@@MAX_GAP_MB@@|${HA_AUTO_REJOIN_MAX_GAP_MB:-128}|g" \
         "$HA_RES_DIR/boot-guard.conf.tpl" > "$_hibg_tmp" || { rm -f "$_hibg_tmp"; return 1; }
     if ! cmp -s "$_hibg_tmp" "$_hibg_conf" 2>/dev/null; then
         install -m 0644 "$_hibg_tmp" "$_hibg_conf" 2>/dev/null \
@@ -1140,16 +1156,49 @@ DROPIN
     if [ -f "$_hibg_unit_conf" ] && cmp -s "$_hibg_unit_tmp" "$_hibg_unit_conf"; then
         rm -f "$_hibg_unit_tmp"
         verbose "  boot guard drop-in up to date: $_hibg_unit_conf"
-        return 0
-    fi
-    install -m 644 "$_hibg_unit_tmp" "$_hibg_unit_conf" 2>/dev/null || {
+    else
+        install -m 644 "$_hibg_unit_tmp" "$_hibg_unit_conf" 2>/dev/null || {
+            rm -f "$_hibg_unit_tmp"
+            warn "cannot write $_hibg_unit_conf - this node boots unguarded"
+            return 1
+        }
         rm -f "$_hibg_unit_tmp"
-        warn "cannot write $_hibg_unit_conf - this node boots unguarded"
-        return 1
-    }
-    rm -f "$_hibg_unit_tmp"
+        verbose "  boot guard drop-in installed: $_hibg_unit_conf (crashed primary cannot boot as a competing primary)"
+    fi
+
+    # 0.3.29: the automatic rejoin - script + unit + enable (never start:
+    # it is a boot-time unit; on the CURRENT uptime the manual --repair
+    # owns the flow)
+    _hibg_ar_dst="$_hibg_dir/pg-auto-rejoin.sh"
+    if [ -f "$HA_RES_DIR/pg-auto-rejoin.sh" ]; then
+        install -D -m 0755 "$HA_RES_DIR/pg-auto-rejoin.sh" "$_hibg_ar_dst" 2>/dev/null \
+            || warn "cannot install $_hibg_ar_dst - automatic rejoin unavailable"
+    elif [ ! -x "$_hibg_ar_dst" ]; then
+        warn "pg-auto-rejoin.sh source missing - automatic rejoin unavailable"
+    fi
+    _hibg_ar_unit="$HA_SYSTEMD_DIR/$HA_AUTO_REJOIN_UNIT.service"
+    if [ -f "$HA_RES_DIR/fusionpbx-ha-auto-rejoin.service" ]; then
+        _hibg_ar_tmp="$(mktemp "${TMPDIR:-/tmp}/fpbx-ha-arunit.XXXXXX")"
+        cat > "$_hibg_ar_tmp" <<ARUNIT
+# fusionpbx-ha: managed by fusionpbx-ha.sh (local changes will be overwritten)
+$(cat "$HA_RES_DIR/fusionpbx-ha-auto-rejoin.service")
+ARUNIT
+        if [ -f "$_hibg_ar_unit" ] && cmp -s "$_hibg_ar_tmp" "$_hibg_ar_unit"; then
+            rm -f "$_hibg_ar_tmp"
+            verbose "  auto-rejoin unit up to date: $_hibg_ar_unit"
+        else
+            install -m 644 "$_hibg_ar_tmp" "$_hibg_ar_unit" 2>/dev/null || {
+                rm -f "$_hibg_ar_tmp"
+                warn "cannot write $_hibg_ar_unit - automatic rejoin unavailable"
+                return 1
+            }
+            rm -f "$_hibg_ar_tmp"
+            verbose "  auto-rejoin unit installed: $_hibg_ar_unit"
+        fi
+    fi
     systemctl daemon-reload 2>/dev/null || true
-    verbose "  boot guard drop-in installed: $_hibg_unit_conf (crashed primary cannot boot as a competing primary)"
+    systemctl enable "$HA_AUTO_REJOIN_UNIT" >/dev/null 2>&1 \
+        || warn "could not enable $HA_AUTO_REJOIN_UNIT - no boot-time automatic rejoin"
     return 0
 }
 

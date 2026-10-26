@@ -1,0 +1,278 @@
+#!/bin/sh
+# fusionpbx-ha: automatic rejoin of a stale primary at boot (installed
+# copy - rendered values live in the secret-free /etc/fusionpbx-ha/
+# boot-guard.conf, shared with the boot guard).
+#
+# WHY (DESIGN.md changelog 0.3.29): the boot guard (0.3.27) leaves a
+# hard-crashed primary SAFELY DOWN until a human runs 'fusionpbx-ha.sh
+# --repair' - correct for data safety, but a crash+reboot with no
+# operator on site (night/weekend) kept the node out of the cluster
+# indefinitely: one live data node, no failover protection, no RPO=0.
+# This unit closes that loop UNATTENDED for the one scenario that is
+# always safe to automate - this node boots, its own PostgreSQL is down,
+# and the peer VERIFIABLY is the live primary, on a higher timeline that
+# forked from ours a moment ago:
+#
+#   gates (all must pass, else REFUSE - see the refuses below):
+#     peer agent 200 / peer PG not-in-recovery  (a live primary exists)
+#     + local PGDATA is a former primary ("in production"), readable
+#     + peer_timeline > local_timeline AND the peer's history forked
+#       FROM the local timeline (we hold no history the peer lacks)
+#     + the fork-point gap is within budget (the crash's last checkpoint
+#       is close to the fork point = the writes the peer never received
+#       are negligible; a big gap smells like a partition with async
+#       writes on our side and MUST go to a human)
+#   -> pg_rewind-rejoin as the peer's standby - exactly what the manual
+#      repair's diverged branch does ('node rejoin --force-rewind') -
+#      then adopt PostgreSQL under systemd, converge repmgrd/lsyncd and
+#      re-enable synchronous replication on the peer.
+#
+# NEVER automatic: a force-clone (an unattended data wipe is
+# unacceptable), a promote, a rejoin past a refused gate, anything on a
+# witness (role gate) or a standby (standby.signal gate) or a node that
+# is not clustered yet (repmgr.conf gate).
+#
+# Any refusal or failure leaves the SAFE blocked state of 0.3.27:
+# PostgreSQL down, this node's haproxy serving its applications from the
+# peer's primary, a loud journal entry; the next boot retries, a human
+# can always run --repair. One attempt per boot (no Restart=): a rejoin
+# that keeps failing must not loop over the data directory.
+
+CONF="${PG_AUTO_REJOIN_CONF:-/etc/fusionpbx-ha/boot-guard.conf}"
+[ -r "$CONF" ] || exit 0
+# shellcheck disable=SC1090
+. "$CONF"
+
+# partial/legacy conf must never break the boot
+: "${BG_PEER_IP:=}" "${BG_PGDATA:=/var/lib/pgsql/data}" "${BG_PG_PORT:=5432}"
+: "${BG_AGENT_PORT:=8008}" "${BG_PG_PASSFILE:=/var/lib/pgsql/.pgpass}"
+: "${BG_REPMGR_USER:=repmgr}" "${BG_REPMGR_DB:=repmgr}"
+: "${BG_REPMGR_CONF_PATH:=/etc/repmgr/repmgr.conf}"
+: "${BG_NODE_ROLE:=data}" "${BG_NODE_NAME:=}"
+: "${BG_PG_SERVICE:=postgresql}" "${BG_REPMGRD_SERVICE:=repmgr}"
+: "${BG_LSYNCD_SERVICE:=lsyncd}"
+: "${BG_REJOIN_ATTEMPTS:=45}" "${BG_REJOIN_SLEEP:=2}" "${BG_MAX_GAP_MB:=128}"
+
+log()    { echo "fusionpbx-ha auto-rejoin: $*" >&2; }
+refuse() {
+    log "REFUSING the automatic rejoin: $*"
+    log "PostgreSQL stays down (the SAFE state - the applications work via the peer);"
+    log "run 'fusionpbx-ha.sh --repair' when convenient."
+    exit 1
+}
+
+# nothing-to-do verdicts are SILENT: a healthy node must not pay log noise
+[ "$BG_NODE_ROLE" = "data" ] || exit 0
+[ -n "$BG_PEER_IP" ] || exit 0
+[ -d "$BG_PGDATA" ] || exit 0
+[ -f "$BG_PGDATA/standby.signal" ] && exit 0   # a standby boots unconditionally
+[ -f "$BG_REPMGR_CONF_PATH" ] || exit 0         # not a clustered node yet
+
+# peer psql as the postgres superuser (root reads the 600 .pgpass - the
+# same pattern the boot guard uses for its repmgr@peer probe)
+ar_peer_psql() {
+    PGPASSFILE="$BG_PG_PASSFILE" psql -h "$BG_PEER_IP" -p "$BG_PG_PORT" \
+        -U postgres -d postgres -tAc "$1" 2>/dev/null | tr -d ' \r'
+}
+
+# local psql over the unix socket (peer auth as postgres, no password)
+ar_local_psql() {
+    runuser -u postgres -- psql -tAc "$1" 2>/dev/null | tr -d ' \r'
+}
+
+# ---------------------------------------------------------------------------
+# 1) the peer verdict (retried: a simultaneous boot may take the peer's
+#    own guard loop ~30s to resolve its own start)
+# ---------------------------------------------------------------------------
+_ar_go=0
+_i=0
+while [ "$_i" -lt "$BG_REJOIN_ATTEMPTS" ]; do
+    _i=$((_i + 1))
+    _code="$(curl --noproxy '*' -s -o /dev/null -w '%{http_code}' \
+        --max-time 3 "http://$BG_PEER_IP:$BG_AGENT_PORT/primary" 2>/dev/null || true)"
+    if [ "$_code" = "200" ]; then
+        _ar_go=1
+        break
+    fi
+    _ir="$(PGPASSFILE="$BG_PG_PASSFILE" psql -h "$BG_PEER_IP" -p "$BG_PG_PORT" \
+        -U "$BG_REPMGR_USER" -d "$BG_REPMGR_DB" -tAc \
+        "SELECT pg_is_in_recovery()" 2>/dev/null | tr -d ' \r' || true)"
+    if [ "$_ir" = "t" ]; then
+        # the peer is a standby waiting for its primary - us; the guard
+        # allows our start (0.3.27 verdict table)
+        exit 0
+    fi
+    if [ "$_ir" = "f" ]; then
+        _ar_go=1
+        break
+    fi
+    # neither answered: the peer is booting / partitioned - keep waiting
+    sleep "$BG_REJOIN_SLEEP"
+done
+[ "$_ar_go" = "1" ] || exit 0
+# sole-survivor case is NOT ours to decide: the GUARD's own retry loop
+# (15x2s) allows the start when the peer never answers
+
+log "peer $BG_PEER_IP is the live primary - this node is a stale primary, rejoining unattended"
+
+# ---------------------------------------------------------------------------
+# 2) local gates
+# ---------------------------------------------------------------------------
+_ar_ctl="$(LC_ALL=C runuser -u postgres -- pg_controldata -D "$BG_PGDATA" 2>/dev/null || true)"
+[ -n "$_ar_ctl" ] \
+    || refuse "pg_controldata cannot read $BG_PGDATA (damaged cluster / no PG_VERSION) - manual --repair --force-clone territory"
+echo "$_ar_ctl" | grep -q '^Database cluster state: *in production$' \
+    || refuse "cluster state is not 'in production' ($(echo "$_ar_ctl" | grep '^Database cluster state:' | sed 's/.*: *//')) - not a former primary, a human must classify it"
+
+_ar_tl_local="$(echo "$_ar_ctl" | grep "^Latest checkpoint's TimeLineID:" | tail -1 | sed 's/.*: *//')"
+_ar_local_lsn="$(echo "$_ar_ctl" | grep '^Latest checkpoint location:' | tail -1 | sed 's/.*: *//')"
+
+_ar_tl_peer="$(ar_peer_psql 'SELECT timeline_id FROM pg_control_checkpoint()')"
+[ -n "$_ar_tl_peer" ] || refuse "cannot read the peer's checkpoint (timeline)"
+_ar_hist="$(ar_peer_psql "SELECT pg_read_file('pg_wal/$(printf '%08X' "$_ar_tl_peer").history')")"
+[ -n "$_ar_hist" ] || refuse "the peer's timeline history is unreadable - cannot prove it forked from us"
+_ar_line="$(echo "$_ar_hist" | tail -1)"
+_ar_parent="$(echo "$_ar_line" | cut -f1)"
+_ar_fork="$(echo "$_ar_line" | cut -f2)"
+[ "$_ar_parent" = "$_ar_tl_local" ] && [ "$_ar_tl_peer" -gt "$_ar_tl_local" ] 2>/dev/null \
+    || refuse "timeline mismatch: local $_ar_tl_local, peer $_ar_tl_peer forked from '$_ar_parent' - this node may hold WAL the peer never had"
+
+# LSN arithmetic (POSIX sh, 64-bit; no command substitution inside
+# $(( )) - that is a bashism dash rejects)
+ar_lsn_num() {
+    _alsn_hi="$(echo "$1" | cut -d/ -f1)"
+    _alsn_lo="$(echo "$1" | cut -d/ -f2)"
+    echo $(( 0x$_alsn_hi * 4294967296 + 0x$_alsn_lo ))
+}
+_ar_local_num="$(ar_lsn_num "$_ar_local_lsn")"
+# the WAL directory is a better estimate of the true write end than the
+# last checkpoint (checkpoint_timeout lag); preallocated segments add a
+# little slop - the budget absorbs it
+_ar_lastseg="$(ls "$BG_PGDATA/pg_wal" 2>/dev/null | grep -E '^[0-9A-F]{24}$' | sort | tail -1)"
+if [ -n "$_ar_lastseg" ]; then
+    _ar_seg_log="$(echo "$_ar_lastseg" | cut -c9-16)"
+    _ar_seg_seg="$(echo "$_ar_lastseg" | cut -c17-24)"
+    _ar_seg_end=$(( ( 0x$_ar_seg_log * 256 + 0x$_ar_seg_seg ) * 16777216 ))
+    [ "$_ar_seg_end" -gt "$_ar_local_num" ] && _ar_local_num="$_ar_seg_end"
+fi
+_ar_fork_num="$(ar_lsn_num "$_ar_fork")"
+_ar_gap_kb=$(( ( _ar_local_num - _ar_fork_num ) / 1024 ))
+if [ "$_ar_gap_kb" -gt $(( BG_MAX_GAP_MB * 1024 )) ]; then
+    refuse "the fork-point gap is ~$((_ar_gap_kb / 1024)) MB (budget ${BG_MAX_GAP_MB} MB) - possible unreplicated writes (a partition with async writes?), a human must decide"
+fi
+log "gates passed: timelines $_ar_tl_local -> $_ar_tl_peer (fork $_ar_fork), gap ~${_ar_gap_kb} KB (budget ${BG_MAX_GAP_MB} MB)"
+
+# ---------------------------------------------------------------------------
+# 3) the rejoin (the manual repair's diverged branch, minus the human)
+# ---------------------------------------------------------------------------
+# quiet the boot-time restart loop and its rate-limit poison first (the
+# same neutralization as ha_pg_start_for_classification, 0.3.28)
+systemctl stop "$BG_PG_SERVICE" >/dev/null 2>&1 || true
+systemctl reset-failed "$BG_PG_SERVICE" >/dev/null 2>&1 || true
+
+ar_rejoin() {
+    runuser -u postgres -- repmgr -f "$BG_REPMGR_CONF_PATH" \
+        node rejoin --force-rewind -h "$BG_PEER_IP" \
+        -U "$BG_REPMGR_USER" -d "$BG_REPMGR_DB" 2>&1
+}
+
+log "rejoining as a standby of $BG_PEER_IP (pg_rewind; this can take minutes)"
+_ar_out="$(ar_rejoin)"
+_ar_rc=$?
+echo "$_ar_out" >&2
+if [ "$_ar_rc" -ne 0 ]; then
+    # the open pg_rewind mystery ("unable to open temporary file", 22.10):
+    # capture the verbose standalone rewind while the state is still
+    # reproducible - the journal gets the debug repmgr never shows
+    log "rejoin failed (output above) - capturing 'pg_rewind -v --debug' for the journal"
+    runuser -u postgres -- pg_rewind -D "$BG_PGDATA" \
+        --source-server="host=$BG_PEER_IP port=$BG_PG_PORT user=$BG_REPMGR_USER dbname=$BG_REPMGR_DB" \
+        -v --debug 2>&1 || true
+    log "retrying the rejoin once (pg_rewind is re-runnable)"
+    _ar_out="$(ar_rejoin)"
+    _ar_rc=$?
+    echo "$_ar_out" >&2
+    if [ "$_ar_rc" -ne 0 ]; then
+        log "REJOIN FAILED - PostgreSQL stays down (the SAFE state); run 'fusionpbx-ha.sh --repair'"
+        exit 1
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# 4) adopt under systemd (repmgr may have started PostgreSQL via pg_ctl,
+#    outside systemd - mirrors the manual repair's ha_pg_adopt_after_rejoin)
+# ---------------------------------------------------------------------------
+if ! ar_local_psql "SELECT 1" >/dev/null 2>&1; then
+    systemctl reset-failed "$BG_PG_SERVICE" >/dev/null 2>&1 || true
+    systemctl start "$BG_PG_SERVICE" \
+        || { log "PostgreSQL did not start after the rejoin; run --repair"; exit 1; }
+else
+    if [ "$(systemctl is-active "$BG_PG_SERVICE" 2>/dev/null)" != "active" ]; then
+        log "PostgreSQL was started outside systemd (by repmgr) - moving it back under systemd"
+        runuser -u postgres -- pg_ctl -D "$BG_PGDATA" stop -m fast -w -t 300 >/dev/null 2>&1
+        systemctl reset-failed "$BG_PG_SERVICE" >/dev/null 2>&1 || true
+        systemctl start "$BG_PG_SERVICE" \
+            || { log "PostgreSQL did not start under systemd; run --repair"; exit 1; }
+    fi
+fi
+_ar_try=0
+while [ "$_ar_try" -lt 60 ]; do
+    ar_local_psql "SELECT 1" >/dev/null 2>&1 && break
+    sleep 1
+    _ar_try=$((_ar_try + 1))
+done
+[ "$_ar_try" -lt 60 ] || { log "PostgreSQL is not answering after the rejoin; run --repair"; exit 1; }
+
+_ir="$(ar_local_psql "SELECT pg_is_in_recovery()")"
+if [ "$_ir" != "t" ]; then
+    # must never happen after a successful rejoin - if it does, return to
+    # the safe state immediately instead of running a rogue primary
+    log "local PostgreSQL is NOT in recovery after the rejoin - stopping it and refusing"
+    systemctl stop "$BG_PG_SERVICE" >/dev/null 2>&1 || true
+    exit 1
+fi
+
+# converge the daemons (their boot instances were restart-looping while
+# the local database was down)
+systemctl restart "$BG_REPMGRD_SERVICE" >/dev/null 2>&1 || true
+systemctl restart "$BG_LSYNCD_SERVICE" >/dev/null 2>&1 || true
+
+# ---------------------------------------------------------------------------
+# 5) synchronous replication back ON (the same verify-then-set order as
+#    ha_ensure_sync: setting the name before we stream would freeze every
+#    commit on the peer - the very disease 0.3.26/0.3.27 fought)
+# ---------------------------------------------------------------------------
+if [ -n "$BG_NODE_NAME" ]; then
+    _ar_streaming=""
+    _ar_try=0
+    while [ "$_ar_try" -lt 15 ]; do
+        _ar_streaming="$(ar_peer_psql "SELECT state FROM pg_stat_replication WHERE application_name='$BG_NODE_NAME'")"
+        [ "$_ar_streaming" = "streaming" ] && break
+        sleep 2
+        _ar_try=$((_ar_try + 1))
+    done
+    if [ "$_ar_streaming" = "streaming" ]; then
+        ar_peer_psql "ALTER SYSTEM SET synchronous_standby_names TO '\"$BG_NODE_NAME\"'" >/dev/null
+        ar_peer_psql "SELECT pg_reload_conf()" >/dev/null
+        _ar_sync=""
+        _ar_try=0
+        while [ "$_ar_try" -lt 8 ]; do
+            _ar_sync="$(ar_peer_psql "SELECT sync_state FROM pg_stat_replication WHERE application_name='$BG_NODE_NAME' AND state='streaming'")"
+            [ "$_ar_sync" = "sync" ] && break
+            sleep 2
+            _ar_try=$((_ar_try + 1))
+        done
+        if [ "$_ar_sync" = "sync" ]; then
+            log "synchronous replication re-enabled on the peer (RPO = 0)"
+        else
+            log "WARNING: sync_state is '$_ar_sync' on the peer - the node is back but RPO > 0; run --doctor on the peer"
+        fi
+    else
+        log "WARNING: this node is not visible as a streaming standby on the peer yet (application_name='$BG_NODE_NAME') - the node is back, run --doctor on the peer"
+    fi
+else
+    log "WARNING: BG_NODE_NAME is unknown - synchronous mode not re-enabled; run --repair"
+fi
+
+log "AUTO-REJOIN COMPLETE: $BG_NODE_NAME is a standby of $BG_PEER_IP (timeline $_ar_tl_peer)"
+exit 0

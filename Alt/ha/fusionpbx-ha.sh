@@ -1339,7 +1339,14 @@ Check: systemctl status haproxy $HA_AGENT_UNIT_NAME"
         if [ -f "${HA_SYSTEMD_DIR}/${HA_PG_SERVICE}.service.d/fusionpbx-ha.conf" ] \
             && [ -x "${HA_LIB_DIR}/pg-boot-guard.sh" ] \
             && [ -f "${HA_ETC_DIR}/boot-guard.conf" ]; then
-            _dr_ok "PostgreSQL boot guard installed (a crashed primary cannot boot as a competing primary)"
+            # 0.3.29: the automatic rejoin unit must be enabled too -
+            # otherwise a crashed primary stays down until a human notices
+            if [ -x "${HA_LIB_DIR}/pg-auto-rejoin.sh" ] \
+                && svc_is_enabled "$HA_AUTO_REJOIN_UNIT"; then
+                _dr_ok "PostgreSQL boot guard installed + automatic rejoin enabled (a crashed primary returns unattended)"
+            else
+                _dr_warn "boot guard installed but the AUTOMATIC REJOIN is not enabled - a crashed primary stays down until a manual --repair (re-run this node's install command)"
+            fi
         else
             _dr_warn "PostgreSQL boot guard NOT installed - a hard-crashed primary will boot as a competing primary (re-run this node's install command)"
         fi

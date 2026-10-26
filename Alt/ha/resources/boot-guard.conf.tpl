@@ -5,7 +5,9 @@
 # the PostgreSQL probe authenticates via the postgres user's .pgpass
 # (the repmgr@peer line written by the installer). The guard itself is
 # /usr/lib/fusionpbx-ha/pg-boot-guard.sh, wired into postgresql.service
-# via an ExecStartPre=+ drop-in.
+# via an ExecStartPre=+ drop-in; the automatic rejoin (0.3.29) is
+# /usr/lib/fusionpbx-ha/pg-auto-rejoin.sh + fusionpbx-ha-auto-rejoin.service,
+# and it reads this same file.
 BG_PEER_IP="@@PEER_IP@@"
 BG_PGDATA="@@PGDATA@@"
 BG_PG_PORT="@@PG_PORT@@"
@@ -16,3 +18,12 @@ BG_PG_PASSFILE="/var/lib/pgsql/.pgpass"
 BG_REPMGR_USER="@@REPMGR_USER@@"
 BG_REPMGR_DB="@@REPMGR_DB@@"
 BG_REPMGR_CONF_PATH="@@REPMGR_CONF@@"
+BG_REPAIR_FLAG="/run/fusionpbx-ha/repair-start.flag"
+BG_NODE_ROLE="data"
+BG_NODE_NAME="@@NODE_NAME@@"
+BG_PG_SERVICE="@@PG_SERVICE@@"
+BG_REPMGRD_SERVICE="@@REPMGRD_SERVICE@@"
+BG_LSYNCD_SERVICE="@@LSYNCD_SERVICE@@"
+BG_REJOIN_ATTEMPTS="@@REJOIN_ATTEMPTS@@"
+BG_REJOIN_SLEEP="@@REJOIN_SLEEP@@"
+BG_MAX_GAP_MB="@@MAX_GAP_MB@@"
