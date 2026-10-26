@@ -43,11 +43,21 @@ CONF="${PG_BOOT_GUARD_CONF:-/etc/fusionpbx-ha/boot-guard.conf}"
 : "${BG_AGENT_PORT:=8008}" "${BG_ATTEMPTS:=15}" "${BG_SLEEP:=2}"
 : "${BG_PG_PASSFILE:=/var/lib/pgsql/.pgpass}" "${BG_REPMGR_USER:=repmgr}"
 : "${BG_REPMGR_DB:=repmgr}" "${BG_REPMGR_CONF_PATH:=/etc/repmgr/repmgr.conf}"
+: "${BG_REPAIR_FLAG:=/run/fusionpbx-ha/repair-start.flag}"
 
 log() { echo "fusionpbx-ha boot-guard: $*" >&2; }
 
 [ -n "$BG_PEER_IP" ] || exit 0
 [ -d "$BG_PGDATA" ] || exit 0
+# 0.3.28: an operator-driven repair may legitimately start a stale primary
+# FOR A MOMENT - its step-3 classifier needs a RUNNING database to tell an
+# 'attached standby' from a 'diverged' node, and the guard used to block
+# exactly that start (the 26.10 bench: the repair died 'local PostgreSQL
+# does not start' with the guard refusing the repair's OWN systemctl call).
+# The repair marks the window with this flag; it lives under /run (tmpfs,
+# gone at reboot - every boot is guarded) and is removed the moment the
+# start attempt returned.
+[ -f "$BG_REPAIR_FLAG" ] && exit 0
 [ -f "$BG_PGDATA/standby.signal" ] && exit 0
 [ -f "$BG_REPMGR_CONF_PATH" ] || exit 0    # not a clustered node yet
 

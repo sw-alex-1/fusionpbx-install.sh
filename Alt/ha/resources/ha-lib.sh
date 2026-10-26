@@ -766,6 +766,42 @@ ha_pg_wait_answer() {
     return 1
 }
 
+# 0.3.28: the repair's step-3 classifier (ha_rejoin_plan) needs the local
+# database RUNNING, i.e. the repair may have to START a stale primary for
+# a moment - and the 0.3.27 boot guard refuses exactly that start while
+# the peer is the live primary (the 26.10 bench: the repair died 'local
+# PostgreSQL does not start', the node stuck out of the cluster while its
+# peer was perfectly healthy). An operator-driven repair owns the node's
+# role transitions for its duration, so the start is marked for the guard
+# with a /run (tmpfs) flag that never survives a reboot and is removed the
+# moment the start attempt returned. The same helper neutralizes the two
+# boot-time leftovers first: the restart loop scheduled by the guard's
+# blocks (it would fight the rejoin's stop) and the start-rate-limit poison
+# (every blocked attempt counted as a failed start - the next
+# 'systemctl start' would die 'Start request repeated too quickly' even
+# when the guard would allow it).
+ha_pg_start_for_classification() {
+    systemctl stop "$HA_PG_SERVICE" >/dev/null 2>&1 || true
+    systemctl reset-failed "$HA_PG_SERVICE" >/dev/null 2>&1 || true
+    _hpsc_flag="${HA_REPAIR_START_FLAG:-/run/fusionpbx-ha/repair-start.flag}"
+    mkdir -p "$(dirname "$_hpsc_flag")" 2>/dev/null || true
+    : > "$_hpsc_flag" 2>/dev/null
+    if ! systemctl start "$HA_PG_SERVICE"; then
+        rm -f "$_hpsc_flag" 2>/dev/null
+        return 1
+    fi
+    rm -f "$_hpsc_flag" 2>/dev/null
+    return 0
+}
+
+# 0.3.28: start the local PostgreSQL under systemd when the boot guard
+# would ALLOW it anyway (standby.signal is present after a clone/rejoin) -
+# only the rate-limit poison from boot-time guard blocks must be cleared.
+ha_pg_start_tracked() {
+    systemctl reset-failed "$HA_PG_SERVICE" >/dev/null 2>&1 || true
+    systemctl start "$HA_PG_SERVICE"
+}
+
 # 0.3.22: classify the LOCAL node for the repair rejoin. repmgr 5.5 refuses
 # 'node rejoin' on a running database ("database is still running in state
 # 'in archive recovery'" / "cannot be executed on a running node") - the
@@ -807,7 +843,7 @@ ha_rejoin_plan() {
 # did not come up at all, a plain systemctl start is enough.
 ha_pg_adopt_after_rejoin() {
     if ! pg_runuser_psql -tAc "SELECT 1" >/dev/null 2>&1; then
-        systemctl start "$HA_PG_SERVICE" \
+        ha_pg_start_tracked \
             || die "PostgreSQL did not start after the rejoin - re-run with --force-clone"
         ha_pg_wait_answer \
             || die "PostgreSQL is not answering after the rejoin - re-run with --force-clone"
@@ -816,7 +852,7 @@ ha_pg_adopt_after_rejoin() {
     if ! svc_active "$HA_PG_SERVICE"; then
         verbose "  PostgreSQL was started outside systemd (by repmgr) - moving it back under systemd"
         runuser -u postgres -- pg_ctl -D "$(ha_pg_data_dir)" stop -m fast -w -t 300 >/dev/null 2>&1
-        systemctl start "$HA_PG_SERVICE" \
+        ha_pg_start_tracked \
             || die "PostgreSQL did not start under systemd after the rejoin - re-run with --force-clone"
         ha_pg_wait_answer \
             || die "PostgreSQL is not answering after the rejoin - re-run with --force-clone"

@@ -954,7 +954,9 @@ rep_step_3_rejoin_or_clone() {
             echo "$_r3c_out"
             die "standby clone failed (see output above)"
         fi
-        systemctl start "$HA_PG_SERVICE" || die "PostgreSQL did not start after the clone"
+        # 0.3.28: standby.signal is written by the clone - the guard
+        # allows this start; only clear the boot-time rate-limit poison
+        ha_pg_start_tracked || die "PostgreSQL did not start after the clone"
         _r3c_out="$(repmgr_cmd standby register --upstream-node-id="$(ha_peer_id)" --force)"
         if [ $? -ne 0 ]; then
             echo "$_r3c_out"
@@ -975,7 +977,13 @@ rep_step_3_rejoin_or_clone() {
         #     with pg_rewind, then make sure systemd tracks it again
         #     (repmgr may have (re)started it via pg_ctl).
         if ! svc_active "$HA_PG_SERVICE"; then
-            systemctl start "$HA_PG_SERVICE" || die "local PostgreSQL does not start - re-run with --force-clone"
+            # 0.3.28: the classifier needs a RUNNING database, i.e. this
+            # start may briefly boot a stale primary - the boot guard
+            # must let the REPAIR's own start through (see
+            # ha_pg_start_for_classification; the 26.10 bench died here
+            # with the guard blocking the repair itself)
+            ha_pg_start_for_classification \
+                || die "local PostgreSQL does not start - re-run with --force-clone"
             ha_pg_wait_answer || die "local PostgreSQL is not answering - re-run with --force-clone"
         fi
         pg_runuser_psql -tAc "SELECT 1" >/dev/null 2>&1 \

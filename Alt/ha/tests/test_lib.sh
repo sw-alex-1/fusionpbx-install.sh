@@ -1661,6 +1661,7 @@ BG_PG_PASSFILE="/nonexistent"
 BG_REPMGR_USER="repmgr"
 BG_REPMGR_DB="repmgr"
 BG_REPMGR_CONF_PATH="$WORK/guardetc/repmgr.conf"
+BG_REPAIR_FLAG="$WORK/guardrun/repair-start.flag"
 EOF
 : > "$WORK/guardetc/repmgr.conf"
 
@@ -1710,6 +1711,17 @@ OUT=$(PG_BOOT_GUARD_CONF="/nonexistent-guard.conf" sh "$RES/pg-boot-guard.sh" 2>
 if [ $? -eq 0 ] && [ -z "$OUT" ]; then _g=0; else _g=1; fi
 report "guard: missing conf -> silent allow (never bricks the boot)" "$_g" "$OUT"
 
+# 0.3.28: the repair's classification-start window - the guard steps
+# aside (an operator-driven repair owns the role transitions); the flag
+# must win even when the peer probe WOULD have blocked (agent 200)
+mkdir -p "$WORK/guardrun"
+: > "$WORK/guardrun/repair-start.flag"
+OUT=$(PG_BOOT_GUARD_CONF="$GUARD_CONF" GUARD_CURL_CODE=200 GUARD_PG_STATE=down \
+    PATH="$WORK/guardbin:$PATH" sh "$RES/pg-boot-guard.sh" 2>&1)
+if [ $? -eq 0 ] && [ -z "$OUT" ]; then _g=0; else _g=1; fi
+report "guard: repair-start flag -> silent allow (the repair owns the start)" "$_g" "$OUT"
+rm -f "$WORK/guardrun/repair-start.flag"
+
 # installer: script + rendered secret-free conf + unit drop-in
 HA_LIB_DIR="$WORK/lib" HA_SYSTEMD_DIR="$WORK/systemd" lib_run '
     HA_NODE_ID=1
@@ -1738,6 +1750,64 @@ HA_LIB_DIR="$WORK/lib" HA_SYSTEMD_DIR="$WORK/systemd" lib_run '
 '
 echo "$OUT" | grep -q "boot guard drop-in up to date"
 report "guard install: idempotent (no churn on a healthy node)" "$?" "$(echo "$OUT" | head -2)"
+
+# 0.3.28: the repair's classification start - neutralize the boot
+# restart loop and the rate-limit poison, mark the window for the guard,
+# remove the flag right after the start (on success AND on failure).
+# A local harness is needed: lib_run prepends $WORK/fakebin, whose own
+# silent systemctl stub would shadow the recording one.
+mkdir -p "$WORK/sysctlbin"
+cat > "$WORK/sysctlbin/systemctl" <<'EOF'
+#!/bin/sh
+echo "$@" >> "$SYSCTL_LOG"
+if [ "$1" = "start" ]; then
+    [ -f "$SYSCTL_FLAG" ] && echo "flag-during-start" >> "$SYSCTL_LOG"
+    exit "${SYSCTL_START_RC:-0}"
+fi
+exit 0
+EOF
+chmod +x "$WORK/sysctlbin/systemctl"
+ha328_run() {
+    OUT=$(
+        {
+            export HA_ETC_DIR="$WORK/etc" \
+                   HA_SANDBOX=1 \
+                   HA_RES_DIR="$RES" \
+                   HA_PGDATA_DEFAULT="$WORK/pgdata" \
+                   HA_NO_COLOR=1 \
+                   PATH="$WORK/sysctlbin:$WORK/fakebin:$PATH"
+            # shellcheck disable=SC1090
+            . "$LIB"
+            eval "$1"
+        } 2>&1 )
+    return $?
+}
+SYSCTL_LOG="$WORK/sysctl.log" SYSCTL_FLAG="$WORK/tmp-repair.flag" \
+HA_PG_SERVICE=postgresql HA_REPAIR_START_FLAG="$WORK/tmp-repair.flag" \
+    ha328_run 'ha_pg_start_for_classification; echo "rc=$?"'
+_g=1
+if [ ! -f "$WORK/tmp-repair.flag" ] && echo "$OUT" | grep -q '^rc=0$' \
+    && grep -q '^stop postgresql$' "$WORK/sysctl.log" \
+    && grep -q '^reset-failed postgresql$' "$WORK/sysctl.log" \
+    && grep -q '^start postgresql$' "$WORK/sysctl.log" \
+    && grep -q '^flag-during-start$' "$WORK/sysctl.log"; then _g=0; fi
+report "repair start: stop+reset-failed first, guard flag covers the start, removed after" "$_g" "$(echo "$OUT" | head -3)"
+
+SYSCTL_LOG="$WORK/sysctl2.log" SYSCTL_FLAG="$WORK/tmp-repair2.flag" \
+HA_PG_SERVICE=postgresql HA_REPAIR_START_FLAG="$WORK/tmp-repair2.flag" \
+SYSCTL_START_RC=1 \
+    ha328_run 'ha_pg_start_for_classification; echo "rc=$?"'
+_g=1
+if [ ! -f "$WORK/tmp-repair2.flag" ] && echo "$OUT" | grep -q '^rc=1$'; then _g=0; fi
+report "repair start: a failed start removes the flag and returns 1" "$_g" "$(echo "$OUT" | head -3)"
+
+# 0.3.28 contract: every repair path that starts PostgreSQL locally goes
+# through the guard-aware helpers (no bare 'systemctl start' left)
+_rr328="$(sed -n '/^rep_step_3_rejoin_or_clone()/,/^}/p' "$CLI")"
+echo "$_rr328" | grep -qF 'ha_pg_start_for_classification' \
+    && echo "$_rr328" | grep -qF 'ha_pg_start_tracked' \
+    && ! echo "$_rr328" | grep -qF 'systemctl start "$HA_PG_SERVICE"'
+report "repair step 3: local starts go through the guard-aware helpers" $?
 
 # doctor contract: the guard presence is reported on the data nodes
 _dc27="$(sed -n '/^cmd_doctor()/,/^}/p' "$CLI")"
