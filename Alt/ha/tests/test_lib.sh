@@ -515,6 +515,8 @@ report "pg_runuser_psql: synchronous_commit=off (installer commits never wait)" 
 _rpc="$(sed -n '/^repmgr_cmd()/,/^}/p' "$LIB")"
 echo "$_rpc" | grep -q "PGOPTIONS='-c synchronous_commit=off'"
 report "repmgr_cmd: synchronous_commit=off (register never waits)" $?
+echo "$_rpc" | grep -q "TMPDIR=/tmp"
+report "repmgr_cmd: TMPDIR forced to /tmp (pam_mktemp poison, 0.3.30)" $?
 
 
 # CLI source-order contracts: authorized_keys must not wait for step 14
@@ -2045,6 +2047,13 @@ if [ -x "$WORK/lib/pg-auto-rejoin.sh" ] \
     && grep -q '^BG_PG_SERVICE="postgresql"$' "$WORK/etc/boot-guard.conf" \
     && ! grep -q 'PASSWORD' "$WORK/etc/boot-guard.conf"; then _g=0; fi
 report "auto-rejoin install: script + unit + rendered conf keys (secret-free)" "$_g" "$(echo "$OUT" | head -3)"
+
+# 0.3.30: repmgr (as postgres) must never inherit a pam_mktemp-poisoned
+# TMPDIR from a manual SSH run - "unable to open temporary file" died
+# before pg_rewind ever executed
+_arj="$(sed -n '/^ar_rejoin()/,/^}/p' "$WORK/lib/pg-auto-rejoin.sh")"
+echo "$_arj" | grep -q "TMPDIR=/tmp runuser -u postgres -- repmgr"
+report "auto-rejoin: repmgr runs with TMPDIR=/tmp (manual SSH runs, 0.3.30)" $?
 
 # doctor contract: the automatic rejoin is reported on the data nodes
 _dc329="$(sed -n '/^cmd_doctor()/,/^}/p' "$CLI")"

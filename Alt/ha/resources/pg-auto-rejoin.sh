@@ -171,7 +171,13 @@ systemctl stop "$BG_PG_SERVICE" >/dev/null 2>&1 || true
 systemctl reset-failed "$BG_PG_SERVICE" >/dev/null 2>&1 || true
 
 ar_rejoin() {
-    runuser -u postgres -- repmgr -f "$BG_REPMGR_CONF_PATH" \
+    # TMPDIR=/tmp (0.3.30): the unit's systemd context has no PAM, but a
+    # MANUAL run of this script from a root SSH session inherits
+    # pam_mktemp's private /tmp/.private/root (0700) - repmgr (as
+    # postgres) then fails mkstemp inside it with "unable to open
+    # temporary file" and the rejoin dies before pg_rewind even runs
+    # (see repmgr_cmd in ha-lib.sh)
+    TMPDIR=/tmp runuser -u postgres -- repmgr -f "$BG_REPMGR_CONF_PATH" \
         node rejoin --force-rewind -h "$BG_PEER_IP" \
         -U "$BG_REPMGR_USER" -d "$BG_REPMGR_DB" 2>&1
 }
@@ -181,9 +187,12 @@ _ar_out="$(ar_rejoin)"
 _ar_rc=$?
 echo "$_ar_out" >&2
 if [ "$_ar_rc" -ne 0 ]; then
-    # the open pg_rewind mystery ("unable to open temporary file", 22.10):
-    # capture the verbose standalone rewind while the state is still
-    # reproducible - the journal gets the debug repmgr never shows
+    # 0.3.30 closed the "unable to open temporary file" case (that was
+    # repmgr's own local_command mkstemp inside a pam_mktemp-poisoned
+    # TMPDIR - pg_rewind never even ran). What fails now is a REAL
+    # pg_rewind failure: capture the verbose standalone rewind while the
+    # state is still reproducible - the journal gets the debug repmgr
+    # never shows
     log "rejoin failed (output above) - capturing 'pg_rewind -v --debug' for the journal"
     runuser -u postgres -- pg_rewind -D "$BG_PGDATA" \
         --source-server="host=$BG_PEER_IP port=$BG_PG_PORT user=$BG_REPMGR_USER dbname=$BG_REPMGR_DB" \

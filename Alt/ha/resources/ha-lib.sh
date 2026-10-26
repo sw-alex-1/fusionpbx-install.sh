@@ -1449,8 +1449,23 @@ host postgres     postgres   $(ha_node_ip 2)/32  md5"
 # metadata on the primary (possibly over TCP from the witness/standby join
 # flow while the primary still waits for its own standby) - the same
 # freeze-proofing as pg_runuser_psql
+#
+# TMPDIR=/tmp (0.3.30): a root PAM session on ALT gets a PRIVATE per-user
+# tmpdir (pam_mktemp: /tmp/.private/root, 0700 - the 0.3.4 precedent), and
+# runuser (no -l) keeps the environment - so repmgr, already running as
+# postgres, inherited root's TMPDIR. Its local_command() helper (repmgr 5.5
+# sysutils.c) captures child stderr via mkstemp("$TMPDIR/repmgr_command.
+# XXXXXX"), which fails EACCES inside root's 0700 directory, and repmgr
+# reports only "unable to open temporary file" - 'node rejoin
+# --force-rewind' died BEFORE pg_rewind was ever executed (22.10 and 26.10,
+# both times a manual --repair over SSH; the output capture was empty -
+# hence the bare "ERROR:" lines with no text). Force the world-writable
+# /tmp: every local_command consumer inside one repmgr process (pg_rewind,
+# the rejoin's own pg_ctl restarts) then works under any login policy.
+# The systemd-started units see no PAM and were never affected.
 repmgr_cmd() {
-    PGOPTIONS='-c synchronous_commit=off' runuser -u postgres -- repmgr -f "$HA_REPMGR_CONF" "$@" 2>&1
+    TMPDIR=/tmp PGOPTIONS='-c synchronous_commit=off' \
+        runuser -u postgres -- repmgr -f "$HA_REPMGR_CONF" "$@" 2>&1
 }
 
 # soft cross-node reachability probe: pg_isready when available, silence
