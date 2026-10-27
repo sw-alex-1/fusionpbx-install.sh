@@ -5,7 +5,7 @@
 # =============================================================================
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
-HA_DIR="$(cd "$HERE/.." && pwd)"
+HA_DIR="$(cd "$HERE/../.." && pwd)"
 
 TOTAL_PASS=0
 TOTAL_FAIL=0

@@ -8,10 +8,10 @@
 # =============================================================================
 set -u
 
-REPO="$(cd "$(dirname "$0")/../../.." && pwd)"
+REPO="$(cd "$(dirname "$0")/../../../.." && pwd)"
 LIB="$REPO/Alt/ha/resources/ha-lib.sh"
 RES="$REPO/Alt/ha/resources"
-CLI="$REPO/Alt/ha/fusionpbx-ha.sh"
+CLI="$REPO/Alt/fusionpbx-ha.sh"
 WORK=$(mktemp -d /tmp/ha-lib-test.XXXXXX)
 trap 'rm -rf "$WORK"' EXIT
 

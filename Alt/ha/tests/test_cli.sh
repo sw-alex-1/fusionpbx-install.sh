@@ -7,7 +7,7 @@
 # =============================================================================
 set -u
 
-REPO="$(cd "$(dirname "$0")/../../.." && pwd)"
+REPO="$(cd "$(dirname "$0")/../../../.." && pwd)"
 SCRIPT="$REPO/Alt/ha/fusionpbx-ha.sh"
 WORK=$(mktemp -d /tmp/ha-cli-test.XXXXXX)
 trap 'rm -rf "$WORK"' EXIT

@@ -37,7 +37,7 @@
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-HA_RES_DIR="$SCRIPT_DIR/resources"
+HA_RES_DIR="$SCRIPT_DIR/ha/resources"
 
 # shellcheck disable=SC1091
 . "$HA_RES_DIR/ha-lib.sh"

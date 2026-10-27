@@ -5,7 +5,7 @@
 # =============================================================================
 set -u
 
-REPO="$(cd "$(dirname "$0")/../../.." && pwd)"
+REPO="$(cd "$(dirname "$0")/../../../.." && pwd)"
 RES="$REPO/Alt/ha/resources"
 WORK=$(mktemp -d /tmp/ha-render-test.XXXXXX)
 trap 'rm -rf "$WORK"' EXIT
