@@ -8,10 +8,10 @@
 # =============================================================================
 set -u
 
-REPO="$(cd "$(dirname "$0")/../../../.." && pwd)"
+REPO="$(cd "$(dirname "$0")/../../.." && pwd)"
 LIB="$REPO/Alt/ha/resources/ha-lib.sh"
 RES="$REPO/Alt/ha/resources"
-CLI="$REPO/Alt/fusionpbx-ha.sh"
+CLI="$REPO/Alt/fusionpbx-ha.sh"   # 0.3.34: the script moved up to Alt/, resources stay in Alt/ha/
 WORK=$(mktemp -d /tmp/ha-lib-test.XXXXXX)
 trap 'rm -rf "$WORK"' EXIT
 
@@ -1510,8 +1510,9 @@ report "prelude: schema fix executed (register self-heal)" $?
 # hand also comes back on the next register/repair
 [ -s "$WORK/.pgpass" ] && grep -q "fusionpbx-ha: managed block" "$WORK/.pgpass"
 report "prelude: .pgpass re-applied (register self-heal, 0.3.7)" $?
-grep -q '^10.0.0.11:5432:\*:postgres:' "$WORK/.pgpass" && grep -q '^10.0.0.12:5432:\*:fusionpbx:' "$WORK/.pgpass"
-report "prelude: .pgpass carries the data-role lines" $?
+grep -q '^10.0.0.11:5432:\*:postgres:' "$WORK/.pgpass" && grep -q '^10.0.0.12:5432:\*:fusionpbx:' "$WORK/.pgpass" \
+    && grep -q '^10.0.0.13:5432:\*:repmgr:' "$WORK/.pgpass"
+report "prelude: .pgpass carries the data-role lines (incl. the witness line, 0.3.34)" $?
 [ "$(stat -c %a "$WORK/.pgpass")" = "600" ]
 report "prelude: .pgpass mode 600" $?
 
@@ -1527,6 +1528,11 @@ lib_run 'ha_load_cluster_conf >/dev/null; ha_write_pgpass witness >/dev/null; ec
 [ "$OUT" = "ok" ]; report "witness role: write exits 0" $? "$OUT"
 grep -q ':repmgr:' "$WORK/.pgpass"
 report "witness role: repmgr lines present" $?
+# 0.3.34: the witness's own repmgrd connects to its OWN IP (conninfo with
+# the node IP, md5 in its pg_hba) - without the self line its repmgrd is
+# dead the moment its repmgr.conf is re-rendered passwordless (0.3.33)
+grep -q '^10.0.0.13:5432:\*:repmgr:' "$WORK/.pgpass"
+report "witness role: the SELF line present (own repmgrd -> own IP, 0.3.34)" $?
 if grep -qE ':(postgres|fusionpbx):' "$WORK/.pgpass"; then _pw=bad; else _pw=ok; fi
 report "witness role: NO postgres/app credentials" "$_pw"
 
@@ -2170,10 +2176,10 @@ report "scrub: repmgr.nodes + repmgr.events, password= stripped, failures tolera
 # the scrub is called at every convergence point
 _g=0
 _cli333="$(cat "$CLI")"
-for _fn333 in rep_step_4_services prp_step_3_services init_step_7_primary_register join_step_6_start_register; do
+for _fn333 in rep_step_4_services prp_step_3_services init_step_7_primary_register join_step_6_start_register wit_step_6_witness_register; do
     echo "$_cli333" | sed -n "/^${_fn333}()/,/^}/p" | grep -qF 'ha_scrub_conninfo_secrets' || _g=1
 done
-report "scrub: called in repair step 4, primary repair step 3, init register, join register" "$_g"
+report "scrub: called in repair step 4, primary repair step 3, init register, join register, witness register (0.3.34)" "$_g"
 
 # the template itself must carry no password
 ! grep -q 'password=' "$RES/repmgr.conf.tpl"
@@ -2194,6 +2200,43 @@ report "preflight: sudo -n systemctl show runs as user postgres" $?
 _arj333="$(sed -n '/^ar_rejoin()/,/^}/p' "$RES/pg-auto-rejoin.sh")"
 echo "$_arj333" | grep -q 'BG_REPAIR_FLAG' && echo "$_arj333" | grep -q 'node rejoin --force-rewind'
 report "auto-rejoin: guard flag window inside ar_rejoin (0.3.33)" $?
+
+# ---------------------------------------------------------------------------
+# 0.3.34: the 27.10 failover outage - the standby degraded instead of
+# promoting: the consensus probe to the witness died "fe_sendauth: no
+# password supplied". 0.3.33 made the passwordless conninfo rely on
+# .pgpass, but nobody wrote the witness line into the data-role file (nor
+# the self line into the witness's own file)
+# ---------------------------------------------------------------------------
+
+# the writer carries the node-3 repmgr line in BOTH roles
+_pw334="$(sed -n '/^ha_write_pgpass()/,/^}/p' "$LIB")"
+[ "$(echo "$_pw334" | grep -cF 'ha_node_ip 3):$HA_PG_PORT:*:$HA_REPMGR_USER')" = "2" ]
+report "pgpass writer: the witness line in BOTH roles (data + witness, 0.3.34)" $?
+
+# the doctor authenticates its quorum probes (the 27.10 witness was
+# "reachable" by TCP while its repmgr login was broken) and tells a
+# broken login (FAIL) apart from a down node (the witness: WARN, the
+# pre-0.3.34 semantics)
+_dc334="$(sed -n '/^cmd_doctor()/,/^}/p' "$CLI")"
+echo "$_dc334" | grep -qF 'PGPASSFILE=' \
+    && echo "$_dc334" | grep -qF 'automatic failover CANNOT' \
+    && echo "$_dc334" | grep -qF 'automatic failover is DISABLED until it returns'
+report "doctor: quorum probes authenticate as repmgr; auth-reject FAILs, witness-down warns (0.3.34)" $?
+
+# the static .pgpass coverage check (catches a missing line even while the
+# peer is down) + the shared path resolver (writer/doctor can never drift)
+echo "$_dc334" | grep -qF '.pgpass lacks the line(s) for:' \
+    && echo "$_dc334" | grep -qF 'ha_pgpass_file'
+report "doctor: static .pgpass coverage via ha_pgpass_file (0.3.34)" $?
+
+# the layout move (0.3.34): the script resolves Alt/ha/resources from its
+# new Alt/ home AND still honors an exported HA_RES_DIR (sandbox contract)
+_head334="$(sed -n '1,60p' "$CLI")"
+echo "$_head334" | grep -qF 'if [ -z "${HA_RES_DIR:-}" ]' \
+    && echo "$_head334" | grep -qF '$SCRIPT_DIR/ha/resources' \
+    && echo "$_head334" | grep -qF '$SCRIPT_DIR/resources/ha-lib.sh'
+report "layout: dual resource-dir resolution, exported HA_RES_DIR wins (0.3.34)" $?
 
 # ---------------------------------------------------------------------------
 echo

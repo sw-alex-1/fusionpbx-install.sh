@@ -1536,8 +1536,8 @@ ha_register_prelude() {
     rm -f "$_hrp_tmp"
 }
 
-# .pgpass for the postgres system user (repmgr + superuser + app credentials
-# on the data nodes; repmgr only on the witness).
+# .pgpass for the postgres system user (repmgr lines for ALL THREE nodes +
+# superuser + app credentials on the data nodes; repmgr only on the witness).
 #
 # The file lives next to PGDATA (the postgres system user's home) - taken
 # from ha_pg_data_dir(), never hardcoded, so the sandbox tests resolve the
@@ -1546,10 +1546,17 @@ ha_register_prelude() {
 # with the packages step, so writing .pgpass any earlier dies with an
 # actionable message instead of bash's bare 'No such file or directory'
 # (regression 0.3.7: the witness join used to write it in the unpack step).
+#
+# The single path resolver for the writer and the doctor's quorum checks
+# (0.3.34) - the two can never drift apart.
+ha_pgpass_file() {
+    echo "$(dirname "$(ha_pg_data_dir)")/.pgpass"
+}
+
 ha_write_pgpass() {
     _hpw_dir="$(dirname "$(ha_pg_data_dir)")"
     _hpw_dir="${_hpw_dir%/}"
-    _hpw_file="$_hpw_dir/.pgpass"
+    _hpw_file="$(ha_pgpass_file)"
     _hpw_role="${1:-data}"       # data | witness
     [ -d "$_hpw_dir" ] || die "$_hpw_dir does not exist - postgresql-server is not installed yet.
 The .pgpass can only be written after the packages step (regression 0.3.7:
@@ -1559,9 +1566,26 @@ the witness join used to write it in the unpack step, before the packages)."
         if [ "$_hpw_role" = "witness" ]; then
             echo "$(ha_node_ip 1):$HA_PG_PORT:*:$HA_REPMGR_USER:$HA_REPMGR_PASSWORD"
             echo "$(ha_node_ip 2):$HA_PG_PORT:*:$HA_REPMGR_USER:$HA_REPMGR_PASSWORD"
+            # 0.3.34: the witness's OWN line. Its repmgr.conf conninfo points
+            # at its own IP (exactly like the data nodes', regression 0.3.2)
+            # and its pg_hba demands md5 for that source address - without
+            # this line the witness's repmgrd cannot connect even to its
+            # OWN database the moment its on-disk repmgr.conf is re-rendered
+            # passwordless (0.3.33).
+            echo "$(ha_node_ip 3):$HA_PG_PORT:*:$HA_REPMGR_USER:$HA_REPMGR_PASSWORD"
         else
             echo "$(ha_node_ip 1):$HA_PG_PORT:*:$HA_REPMGR_USER:$HA_REPMGR_PASSWORD"
             echo "$(ha_node_ip 2):$HA_PG_PORT:*:$HA_REPMGR_USER:$HA_REPMGR_PASSWORD"
+            # 0.3.34: the witness line. Since 0.3.33 the conninfo records in
+            # the metadata carry NO password - every libpq connection
+            # repmgr/repmgrd makes must authenticate from THIS file. The
+            # 27.10 outage: the data-role file had no witness line, so the
+            # standby's failover-consensus probe to the witness died
+            # "fe_sendauth: no password supplied" -> "unable to reach a
+            # qualified majority of nodes" -> degraded monitoring instead of
+            # promotion for the whole primary outage (the doctor's 4b/4c
+            # checks catch it from now on).
+            echo "$(ha_node_ip 3):$HA_PG_PORT:*:$HA_REPMGR_USER:$HA_REPMGR_PASSWORD"
             echo "$(ha_node_ip 1):$HA_PG_PORT:*:postgres:$HA_DB_PASSWORD"
             echo "$(ha_node_ip 2):$HA_PG_PORT:*:postgres:$HA_DB_PASSWORD"
             echo "$(ha_node_ip 1):$HA_PG_PORT:*:$HA_DB_USER:$HA_DB_PASSWORD"

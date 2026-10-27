@@ -1,14 +1,15 @@
 #!/bin/bash
 # =============================================================================
-# CLI tests for Alt/ha/fusionpbx-ha.sh - argument handling, command conflict
-# rules, --status/--doctor/--print-token flows. The script runs with
-# HA_SANDBOX=1, a sandbox HA_ETC_DIR and a fakebin of systemctl/psql/curl/
-# repmgr stubs; nothing touches the real system.
+# CLI tests for Alt/fusionpbx-ha.sh (moved up from Alt/ha/ in 0.3.34) -
+# argument handling, command conflict rules, --status/--doctor/--print-token
+# flows. The script runs with HA_SANDBOX=1, a sandbox HA_ETC_DIR and a
+# fakebin of systemctl/psql/curl/repmgr stubs; nothing touches the real
+# system.
 # =============================================================================
 set -u
 
-REPO="$(cd "$(dirname "$0")/../../../.." && pwd)"
-SCRIPT="$REPO/Alt/ha/fusionpbx-ha.sh"
+REPO="$(cd "$(dirname "$0")/../../.." && pwd)"
+SCRIPT="$REPO/Alt/fusionpbx-ha.sh"   # 0.3.34: moved up from Alt/ha/, resources stay in Alt/ha/
 WORK=$(mktemp -d /tmp/ha-cli-test.XXXXXX)
 trap 'rm -rf "$WORK"' EXIT
 
@@ -71,13 +72,22 @@ EOF
 cat > "$FB/psql" <<'EOF'
 #!/bin/sh
 [ "${PSQL_RC:-0}" != "0" ] && exit "$PSQL_RC"
-_sql=""
+_sql=""; _h=""
 while [ $# -gt 0 ]; do
     case "$1" in
         -c|-tAc) _sql="$2"; shift 2 ;;
+        -h) _h="$2"; shift 2 ;;
         *) shift ;;
     esac
 done
+# 0.3.34: the doctor's quorum probes are the ONLY PGPASSFILE-carrying psql
+# calls in the CLI flows - PSQL_QUORUM_FAIL lists IPs whose probe dies like
+# a real broken link (auth refused while the server still answers TCP)
+if [ -n "${PGPASSFILE:-}" ] && [ -n "${PSQL_QUORUM_FAIL:-}" ] \
+        && echo ",$PSQL_QUORUM_FAIL," | grep -q ",$_h,"; then
+    echo "psql: error: connection to server at \"$_h\", port 5432 failed: fe_sendauth: no password supplied" >&2
+    exit 2
+fi
 case "$_sql" in
     *pg_is_in_recovery*) echo "${PSQL_RECOVERY:-f}" ;;
     *"count(*) FROM pg_stat_replication"*) echo "${PSQL_STREAMING:-1}" ;;
@@ -250,6 +260,23 @@ AK_LINE="from=\"10.0.0.11,10.0.0.12\",command=\"$WORK/bin/rrsync $WORK/storage\"
     echo "# END fusionpbx-ha (managed)"
 } > "$WORK/sshdir/authorized_keys"
 chmod 600 "$WORK/sshdir/authorized_keys"
+
+# 0.3.34: the doctor's static .pgpass coverage fixture (the data-role set
+# incl. the witness line - ha_write_pgpass format; in the sandbox the file
+# lands next to HA_PGDATA_DEFAULT, i.e. $WORK/.pgpass). A pristine copy is
+# kept for the tests that strip a line and restore it after
+{
+    echo "# fusionpbx-ha: managed block"
+    echo "10.0.0.11:5432:*:repmgr:reppass456"
+    echo "10.0.0.12:5432:*:repmgr:reppass456"
+    echo "10.0.0.13:5432:*:repmgr:reppass456"
+    echo "10.0.0.11:5432:*:postgres:dbpass123"
+    echo "10.0.0.12:5432:*:postgres:dbpass123"
+    echo "10.0.0.11:5432:*:fusionpbx:dbpass123"
+    echo "10.0.0.12:5432:*:fusionpbx:dbpass123"
+} > "$WORK/.pgpass"
+chmod 600 "$WORK/.pgpass"
+cp "$WORK/.pgpass" "$WORK/.pgpass.pristine"
 
 # run the real script in the sandbox. Args after the environment file.
 ha_cli() {
@@ -478,6 +505,8 @@ ha_cli --doctor > "$WORK/out.log" 2>&1; _rc=$?
   && grep -q "local PostgreSQL is up (primary)" "$WORK/out.log" \
   && grep -q "synchronous replication active" "$WORK/out.log" \
   && grep -q "repmgr sees all 3 nodes active" "$WORK/out.log" \
+  && grep -qF "quorum link to fpbx-witness (10.0.0.13): authenticated as repmgr" "$WORK/out.log" \
+  && grep -qF ".pgpass covers every cluster node" "$WORK/out.log" \
   && grep -q "routes to the primary" "$WORK/out.log" \
   && grep -q "Doctor result: healthy" "$WORK/out.log"
 report "--doctor healthy cluster -> exit 0" "$?" "$(grep -c FAIL "$WORK/out.log") failures shown"
@@ -493,16 +522,49 @@ PSQL_STREAMING=0 PSQL_SYNCNAMES="" ha_cli --doctor > "$WORK/out.log" 2>&1; _rc=$
 report "--doctor accepts cleared async mode (warns)" "$?"
 
 echo "== --doctor: witness down =="
-PG_ISREADY_RC=2 ha_cli --doctor > "$WORK/out.log" 2>&1; _rc=$?
+# 0.3.34: the witness probe must die like a real down link (PSQL_QUORUM_FAIL)
+# before pg_isready classifies it - the psql stub answers SELECT 1 otherwise
+PSQL_QUORUM_FAIL="10.0.0.13" PG_ISREADY_RC=2 ha_cli --doctor > "$WORK/out.log" 2>&1; _rc=$?
 [ "$_rc" = "0" ] && grep -q "witness 10.0.0.13 unreachable" "$WORK/out.log" \
   && grep -q "automatic failover is DISABLED" "$WORK/out.log"
 report "--doctor warns when the witness is unreachable (still healthy)" "$?"
 
 echo "== --doctor: witness verdict quoted (0.3.6) =="
-PG_ISREADY_RC=2 PG_ISREADY_OUT="10.0.0.13:5432 - no response" ha_cli --doctor > "$WORK/out.log" 2>&1; _rc=$?
+PSQL_QUORUM_FAIL="10.0.0.13" PG_ISREADY_RC=2 PG_ISREADY_OUT="10.0.0.13:5432 - no response" ha_cli --doctor > "$WORK/out.log" 2>&1; _rc=$?
 [ "$_rc" = "0" ] \
   && grep -q "unreachable - 10.0.0.13:5432 - no response" "$WORK/out.log"
 report "--doctor quotes the pg_isready verdict (firewall vs down)" "$?" "$(grep -m1 'unreachable' "$WORK/out.log")"
+
+echo "== --doctor: witness rejects the repmgr login (0.3.34: the 27.10 outage) =="
+# TCP up (pg_isready passes), auth broken: the exact shape that kept the
+# standby degraded through a whole primary outage - the pre-0.3.34 doctor
+# called this "witness is reachable"
+PSQL_QUORUM_FAIL="10.0.0.13" ha_cli --doctor > "$WORK/out.log" 2>&1; _rc=$?
+[ "$_rc" = "1" ] \
+  && grep -qF "quorum link to fpbx-witness (10.0.0.13): server reachable but the repmgr login FAILED" "$WORK/out.log" \
+  && grep -q "fe_sendauth" "$WORK/out.log" \
+  && grep -q "qualified majority" "$WORK/out.log" \
+  && grep -q -- "--repair" "$WORK/out.log"
+report "--doctor FAILS on a reachable-but-rejecting witness (auth, not TCP)" "$?" "$(grep -m1 'quorum link to fpbx-witness' "$WORK/out.log")"
+
+echo "== --doctor: .pgpass without the witness line (0.3.34) =="
+# the static coverage check: the file exists but lost the line that broke
+# the 27.10 election - caught even while everything else is healthy
+grep -v '^10\.0\.0\.13:5432:' "$WORK/.pgpass" > "$WORK/.pgpass.stripped" \
+    && mv "$WORK/.pgpass.stripped" "$WORK/.pgpass"
+ha_cli --doctor > "$WORK/out.log" 2>&1; _rc=$?
+[ "$_rc" = "1" ] && grep -qF ".pgpass lacks the line(s) for: repmgr@fpbx-witness" "$WORK/out.log" \
+  && grep -q "never modifies configurations" "$WORK/out.log"
+report "--doctor FAILS on a .pgpass without the witness line" "$?" "$(grep -m1 '.pgpass lacks' "$WORK/out.log")"
+cp "$WORK/.pgpass.pristine" "$WORK/.pgpass"
+
+echo "== --doctor: .pgpass missing entirely (0.3.34) =="
+mv "$WORK/.pgpass" "$WORK/.pgpass.away"
+ha_cli --doctor > "$WORK/out.log" 2>&1; _rc=$?
+[ "$_rc" = "1" ] && grep -qF ".pgpass missing:" "$WORK/out.log" \
+  && grep -q "cannot authenticate to ANY node" "$WORK/out.log"
+report "--doctor FAILS on a missing .pgpass" "$?"
+mv "$WORK/.pgpass.away" "$WORK/.pgpass"
 
 echo "== --doctor: NTP out of sync =="
 TIMEDATECTL_VALUE=no ha_cli --doctor > "$WORK/out.log" 2>&1; _rc=$?
@@ -512,8 +574,9 @@ report "--doctor fails on NTP drift" "$?"
 echo "== --doctor on the witness (reduced check set) =="
 FAKE_IP=10.0.0.13 ha_cli --doctor > "$WORK/out.log" 2>&1; _rc=$?
 [ "$_rc" = "0" ] && grep -q "service postgresql active" "$WORK/out.log" \
+  && grep -qF "quorum link to fpbx-ha-1 (10.0.0.11): authenticated as repmgr" "$WORK/out.log" \
   && ! grep -q "entry point" "$WORK/out.log"
-report "--doctor witness: no haproxy/agent checks" "$?"
+report "--doctor witness: no haproxy/agent checks, quorum probes still run" "$?"
 
 # ---------------------------------------------------------------------------
 echo "== --doctor: repmgr shared memory preload (regression 0.3.15) =="

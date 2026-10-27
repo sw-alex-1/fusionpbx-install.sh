@@ -5,7 +5,7 @@
 # =============================================================================
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
-HA_DIR="$(cd "$HERE/../.." && pwd)"
+HA_DIR="$(cd "$HERE/.." && pwd)"
 
 TOTAL_PASS=0
 TOTAL_FAIL=0
@@ -18,7 +18,9 @@ echo
 
 echo "--- static checks ---"
 _fail=0
-for f in "$HA_DIR/fusionpbx-ha.sh" "$HA_DIR/resources/ha-lib.sh" "$HA_DIR/resources/promote.sh.tpl"; do
+# 0.3.34: the entry script moved up to Alt/ (next to the layer-1
+# install.sh); its resources/tests stay here in Alt/ha/
+for f in "$HA_DIR/../fusionpbx-ha.sh" "$HA_DIR/resources/ha-lib.sh" "$HA_DIR/resources/promote.sh.tpl"; do
     if sh -n "$f" 2>/dev/null; then
         echo "PASS  sh -n $f"
         TOTAL_PASS=$((TOTAL_PASS + 1))

@@ -42,9 +42,15 @@ in **RUNBOOK.md** (written for "it's been months, nobody remembers anything").
 
 ## Contents
 
+**Layout (0.3.34):** the entry script lives one level up — `Alt/fusionpbx-ha.sh`,
+next to the layer-1 `pre-install.sh`/`install.sh` (one system, one place).
+Everything it ships (templates, units, tests, docs) stays here in `Alt/ha/`.
+The script resolves both layouts itself, and a deployed flat copy
+(`/root/ha/{fusionpbx-ha.sh,resources/}`) keeps working unchanged.
+
 | File | Purpose |
 |------|---------|
-| `fusionpbx-ha.sh` | Layer-2 installer: `--init`, `--join`, `--repair`, `--status`, `--doctor`, `--print-token` |
+| `../fusionpbx-ha.sh` | Layer-2 installer (`Alt/fusionpbx-ha.sh`): `--init`, `--join`, `--repair`, `--status`, `--doctor`, `--print-token` |
 | `resources/ha-lib.sh` | Core library: state machine, token, cluster.conf, rendering, PG/sync helpers (sourced; also used by tests) |
 | `resources/` | Templates & units: `repmgr.conf.tpl`, `haproxy.cfg.tpl`, `lsyncd.conf.lua.tpl`, `promote.sh.tpl`, `role-agent.py`, `fusionpbx-ha-agent.service` |
 | `tests/` | Sandbox test suite (`run-all.sh`): lib/render/CLI/agent, layer-1 `test_guard.sh` style |

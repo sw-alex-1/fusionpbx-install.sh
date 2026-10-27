@@ -37,7 +37,21 @@
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-HA_RES_DIR="$SCRIPT_DIR/ha/resources"
+# 0.3.34: the script moved from Alt/ha/ up to Alt/ (next to the layer-1
+# pre-install.sh/install.sh - one system, one place); its resources stay in
+# Alt/ha/. Two layouts to resolve, and an exported HA_RES_DIR always wins
+# (the sandbox tests pin it):
+#   flat (deployed / a copied dir): <dir>/fusionpbx-ha.sh + <dir>/resources/
+#   repo (0.3.34+):                 Alt/fusionpbx-ha.sh + Alt/ha/resources/
+# Alt/resources/ is the LAYER-1 resource dir (no ha-lib.sh inside) - the
+# file probe below can never mistake it for ours.
+if [ -z "${HA_RES_DIR:-}" ]; then
+    if [ -f "$SCRIPT_DIR/resources/ha-lib.sh" ]; then
+        HA_RES_DIR="$SCRIPT_DIR/resources"
+    else
+        HA_RES_DIR="$SCRIPT_DIR/ha/resources"
+    fi
+fi
 
 # shellcheck disable=SC1091
 . "$HA_RES_DIR/ha-lib.sh"
@@ -866,6 +880,12 @@ The witness registers against a running primary - complete --init on the primary
         echo "$_wfr_out"
         die "'repmgr witness register' against $_wfr_ip failed (see output above)"
     fi
+    ha_scrub_conninfo_secrets   # 0.3.34: the register --force re-copied
+                                # repmgr.nodes from the (scrubbed) primary;
+                                # this cleans the witness's OWN local
+                                # repmgr.events rows, which may still carry
+                                # password= from registrations done by
+                                # pre-0.3.33 versions
     verbose "  witness registered against the primary $_wfr_ip"
 }
 
@@ -1392,6 +1412,82 @@ Fix: fusionpbx-ha.sh --repair  (degrades to async) or restore the standby"
         fi
     fi
 
+    # 4b. failover quorum links (0.3.34): the 27.10 outage - the standby
+    # detected the primary's death correctly, then its consensus probe to
+    # the witness died "fe_sendauth: no password supplied" (0.3.33 had
+    # removed the password from the metadata conninfo records and made the
+    # postgres user's .pgpass the only password carrier - but the data-role
+    # .pgpass never had a witness line) -> "unable to reach a qualified
+    # majority of nodes" -> degraded monitoring instead of promotion: the
+    # cluster stayed down for the whole primary outage. pg_isready alone
+    # kept saying "witness is reachable" that day - TCP was up, only AUTH
+    # was broken. The probe must authenticate exactly the way repmgrd does
+    # during an election: psql as the repmgr user through the postgres
+    # system user's .pgpass. Runs on every role (the witness's own repmgrd
+    # connects to its own IP the same way, 0.3.2); a node that is merely
+    # DOWN keeps its old semantics (the witness: a warning - RUNBOOK.md 4).
+    _dcq_passfile="$(ha_pgpass_file)"
+    for _dcq_id in 1 2 3; do
+        _dcq_ip="$(ha_node_ip "$_dcq_id")"
+        _dcq_name="$(ha_node_name "$_dcq_id")"
+        _dcq_out="$(PGCONNECT_TIMEOUT=5 PGPASSFILE="$_dcq_passfile" psql -w \
+            -h "$_dcq_ip" -p "$HA_PG_PORT" -U "$HA_REPMGR_USER" -d "$HA_REPMGR_DB" \
+            -tAc "SELECT 1" 2>&1 | tr -d ' \r')"
+        if [ "$_dcq_out" = "1" ]; then
+            _dr_ok "quorum link to $_dcq_name ($_dcq_ip): authenticated as $HA_REPMGR_USER"
+            continue
+        fi
+        if ha_pg_isready "$_dcq_ip"; then
+            _dr_fail "quorum link to $_dcq_name ($_dcq_ip): server reachable but the $HA_REPMGR_USER login FAILED
+      ($_dcq_out) - with this link broken an automatic failover CANNOT
+      reach a qualified majority (the 27.10 outage shape: the witness
+      rejected the login, the standby degraded instead of promoting).
+      Fix: update the scripts (RUNBOOK.md 7), then 'fusionpbx-ha.sh
+      --repair' on THIS node and on $_dcq_name"
+        elif [ "$_dcq_id" = "3" ] && [ "$HA_NODE_ID" != "3" ]; then
+            _dr_warn "witness $(ha_node_ip 3) unreachable${HA_PG_ISREADY_MSG:+ - $HA_PG_ISREADY_MSG} - automatic failover is DISABLED until it returns (RUNBOOK.md 4)"
+        else
+            _dr_fail "quorum link to $_dcq_name ($_dcq_ip) unreachable${HA_PG_ISREADY_MSG:+ - $HA_PG_ISREADY_MSG} - node down? (RUNBOOK.md 3/4)"
+        fi
+    done
+
+    # 4c. .pgpass coverage, statically (0.3.34): the companion of 4b that
+    # also works while the peer is down - a line lost to an older script
+    # version or a manual edit is caught BEFORE it can break an election.
+    # repmgr line for EVERY node (self included); on the data nodes also
+    # the postgres lines for the peer pair (pg_rewind, sync-name mgmt).
+    _dcp_file="$(ha_pgpass_file)"
+    if [ ! -f "$_dcp_file" ]; then
+        _dr_fail ".pgpass missing: $_dcp_file - repmgr cannot authenticate to ANY node
+      Fix: 'fusionpbx-ha.sh --repair' on this node (the doctor never modifies configurations)"
+    else
+        _dcp_miss=""
+        for _dcp_id in 1 2 3; do
+            grep -q "^$(ha_node_ip "$_dcp_id"):$HA_PG_PORT:\*:$HA_REPMGR_USER:" "$_dcp_file" 2>/dev/null \
+                || _dcp_miss="$_dcp_miss repmgr@$(ha_node_name "$_dcp_id")"
+        done
+        if [ "$HA_NODE_ID" != "3" ]; then
+            for _dcp_id in 1 2; do
+                grep -q "^$(ha_node_ip "$_dcp_id"):$HA_PG_PORT:\*:postgres:" "$_dcp_file" 2>/dev/null \
+                    || _dcp_miss="$_dcp_miss postgres@$(ha_node_name "$_dcp_id")"
+            done
+        fi
+        if [ -n "$_dcp_miss" ]; then
+            _dr_fail ".pgpass lacks the line(s) for:$_dcp_miss
+      (since 0.3.33 the .pgpass is the ONLY password carrier - a missing
+      line breaks the failover quorum: the 27.10 outage). Fix:
+      'fusionpbx-ha.sh --repair' on this node (the doctor never modifies configurations)"
+        else
+            _dr_ok ".pgpass covers every cluster node (quorum credentials complete)"
+        fi
+        # libpq silently IGNORES a .pgpass with a permissive mode - the
+        # quorum probes above would fail with no visible reason (0.3.34)
+        if cmd_exists stat; then
+            [ "$(stat -c %a "$_dcp_file" 2>/dev/null)" = "600" ] \
+                || _dr_warn ".pgpass mode is not 600 - libpq refuses to read it ('fusionpbx-ha.sh --repair' rewrites it)"
+        fi
+    fi
+
     # 5. entry point (data nodes)
     if [ "$HA_NODE_ID" != "3" ]; then
         _dc_probe="$(pg_psql_app 127.0.0.1 -p "$HA_HAPROXY_PORT" -tAc "SELECT pg_is_in_recovery()" 2>/dev/null | tr -d ' \r')"
@@ -1594,14 +1690,10 @@ Check: systemctl status haproxy $HA_AGENT_UNIT_NAME"
         esac
     done
 
-    # 10. witness reachability (from data nodes)
-    if [ "$HA_NODE_ID" != "3" ]; then
-        if ha_pg_isready "$(ha_node_ip 3)"; then
-            _dr_ok "witness $(ha_node_ip 3) is reachable"
-        else
-            _dr_warn "witness $(ha_node_ip 3) unreachable${HA_PG_ISREADY_MSG:+ - $HA_PG_ISREADY_MSG} - automatic failover is DISABLED until it returns (RUNBOOK.md 4)"
-        fi
-    fi
+    # 10. witness reachability - REMOVED in 0.3.34: a TCP-only probe kept
+    # saying "witness is reachable" while the repmgr login was broken (the
+    # 27.10 outage) - check 4b authenticates as the repmgr user and says
+    # both the truth and the fix command
 
     verbose ""
     if [ "$DOCTOR_FAIL" -gt 0 ]; then
