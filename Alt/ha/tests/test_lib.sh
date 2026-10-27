@@ -1091,6 +1091,20 @@ echo "$_r3c" | grep -q 'ha_rejoin_plan ' \
     && echo "$_r3c" | grep -qF 'rejoin not needed, replication left running'
 report "repair step 3: an attached standby skips the rejoin entirely" $?
 
+# 0.3.32: the 26.10 zombie (standby.signal + a checkpoint PAST the peer's
+# fork point) CANNOT start - PostgreSQL 16 refuses to boot such a standby
+# at all - and the repair used to die right at the classification start
+# advising --force-clone for an INTACT database (a rewind, not a wipe, is
+# the cure). A start failure must now fall through to the diverged rejoin
+if echo "$_r3c" | grep -qF 'local PostgreSQL does not start - re-run with --force-clone'; then
+    _z332=bad
+else
+    _z332=ok
+fi
+echo "$_r3c" | grep -qF 'treating the node as diverged and going straight to the rejoin' || _z332=bad
+echo "$_r3c" | grep -qF 'does not start or answer' || _z332=bad
+report "repair step 3: a failed classification start falls through to the rejoin, not --force-clone (0.3.32)" "$_z332"
+
 _r3c_div="$(printf '%s\n' "$_r3c" | sed -n '/local database diverged/,/pg_rewind applied/p')"
 _r3c_stop="$(printf '%s\n' "$_r3c_div" | grep -n 'svc_stop "\$HA_PG_SERVICE"' | head -n 1 | cut -d: -f1)"
 _r3c_rejoin="$(printf '%s\n' "$_r3c_div" | grep -n 'node rejoin --force-rewind' | head -n 1 | cut -d: -f1)"

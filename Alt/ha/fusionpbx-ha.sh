@@ -976,19 +976,43 @@ rep_step_3_rejoin_or_clone() {
         #     standby on a dead/wrong upstream): STOP PostgreSQL, rejoin
         #     with pg_rewind, then make sure systemd tracks it again
         #     (repmgr may have (re)started it via pg_ctl).
-        if ! svc_active "$HA_PG_SERVICE"; then
+        # 0.3.32: a local database that CANNOT START cannot be an
+        # attached standby either - the 27.10 morning boot of the 26.10
+        # zombie: after the failed pg_rewind rejoin (missing grants,
+        # fixed in 0.3.31) the node carried standby.signal with its last
+        # checkpoint PAST the peer's fork point, and PostgreSQL 16
+        # refuses to boot such a standby AT ALL ("no branching of the
+        # requested timeline 5 in the server's history: last checkpoint
+        # 0/D251590 on timeline 4, but it forked at 0/D251518") - the
+        # classification start died and the repair kept advising
+        # --force-clone for an INTACT database whose cure is a rewind,
+        # not a wipe. A failed classification start now simply means
+        # "diverged": skip the classifier and go straight to the rejoin
+        # (the node is already stopped; repmgr's rejoin owns the rewind
+        # and the start) - and if THAT fails, the die below still points
+        # at --force-clone for genuinely broken data directories.
+        _r3c_plan="diverged"
+        if svc_active "$HA_PG_SERVICE"; then
+            pg_runuser_psql -tAc "SELECT 1" >/dev/null 2>&1 \
+                || die "local PostgreSQL is active but not answering (check the PostgreSQL log) - re-run with --force-clone if the data directory is damaged"
+            _r3c_plan="$(ha_rejoin_plan "$(ha_peer_ip)")"
+        else
             # 0.3.28: the classifier needs a RUNNING database, i.e. this
             # start may briefly boot a stale primary - the boot guard
             # must let the REPAIR's own start through (see
             # ha_pg_start_for_classification; the 26.10 bench died here
             # with the guard blocking the repair itself)
-            ha_pg_start_for_classification \
-                || die "local PostgreSQL does not start - re-run with --force-clone"
-            ha_pg_wait_answer || die "local PostgreSQL is not answering - re-run with --force-clone"
+            if ha_pg_start_for_classification && ha_pg_wait_answer \
+                && pg_runuser_psql -tAc "SELECT 1" >/dev/null 2>&1; then
+                _r3c_plan="$(ha_rejoin_plan "$(ha_peer_ip)")"
+            else
+                verbose "  local PostgreSQL does not start or answer - it cannot be an"
+                verbose "  attached standby (the 26.10 state: a checkpoint past the peer's"
+                verbose "  fork point refuses to boot until pg_rewind) -"
+                verbose "  treating the node as diverged and going straight to the rejoin"
+            fi
         fi
-        pg_runuser_psql -tAc "SELECT 1" >/dev/null 2>&1 \
-            || die "local PostgreSQL is not answering - re-run with --force-clone"
-        if [ "$(ha_rejoin_plan "$(ha_peer_ip)")" = "attached" ]; then
+        if [ "$_r3c_plan" = "attached" ]; then
             _r3c_out="$(repmgr_cmd standby register --upstream-node-id="$(ha_peer_id)" --force)"
             if [ $? -ne 0 ]; then
                 echo "$_r3c_out"
