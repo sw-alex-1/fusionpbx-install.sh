@@ -10,7 +10,17 @@
 #   pg_promote() as user postgres - a systemd reload would NOT promote.
 node_id=@@NODE_ID@@
 node_name=@@NODE_NAME@@
-conninfo='host=@@NODE_IP@@ port=@@PG_PORT@@ user=@@REPMGR_USER@@ dbname=@@REPMGR_DB@@ password=@@REPMGR_PASSWORD@@ connect_timeout=5@@CONNINFO_EXTRA@@'
+# 0.3.33: NO password in conninfo - repmgr prints the connection string
+# verbatim (WARNING "unable to ping ..." lines, the "pg_rewind command
+# is ..." DETAIL with --source-server built from the PEER's node record)
+# and a password here ends up in the console output, repmgrd.log and
+# the journal. The postgres system user's .pgpass (written by the
+# installer's ha_write_pgpass, mode 600) authenticates every libpq
+# connection repmgr itself makes - including pg_rewind's --source-server
+# (it inherits this conninfo minus the password). Records written into
+# the metadata DB by older versions are stripped by
+# ha_scrub_conninfo_secrets().
+conninfo='host=@@NODE_IP@@ port=@@PG_PORT@@ user=@@REPMGR_USER@@ dbname=@@REPMGR_DB@@ connect_timeout=5@@CONNINFO_EXTRA@@'
 data_directory='@@PGDATA@@'
 pg_bindir='/usr/bin'
 replication_type=physical

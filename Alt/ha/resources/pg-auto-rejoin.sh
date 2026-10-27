@@ -52,6 +52,7 @@ CONF="${PG_AUTO_REJOIN_CONF:-/etc/fusionpbx-ha/boot-guard.conf}"
 : "${BG_PG_SERVICE:=postgresql}" "${BG_REPMGRD_SERVICE:=repmgr}"
 : "${BG_LSYNCD_SERVICE:=lsyncd}"
 : "${BG_REJOIN_ATTEMPTS:=45}" "${BG_REJOIN_SLEEP:=2}" "${BG_MAX_GAP_MB:=128}"
+: "${BG_REPAIR_FLAG:=/run/fusionpbx-ha/repair-start.flag}"
 
 log()    { echo "fusionpbx-ha auto-rejoin: $*" >&2; }
 refuse() {
@@ -177,9 +178,25 @@ ar_rejoin() {
     # postgres) then fails mkstemp inside it with "unable to open
     # temporary file" and the rejoin dies before pg_rewind even runs
     # (see repmgr_cmd in ha-lib.sh)
+    #
+    # 0.3.33: the guard flag covers the WHOLE rejoin call - its
+    # 'systemctl start' (service_start_command) happens INSIDE repmgr,
+    # right after repmgr 5.5.0's create_recovery_file() writes
+    # standby.signal (repmgr-action-standby.c:8309 - so the guard's own
+    # standby check lets the start through anyway); the window costs
+    # nothing and covers any path where the signal file is not (yet)
+    # there. /run (tmpfs): a crash cannot leave the guard blinded.
+    # printf, not ': >' - a redirection failure on the POSIX special
+    # builtin ':' is FATAL for the subshell in dash-family shells (killed
+    # ar_rejoin before repmgr ever ran when the flag path was unwritable)
+    mkdir -p "$(dirname "$BG_REPAIR_FLAG")" 2>/dev/null || true
+    printf '' > "$BG_REPAIR_FLAG" 2>/dev/null || true
     TMPDIR=/tmp runuser -u postgres -- repmgr -f "$BG_REPMGR_CONF_PATH" \
         node rejoin --force-rewind -h "$BG_PEER_IP" \
         -U "$BG_REPMGR_USER" -d "$BG_REPMGR_DB" 2>&1
+    _arrc=$?
+    rm -f "$BG_REPAIR_FLAG" 2>/dev/null || true
+    return "$_arrc"
 }
 
 log "rejoining as a standby of $BG_PEER_IP (pg_rewind; this can take minutes)"
@@ -201,11 +218,21 @@ if [ "$_ar_rc" -ne 0 ]; then
         --source-server="host=$BG_PEER_IP port=$BG_PG_PORT user=$BG_REPMGR_USER dbname=$BG_REPMGR_DB" \
         --debug 2>&1 || true
     log "retrying the rejoin once (pg_rewind is re-runnable)"
+    # 0.3.33: the first attempt may have crash-looped PostgreSQL against
+    # a poisoned data dir and tripped systemd's start-rate limiter - clear
+    # it, or the retry's inner 'systemctl start' is refused with
+    # "Start request repeated too quickly" before postgres even runs
+    systemctl reset-failed "$BG_PG_SERVICE" >/dev/null 2>&1 || true
     _ar_out="$(ar_rejoin)"
     _ar_rc=$?
     echo "$_ar_out" >&2
     if [ "$_ar_rc" -ne 0 ]; then
         log "REJOIN FAILED - PostgreSQL stays down (the SAFE state); run 'fusionpbx-ha.sh --repair'"
+        # 0.3.33: repmgr swallows the failed start's output (only "unable
+        # to start server"); the journal holds the real reason - keep the
+        # last 40 lines next to the pg_rewind --debug capture above
+        journalctl -u "$BG_PG_SERVICE" --no-pager -n 40 2>/dev/null \
+            | sed -e 's/^/  /' -e 's/password=[^ ]*/password=***/g' >&2 || true
         exit 1
     fi
 fi

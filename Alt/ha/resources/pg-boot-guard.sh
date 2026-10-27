@@ -29,7 +29,10 @@
 #     - peer PostgreSQL answers pg_is_in_recovery()=f (agent broken/silent)
 #
 # Never blocks a promote (no systemd start involved), a standby boot, a
-# repair rejoin (standby.signal is written BEFORE the start) or a fresh
+# repair rejoin (repmgr 5.5.0 create_recovery_file() writes standby.signal
+# BEFORE the rejoin's systemctl start - repmgr-action-standby.c:8309; and
+# since 0.3.33 the repair/auto-rejoin hold this flag across the whole
+# 'node rejoin' call anyway, belt over that ordering) or a fresh
 # init (no repmgr.conf yet). A blocked boot is SAFE: the local haproxy
 # routes the applications to the surviving primary via its agent check.
 
@@ -57,6 +60,11 @@ log() { echo "fusionpbx-ha boot-guard: $*" >&2; }
 # The repair marks the window with this flag; it lives under /run (tmpfs,
 # gone at reboot - every boot is guarded) and is removed the moment the
 # start attempt returned.
+# 0.3.33: the window was widened - the repair and the auto-rejoin now hold
+# the flag across the WHOLE 'repmgr node rejoin' call (its inner
+# service_start_command start included), because repmgr discards the
+# start's output on failure and a guard refusal there is otherwise
+# invisible (the 27.10 bench: 'unable to start server' with nothing else).
 [ -f "$BG_REPAIR_FLAG" ] && exit 0
 [ -f "$BG_PGDATA/standby.signal" ] && exit 0
 [ -f "$BG_REPMGR_CONF_PATH" ] || exit 0    # not a clustered node yet

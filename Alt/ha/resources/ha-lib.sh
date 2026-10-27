@@ -804,6 +804,83 @@ ha_pg_start_tracked() {
     systemctl start "$HA_PG_SERVICE"
 }
 
+# 0.3.33: the guard flag window for the WHOLE 'repmgr node rejoin' call.
+# repmgr's service_start_command start happens INSIDE the rejoin
+# (repmgr-action-standby.c: do_standby_follow_internal() ->
+# create_recovery_file() -> systemctl start), and create_recovery_file()
+# DOES write standby.signal before that start (repmgr 5.5.0,
+# repmgr-action-standby.c:8309 - so the guard allows the rejoin start
+# even without the flag), but the window costs nothing and covers any
+# path where the signal file is not yet there (a failed rewind, a
+# repmgr version that orders things differently). The same 0.3.28
+# rationale, extended one call further: an operator-driven repair owns
+# the node's role transitions for its duration. /run (tmpfs) - a crash
+# cannot leave the guard blinded across a reboot.
+ha_repair_start_window_open() {
+    _hrso_flag="${HA_REPAIR_START_FLAG:-/run/fusionpbx-ha/repair-start.flag}"
+    mkdir -p "$(dirname "$_hrso_flag")" 2>/dev/null || true
+    : > "$_hrso_flag" 2>/dev/null || true
+}
+
+ha_repair_start_window_close() {
+    _hrsc_flag="${HA_REPAIR_START_FLAG:-/run/fusionpbx-ha/repair-start.flag}"
+    rm -f "$_hrsc_flag" 2>/dev/null || true
+}
+
+# 0.3.33: prove the exact privilege path repmgr's service_start_command
+# needs BEFORE the rejoin runs into it. 'sudo -n systemctl show' is one
+# read-only shot that exercises sudo + the sudoers drop-in + NOPASSWD +
+# no-requiretty + the systemctl binary as user postgres (the verb is in
+# the FUSIONPBX_HA_PGCTL alias precisely for this probe - 'show' cannot
+# change state and succeeds for an existing unit). repmgr discards the
+# captured child output when the command FAILS (only "unable to start
+# server" is printed), so a broken sudo path inside the rejoin is
+# otherwise invisible; this preflight turns it into an actionable die.
+ha_preflight_repmgr_service_commands() {
+    cmd_exists sudo || return 0
+    runuser -u postgres -- sudo -n systemctl show "$HA_PG_SERVICE" >/dev/null 2>&1
+    [ $? -eq 0 ] && return 0
+    die "repmgr cannot control PostgreSQL as user postgres:
+'sudo -n systemctl show $HA_PG_SERVICE' (run as postgres) failed - the
+rejoin's 'systemctl start' (repmgr.conf service_start_command) would die
+the same way, with the reason swallowed by repmgr.
+Check, in this order:
+  1. visudo -c  (sudoers syntax)
+  2. /etc/sudoers.d/fusionpbx-ha exists and contains the PGCTL alias
+  3. 'Defaults requiretty' in /etc/sudoers (must NOT apply to postgres:
+     add 'Defaults!postgres !requiretty')
+  4. manual proof: runuser -u postgres -- sudo -n systemctl show $HA_PG_SERVICE"
+}
+
+# 0.3.33: repmgr's local_command() discards the captured child output
+# when the command FAILS (repmgr-action-standby.c:3553-3559: only
+# "unable to start server" is printed - the systemctl stderr, a guard
+# refusal and PostgreSQL's own startup FATAL all vanish). The 27.10
+# bench: the diverged rejoin died exactly so, 'unable to start server'
+# with nothing else, while the journal held the whole story. Collect
+# the two sources the node actually has, right now, while fresh - and
+# scrub password= from anything printed, belt over the 0.3.33
+# passwordless conninfo.
+ha_rejoin_failure_forensics() {
+    warn "  collecting the rejoin failure forensics (repmgr will not show them):"
+    echo "    --- journal: $HA_PG_SERVICE, last 40 lines:" >&2
+    journalctl -u "$HA_PG_SERVICE" --since '-20 min' --no-pager 2>/dev/null \
+        | tail -n 40 | sed -e 's/^/      /' -e 's/password=[^ ]*/password=***/g' >&2
+    _hrff_log="$(ls -t "$(ha_pg_data_dir)/log/"postgresql-*.log 2>/dev/null | head -n 1)"
+    if [ -n "$_hrff_log" ]; then
+        echo "    --- PostgreSQL log tail ($_hrff_log):" >&2
+        tail -n 30 "$_hrff_log" 2>/dev/null \
+            | sed -e 's/^/      /' -e 's/password=[^ ]*/password=***/g' >&2
+    else
+        echo "    --- no $(ha_pg_data_dir)/log/postgresql-*.log found" >&2
+    fi
+    if [ -f "$(ha_pg_data_dir)/standby.signal" ]; then
+        echo "    standby.signal present - PostgreSQL starts in recovery mode" >&2
+    else
+        echo "    standby.signal MISSING - a start would come up as a read-write primary" >&2
+    fi
+}
+
 # 0.3.22: classify the LOCAL node for the repair rejoin. repmgr 5.5 refuses
 # 'node rejoin' on a running database ("database is still running in state
 # 'in archive recovery'" / "cannot be executed on a running node") - the
@@ -1119,7 +1196,8 @@ ha_install_sudoers() {
 # to the failed peer (restart-only verbs - no start/stop privilege).
 Cmnd_Alias FUSIONPBX_HA_PGCTL = /usr/bin/systemctl start postgresql, \
     /usr/bin/systemctl stop postgresql, /usr/bin/systemctl restart postgresql, \
-    /usr/bin/systemctl reload postgresql, /usr/bin/systemctl status postgresql
+    /usr/bin/systemctl reload postgresql, /usr/bin/systemctl status postgresql, \
+    /usr/bin/systemctl show postgresql
 Cmnd_Alias FUSIONPBX_HA_APPS = /usr/bin/systemctl try-restart php*-fpm, \
     /usr/bin/systemctl try-restart angie, \
     /usr/bin/systemctl try-restart freeswitch
@@ -1556,6 +1634,28 @@ host postgres     postgres   $(ha_node_ip 2)/32  md5"
 repmgr_cmd() {
     TMPDIR=/tmp PGOPTIONS='-c synchronous_commit=off' \
         runuser -u postgres -- repmgr -f "$HA_REPMGR_CONF" "$@" 2>&1
+}
+
+# 0.3.33: strip password= from the repmgr metadata (repmgr.nodes.conninfo
+# and repmgr.events.details). repmgr prints node conninfo verbatim (the
+# WARNING "unable to ping ..." lines, and the "pg_rewind command is ..."
+# DETAIL is built from the PEER's node record), so every record registered
+# by an older version carries the plaintext password into the console,
+# repmgrd.log and the journal. The rendered conninfo is passwordless since
+# 0.3.33 (see repmgr.conf.tpl), but the DB records outlive config
+# re-renders - and the metadata DB is REPLICATED, so one write on the
+# primary heals every node's copy (the witness re-copies them on its next
+# register --force). The local UPDATE silently no-ops on a standby
+# (read-only) and the peer UPDATE silently no-ops when the peer is down:
+# between the two, whichever node is the primary gets cleaned. Idempotent;
+# called after every register/rejoin/repair convergence point.
+ha_scrub_conninfo_secrets() {
+    _hsc_sql_nodes="UPDATE repmgr.nodes SET conninfo = regexp_replace(conninfo, '[[:space:]]*password=[^[:space:]]*', '', 'g') WHERE conninfo LIKE '%password=%'"
+    _hsc_sql_events="UPDATE repmgr.events SET details = regexp_replace(details, 'password=[^[:space:]]*', 'password=***', 'g') WHERE details LIKE '%password=%'"
+    pg_runuser_psql -d "$HA_REPMGR_DB" -c "$_hsc_sql_nodes" >/dev/null 2>&1 || true
+    pg_runuser_psql -d "$HA_REPMGR_DB" -c "$_hsc_sql_events" >/dev/null 2>&1 || true
+    pg_psql_superuser "$(ha_peer_ip)" -d "$HA_REPMGR_DB" -c "$_hsc_sql_nodes" >/dev/null 2>&1 || true
+    pg_psql_superuser "$(ha_peer_ip)" -d "$HA_REPMGR_DB" -c "$_hsc_sql_events" >/dev/null 2>&1 || true
 }
 
 # soft cross-node reachability probe: pg_isready when available, silence

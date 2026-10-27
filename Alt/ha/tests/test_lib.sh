@@ -1989,7 +1989,7 @@ BG_PG_PASSFILE="/nonexistent"
 BG_REPMGR_USER="repmgr"
 BG_REPMGR_DB="repmgr"
 BG_REPMGR_CONF_PATH="$WORK/arconf/repmgr.conf"
-BG_REPAIR_FLAG="/run/fusionpbx-ha/repair-start.flag"
+BG_REPAIR_FLAG="$WORK/ar-repair.flag"
 BG_NODE_ROLE="data"
 BG_NODE_NAME="fpbx-ha-1"
 BG_PG_SERVICE="postgresql"
@@ -2090,8 +2090,9 @@ if [ "$_g_rc" = "1" ] && echo "$OUT" | grep -q "REJOIN FAILED" \
     && [ "$(grep -c 'node rejoin' "$WORK/ar-repmgr.log")" = "2" ] \
     && grep -q -- '--debug' "$WORK/ar-rewind.log" \
     && ! grep -qE '(^| )-v( |$)' "$WORK/ar-rewind.log" \
-    && ! grep -q '^start postgresql$' "$WORK/ar-sysctl.log"; then _g=0; fi
-report "auto-rejoin: failed rejoin -> rewind --debug captured (no invalid -v), one retry, PG left down" "$_g" "$(echo "$OUT" | tail -3)"
+    && ! grep -q '^start postgresql$' "$WORK/ar-sysctl.log" \
+    && [ ! -e "$WORK/ar-repair.flag" ]; then _g=0; fi
+report "auto-rejoin: failed rejoin -> rewind --debug captured (no invalid -v), one retry, PG left down, guard flag closed" "$_g" "$(echo "$OUT" | tail -3)"
 
 # installer contract: the auto-rejoin script + unit + new conf keys
 HA_LIB_DIR="$WORK/lib" HA_SYSTEMD_DIR="$WORK/systemd" lib_run '
@@ -2131,6 +2132,68 @@ _dc27="$(sed -n '/^cmd_doctor()/,/^}/p' "$CLI")"
 echo "$_dc27" | grep -qF 'PostgreSQL boot guard installed' \
     && echo "$_dc27" | grep -qF 'will boot as a competing primary'
 report "doctor: boot guard presence check (0.3.27)" $?
+
+# ---------------------------------------------------------------------------
+# 0.3.33: the diverged rejoin survives the systemd start-rate poison (the
+# 27.10 bench: the classifier's crash loop tripped the limiter, repmgr's
+# inner 'systemctl start' was refused, "unable to start server" with the
+# reason swallowed), holds the guard flag across the WHOLE rejoin call,
+# proves the sudo privilege path first, prints forensics on failure,
+# retries once - and the password left the conninfo/metadata everywhere
+# ---------------------------------------------------------------------------
+_rr333="$(sed -n '/^rep_step_3_rejoin_or_clone()/,/^}/p' "$CLI")"
+echo "$_rr333" | grep -qF 'systemctl reset-failed "$HA_PG_SERVICE"'
+report "repair step 3: start-rate poison cleared before the rejoin (0.3.33)" $?
+echo "$_rr333" | grep -qF 'ha_preflight_repmgr_service_commands'
+report "repair step 3: sudo privilege path proven before the rejoin" $?
+_g=1
+_flagopen="$(echo "$_rr333" | grep -n 'ha_repair_start_window_open' | head -1 | cut -d: -f1)"
+_flagclose="$(echo "$_rr333" | grep -n 'ha_repair_start_window_close' | head -1 | cut -d: -f1)"
+_rejoin="$(echo "$_rr333" | grep -n 'node rejoin --force-rewind' | head -1 | cut -d: -f1)"
+[ -n "$_flagopen" ] && [ -n "$_flagclose" ] && [ -n "$_rejoin" ] \
+    && [ "$_flagopen" -lt "$_rejoin" ] && [ "$_flagclose" -gt "$_rejoin" ] && _g=0
+report "repair step 3: guard flag window wraps the whole rejoin call" "$_g"
+echo "$_rr333" | grep -qF 'ha_rejoin_failure_forensics'
+report "repair step 3: a failed rejoin prints the journal + PG log forensics" $?
+[ "$(echo "$_rr333" | grep -c 'node rejoin --force-rewind')" = "2" ]
+report "repair step 3: the rejoin is retried once (pg_rewind is re-runnable)" $?
+echo "$_rr333" | grep -qF 'ha_scrub_conninfo_secrets'
+report "repair step 3: conninfo secrets scrubbed after the rejoin" $?
+
+# the scrub function: both metadata tables, regexp-based, tolerant
+_scrub333="$(sed -n '/^ha_scrub_conninfo_secrets()/,/^}/p' "$LIB")"
+echo "$_scrub333" | grep -q 'repmgr\.nodes' && echo "$_scrub333" | grep -q 'repmgr\.events' \
+    && echo "$_scrub333" | grep -q 'regexp_replace' \
+    && echo "$_scrub333" | grep -q '|| true'
+report "scrub: repmgr.nodes + repmgr.events, password= stripped, failures tolerated (read-only standby)" $?
+
+# the scrub is called at every convergence point
+_g=0
+_cli333="$(cat "$CLI")"
+for _fn333 in rep_step_4_services prp_step_3_services init_step_7_primary_register join_step_6_start_register; do
+    echo "$_cli333" | sed -n "/^${_fn333}()/,/^}/p" | grep -qF 'ha_scrub_conninfo_secrets' || _g=1
+done
+report "scrub: called in repair step 4, primary repair step 3, init register, join register" "$_g"
+
+# the template itself must carry no password
+! grep -q 'password=' "$RES/repmgr.conf.tpl"
+report "repmgr.conf.tpl: conninfo carries no password token (0.3.33)" $?
+
+# sudoers alias carries the read-only 'show' verb for the preflight probe
+_sud333="$(sed -n '/^ha_install_sudoers()/,/^}/p' "$LIB")"
+echo "$_sud333" | grep -q 'systemctl show postgresql'
+report "sudoers: read-only 'show' verb for the rejoin preflight (0.3.33)" $?
+
+# the preflight proves the path AS POSTGRES (runuser + sudo -n)
+_pre333="$(sed -n '/^ha_preflight_repmgr_service_commands()/,/^}/p' "$LIB")"
+echo "$_pre333" | grep -q 'runuser -u postgres -- sudo -n systemctl show'
+report "preflight: sudo -n systemctl show runs as user postgres" $?
+
+# auto-rejoin: the guard flag covers its rejoin call too (belt over
+# repmgr's standby.signal-before-start ordering)
+_arj333="$(sed -n '/^ar_rejoin()/,/^}/p' "$RES/pg-auto-rejoin.sh")"
+echo "$_arj333" | grep -q 'BG_REPAIR_FLAG' && echo "$_arj333" | grep -q 'node rejoin --force-rewind'
+report "auto-rejoin: guard flag window inside ar_rejoin (0.3.33)" $?
 
 # ---------------------------------------------------------------------------
 echo

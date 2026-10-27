@@ -396,6 +396,8 @@ init_step_7_primary_register() {
         echo "$_ipr_out"
         die "'repmgr primary register' failed (see output above)"
     fi
+    ha_scrub_conninfo_secrets   # 0.3.33: keep password= out of the records
+                                # from the very first registration
     echo "$_ipr_out" | grep -q "successfully\|already registered" 2>/dev/null || verbose "  $_ipr_out"
     verbose "  this node is registered as the cluster primary (node 1)"
     # 0.3.16: the repmgrd unit drop-in (ordering + REPMGRD_OPTS) is
@@ -674,6 +676,9 @@ join_step_6_start_register() {
         echo "$_jsr_out"
         die "'repmgr standby register' failed (see output above)"
     fi
+    ha_scrub_conninfo_secrets   # 0.3.33: the fresh record is clean (passwordless
+                                # conninfo); this also strips the PEER's legacy
+                                # record - the peer is the writable primary
     verbose "  registered as a standby of node $(ha_peer_id) ($(ha_peer_name))"
     # 0.3.16: the repmgrd unit drop-in (ordering + REPMGRD_OPTS) is
     # installer-owned - installed before every repmgrd enable+start
@@ -1037,13 +1042,61 @@ rep_step_3_rejoin_or_clone() {
             # (first real exercise of the diverged branch: the bench repairs
             # of 0.3.22/0.3.23 all took the 'attached' path). Give the rejoin
             # the same explicit identity the clone command has always used.
+            #
+            # 0.3.33: the 27.10 rejoin reached the START for the first time
+            # ever - pg_rewind succeeded ("0 files copied" - a ~240-byte
+            # fork gap), repmgr wrote standby.signal + primary_conninfo
+            # and called 'sudo systemctl start postgresql' ... which failed
+            # with NOTHING: repmgr discards the captured child output when
+            # the command fails (repmgr-action-standby.c:3553). Three
+            # belt-and-braces measures, all verified against repmgr 5.5.0
+            # sources:
+            #   a) 'systemctl reset-failed' first: the classifier's own
+            #      start attempt (this same run, on the un-rewound zombie)
+            #      crash-looped PostgreSQL and systemd's start-rate limiter
+            #      then refuses further starts with "Start request repeated
+            #      too quickly" - the exact shape of "unable to start
+            #      server" with a perfectly rewound data directory;
+            #   b) the guard flag covers the WHOLE rejoin call (repmgr's
+            #      systemctl start happens INSIDE it; see
+            #      ha_repair_start_window_open);
+            #   c) the sudo privilege path is proven BEFORE the rejoin
+            #      (ha_preflight_repmgr_service_commands) and a failure now
+            #      prints the journal + the PostgreSQL log (repmgr will not).
+            systemctl reset-failed "$HA_PG_SERVICE" >/dev/null 2>&1 || true
+            ha_preflight_repmgr_service_commands
+            ha_repair_start_window_open
             _r3c_out="$(repmgr_cmd node rejoin --force-rewind -h "$(ha_peer_ip)" -U "$HA_REPMGR_USER" -d "$HA_REPMGR_DB")"
-            if [ $? -ne 0 ]; then
+            _r3c_rc=$?
+            ha_repair_start_window_close
+            if [ "$_r3c_rc" -ne 0 ]; then
                 echo "$_r3c_out"
-                die "node rejoin failed (see output above).
+                ha_rejoin_failure_forensics
+                if pg_runuser_psql -tAc "SELECT 1" >/dev/null 2>&1 \
+                        && [ "$(ha_rejoin_plan "$(ha_peer_ip)")" = "attached" ]; then
+                    verbose "  the rejoin reported a failure, but the node IS up and"
+                    verbose "  streaming as an attached standby (slow catchup) - continuing"
+                else
+                    # retry once: pg_rewind is re-runnable, and the first
+                    # attempt may have died on the start-rate poison or a
+                    # transient peer hiccup (the auto-rejoin does the same)
+                    systemctl reset-failed "$HA_PG_SERVICE" >/dev/null 2>&1 || true
+                    ha_repair_start_window_open
+                    _r3c_out="$(repmgr_cmd node rejoin --force-rewind -h "$(ha_peer_ip)" -U "$HA_REPMGR_USER" -d "$HA_REPMGR_DB")"
+                    _r3c_rc=$?
+                    ha_repair_start_window_close
+                    if [ "$_r3c_rc" -ne 0 ]; then
+                        echo "$_r3c_out"
+                        ha_rejoin_failure_forensics
+                        die "node rejoin failed twice (see the forensics above).
 If the local PGDATA is damaged beyond rewind, re-run with: --repair --force-clone"
+                    fi
+                fi
             fi
             ha_pg_adopt_after_rejoin
+            ha_scrub_conninfo_secrets   # 0.3.33: the peer's node record still
+                                        # carries password= (registered by an
+                                        # older version) - strip it everywhere
             verbose "  rejoined as a standby of $(ha_peer_name) (pg_rewind applied)"
         fi
     fi
@@ -1053,6 +1106,9 @@ rep_step_4_services() {
     # self-healing preamble: refresh pg_hba, listen_addresses, sudoers and
     # re-render repmgr.conf if the on-disk copy differs from the template
     ha_register_prelude standby
+    ha_scrub_conninfo_secrets   # 0.3.33: strip password= from the metadata
+                                # (covers the attached branch and re-runs;
+                                # idempotent, heals both nodes' records)
     ha_render_repmgr_conf standby
     ha_install_promote_sh
     ha_install_agent
@@ -1110,6 +1166,8 @@ prp_step_2_degrade() {
 prp_step_3_services() {
     # self-healing preamble on the surviving primary (idempotent)
     ha_register_prelude primary
+    ha_scrub_conninfo_secrets   # 0.3.33: the primary owns the writable copy
+                                # of the metadata - strip password= here
     ha_render_repmgr_conf primary
     ha_install_promote_sh
     ha_install_agent

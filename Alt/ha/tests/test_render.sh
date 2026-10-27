@@ -51,7 +51,10 @@ ha_render_repmgr_conf primary
 check_line "$WORK/repmgr-1.conf" '^node_id=1$' "node_id=1"
 check_line "$WORK/repmgr-1.conf" "^node_name='?fpbx-ha-1'?$" "node_name"
 check_line "$WORK/repmgr-1.conf" "host=10.0.0.11" "conninfo host"
-check_line "$WORK/repmgr-1.conf" "password=reppass456" "conninfo password"
+check_line "$WORK/repmgr-1.conf" "user=repmgr dbname=repmgr" "conninfo user+dbname"
+# 0.3.33: NO password in conninfo - repmgr prints it verbatim (WARNING ping
+# lines, the pg_rewind --source-server DETAIL); the .pgpass authenticates
+check_absent "$WORK/repmgr-1.conf" "password=" "conninfo carries no password (secret stays in .pgpass)"
 check_line "$WORK/repmgr-1.conf" "^failover=manual$" "failover=manual (never promoted)"
 check_line "$WORK/repmgr-1.conf" "data_directory='$WORK/pgdata'" "PGDATA from detection"
 check_absent "$WORK/repmgr-1.conf" "^promote_command|application_name" "no standby-only directives"
