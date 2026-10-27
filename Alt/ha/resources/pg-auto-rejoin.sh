@@ -227,12 +227,39 @@ if [ "$_ar_rc" -ne 0 ]; then
     _ar_rc=$?
     echo "$_ar_out" >&2
     if [ "$_ar_rc" -ne 0 ]; then
-        log "REJOIN FAILED - PostgreSQL stays down (the SAFE state); run 'fusionpbx-ha.sh --repair'"
+        log "REJOIN FAILED"
         # 0.3.33: repmgr swallows the failed start's output (only "unable
         # to start server"); the journal holds the real reason - keep the
         # last 40 lines next to the pg_rewind --debug capture above
         journalctl -u "$BG_PG_SERVICE" --no-pager -n 40 2>/dev/null \
             | sed -e 's/^/  /' -e 's/password=[^ ]*/password=***/g' >&2 || true
+        # 0.3.35: the rejoin may have failed AFTER repmgr had already
+        # started the server (the 27.10 14:0x boot: pg_rewind done,
+        # PostgreSQL up as a standby on the new timeline - but the WAL
+        # receiver never attached, the metadata record still said
+        # 'primary', repmgrd crash-looped 'node is registered as a primary
+        # but running as a standby', and the startup process kept
+        # replaying the node's OWN divergent WAL tail onto the rewound
+        # files). "PostgreSQL stays down" was a lie for this path. Tell
+        # the two leftovers apart by the WAL receiver:
+        if ar_local_psql "SELECT 1" >/dev/null 2>&1; then
+            if [ "$(ar_local_psql "SELECT sender_host FROM pg_stat_wal_receiver")" = "$BG_PEER_IP" ]; then
+                log "PostgreSQL IS up and streaming from the peer (catchup) - the rejoin"
+                log "failed at a later stage (the metadata record may be stale). Do NOT"
+                log "reboot it: run 'fusionpbx-ha.sh --repair' - the attached path"
+                log "refreshes the record without interrupting the replication."
+            else
+                log "PostgreSQL is up but NOT attached to the peer (the zombie standby:"
+                log "stale 'primary' record, no streaming, own-divergent-WAL replay) -"
+                log "stopping it: the SAFE state (the applications work via the peer)"
+                systemctl stop "$BG_PG_SERVICE" >/dev/null 2>&1 || true
+                systemctl stop "$BG_REPMGRD_SERVICE" >/dev/null 2>&1 || true
+                log "PostgreSQL and repmgrd stopped; run 'fusionpbx-ha.sh --repair'"
+                log "(the next boot retries the rejoin automatically)"
+            fi
+        else
+            log "PostgreSQL stays down (the SAFE state); run 'fusionpbx-ha.sh --repair'"
+        fi
         exit 1
     fi
 fi

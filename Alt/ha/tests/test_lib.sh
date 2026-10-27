@@ -1212,11 +1212,11 @@ echo "== the failover is not over until the apps are back (regression 0.3.24) ==
 
 rm -rf "$WORK/lib" "$WORK/sudoers"
 HA_LIB_DIR="$WORK/lib" HA_SUDOERS_DIR="$WORK/sudoers" lib_run 'ha_install_promote_sh'
-[ -x "$WORK/lib/promote.sh" ] && grep -qF 'sudo -n systemctl try-restart' "$WORK/lib/promote.sh" \
+[ -x "$WORK/lib/promote.sh" ] && grep -qF 'sudo -n /usr/bin/systemctl try-restart' "$WORK/lib/promote.sh" \
     && grep -q 'for _psh_svc in' "$WORK/lib/promote.sh" \
     && grep -qF 'angie' "$WORK/lib/promote.sh" && grep -qF 'freeswitch' "$WORK/lib/promote.sh" \
     && ! grep -q '@@' "$WORK/lib/promote.sh"
-report "ha_install_promote_sh: renders executable, app list resolved (0.3.24)" $? "$(cat "$WORK/lib/promote.sh" 2>/dev/null | head -c 80)"
+report "ha_install_promote_sh: renders executable, app list resolved (0.3.24; absolute systemctl 0.3.35)" $? "$(cat "$WORK/lib/promote.sh" 2>/dev/null | head -c 80)"
 
 HA_SUDOERS_DIR="$WORK/sudoers" lib_run 'ha_install_sudoers'
 [ -f "$WORK/sudoers/fusionpbx-ha" ] && grep -q 'FUSIONPBX_HA_APPS' "$WORK/sudoers/fusionpbx-ha" \
@@ -1922,6 +1922,10 @@ fi
 echo "LOCAL $*" >> "$AR_PSQL_LOG"
 case "$*" in
     *pg_is_in_recovery*) printf 't'; exit 0 ;;
+    # 0.3.35: the zombie-vs-catchup gate of the failed-rejoin path
+    # (AR_LOCAL_SENDER: empty = the WAL receiver never attached - the
+    # 27.10 zombie; <peer-ip> = streaming catchup - keep it running)
+    *pg_stat_wal_receiver*) printf '%s' "${AR_LOCAL_SENDER:-}"; exit 0 ;;
     *) exit 0 ;;
 esac
 EOF
@@ -2085,11 +2089,16 @@ report "auto-rejoin: happy path (rejoin + adopt + daemons + sync on the peer)" "
 
 # a failing rejoin: capture the pg_rewind debug trace (0.3.31: pg_rewind
 # has no '-v' - the old capture died "invalid option" and logged nothing),
-# retry once, then give up and leave PostgreSQL DOWN (the safe state)
+# retry once, then give up. 0.3.35: the rejoin may have failed AFTER
+# repmgr started the server - PostgreSQL "up" (the stub answers SELECT 1)
+# but the WAL receiver never attached (AR_LOCAL_SENDER empty) = the 27.10
+# zombie standby (stale 'primary' record, own-divergent-WAL replay,
+# repmgrd crash-loop) - it must be STOPPED (PG + repmgrd), not left behind
 : > "$WORK/ar-repmgr.log"; : > "$WORK/ar-rewind.log"; : > "$WORK/ar-sysctl.log"
 AR_PEER_HISTORY="$(printf '2\t0/3000000\t\n3\t0/5000000\tfailover')" \
 AR_CTL_LSN="0/5001000" AR_IS_ACTIVE="inactive" \
 AR_REJOIN_RC=1 AR_REJOIN_OUT='pg_rewind: error: unable to open temporary file\\n' \
+AR_LOCAL_SENDER="" \
 AR_CURL_CODE=200 AR_PEER_RECOVERY="" AR_CTL_STATE="in production" ar_run; _g_rc=$?
 _g=1
 if [ "$_g_rc" = "1" ] && echo "$OUT" | grep -q "REJOIN FAILED" \
@@ -2097,8 +2106,28 @@ if [ "$_g_rc" = "1" ] && echo "$OUT" | grep -q "REJOIN FAILED" \
     && grep -q -- '--debug' "$WORK/ar-rewind.log" \
     && ! grep -qE '(^| )-v( |$)' "$WORK/ar-rewind.log" \
     && ! grep -q '^start postgresql$' "$WORK/ar-sysctl.log" \
+    && grep -q '^stop postgresql$' "$WORK/ar-sysctl.log" \
+    && grep -q '^stop repmgr$' "$WORK/ar-sysctl.log" \
+    && echo "$OUT" | grep -q "NOT attached to the peer" \
     && [ ! -e "$WORK/ar-repair.flag" ]; then _g=0; fi
-report "auto-rejoin: failed rejoin -> rewind --debug captured (no invalid -v), one retry, PG left down, guard flag closed" "$_g" "$(echo "$OUT" | tail -3)"
+report "auto-rejoin: failed rejoin, PG up but NOT attached -> zombie STOPPED (PG + repmgrd), rewind --debug captured, one retry, guard flag closed" "$_g" "$(echo "$OUT" | tail -3)"
+
+# the other leftover (0.3.35): the rejoin failed at a LATER stage - the WAL
+# receiver IS attached (catchup): the catchup is valuable, the node must be
+# left RUNNING with an actionable message (a reboot would waste it)
+: > "$WORK/ar-repmgr.log"; : > "$WORK/ar-sysctl.log"
+AR_PEER_HISTORY="$(printf '2\t0/3000000\t\n3\t0/5000000\tfailover')" \
+AR_CTL_LSN="0/5001000" AR_IS_ACTIVE="inactive" \
+AR_REJOIN_RC=1 AR_REJOIN_OUT='ERROR: timeout waiting for node to attach\\n' \
+AR_LOCAL_SENDER="10.0.0.12" \
+AR_CURL_CODE=200 AR_PEER_RECOVERY="" AR_CTL_STATE="in production" ar_run; _g_rc=$?
+_g=1
+if [ "$_g_rc" = "1" ] && echo "$OUT" | grep -q "REJOIN FAILED" \
+    && echo "$OUT" | grep -q "IS up and streaming from the peer" \
+    && echo "$OUT" | grep -q "Do NOT" \
+    && ! grep -q '^stop repmgr$' "$WORK/ar-sysctl.log" \
+    && [ ! -e "$WORK/ar-repair.flag" ]; then _g=0; fi
+report "auto-rejoin: failed rejoin, PG up AND attached -> left running, --repair named (0.3.35)" "$_g" "$(echo "$OUT" | tail -3)"
 
 # installer contract: the auto-rejoin script + unit + new conf keys
 HA_LIB_DIR="$WORK/lib" HA_SYSTEMD_DIR="$WORK/systemd" lib_run '
@@ -2237,6 +2266,90 @@ echo "$_head334" | grep -qF 'if [ -z "${HA_RES_DIR:-}" ]' \
     && echo "$_head334" | grep -qF '$SCRIPT_DIR/ha/resources' \
     && echo "$_head334" | grep -qF '$SCRIPT_DIR/resources/ha-lib.sh'
 report "layout: dual resource-dir resolution, exported HA_RES_DIR wins (0.3.34)" $?
+
+# ---------------------------------------------------------------------------
+# 0.3.35: the 27.10 13:57 promote restarted NO applications - every
+# 'sudo -n systemctl try-restart' from repmgrd's context died instantly
+# and SILENTLY (the reason swallowed by '>/dev/null 2>&1'); the 14:0x
+# auto-rejoin then left a zombie standby behind ("PostgreSQL stays down"
+# was a lie - repmgr had already started the server)
+# ---------------------------------------------------------------------------
+
+# promote.sh: ABSOLUTE systemctl (the sudoers patterns are absolute) and
+# the FIRST LINE of the captured error in the warning (the reason must
+# reach repmgrd.log - the 13:57 promote left nothing to diagnose)
+_tpl335="$(cat "$RES/promote.sh.tpl")"
+echo "$_tpl335" | grep -qF 'sudo -n /usr/bin/systemctl try-restart "$_psh_svc" 2>&1' \
+    && echo "$_tpl335" | grep -qF 'head -n 1' \
+    && echo "$_tpl335" | grep -qF 'rc=$_psh_rc: ${_psh_reason:-no output}'
+report "promote.sh: absolute systemctl + the captured sudo reason in the warning (0.3.35)" $?
+
+# the repmgrd drop-in turns NoNewPrivileges off (the only context where
+# sudo was ever seen failing is the daemon's own unit) and VERIFIES the
+# merged property after daemon-reload
+_dr335="$(sed -n '/^ha_install_repmgr_dropin()/,/^}/p' "$LIB")"
+echo "$_dr335" | grep -q '^NoNewPrivileges=no$' \
+    && echo "$_dr335" | grep -qF 'systemctl show "$HA_REPMGRD_SERVICE" -p NoNewPrivileges --value'
+report "repmgrd drop-in: NoNewPrivileges=no + merged-property verification (0.3.35)" $?
+
+# the sudo path is pre-verified at every promote-wrapper install (as
+# postgres, sudo -n -l) and stays WARN-only tolerant
+_chk335="$(sed -n '/^ha_check_app_restart_sudo()/,/^}/p' "$LIB")"
+echo "$_chk335" | grep -qF 'runuser -u postgres -- sudo -n -l' \
+    && echo "$_chk335" | grep -qF '/usr/bin/systemctl try-restart' \
+    && echo "$_chk335" | grep -qF 'cmd_exists sudo || return 0' \
+    && echo "$_chk335" | grep -qF 'cat /etc/sudoers.d/repmgr'
+report "sudo preflight: sudo -n -l as postgres, tolerant, names the RPM's own sudoers file (0.3.35)" $?
+_prom335="$(sed -n '/^ha_install_promote_sh()/,/^}/p' "$LIB")"
+echo "$_prom335" | grep -qF 'ha_check_app_restart_sudo "$_hips_apps"'
+report "sudo preflight: called from every promote-wrapper install (0.3.35)" $?
+
+# the sudo preflight: behavioral (scoped sudo/runuser stubs - the global
+# fakebin must not fake runuser for the rest of the suite)
+mkdir -p "$WORK/sudobin"
+cat > "$WORK/sudobin/sudo" <<'EOF'
+#!/bin/sh
+echo "sudo $*" >> "${SUDO_PROBE_LOG:?}"
+exit "${SUDO_PROBE_RC:-0}"
+EOF
+cat > "$WORK/sudobin/runuser" <<'EOF'
+#!/bin/sh
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -u) shift 2 ;;
+        --) shift; break ;;
+        *) break ;;
+    esac
+done
+exec "$@"
+EOF
+chmod +x "$WORK/sudobin/"*
+: > "$WORK/sudo-probe.log"
+SUDO_PROBE_LOG="$WORK/sudo-probe.log" SUDO_PROBE_RC=0 lib_run '
+    PATH="$WORK/sudobin:$PATH" ha_check_app_restart_sudo "php8.3-fpm angie freeswitch" >/dev/null'
+[ "$?" = "0" ] && [ "$(grep -c 'sudo -n -l /usr/bin/systemctl try-restart' "$WORK/sudo-probe.log")" = "3" ]
+report "sudo preflight: 3 probes, rc=0 path silent (0.3.35)" $?
+SUDO_PROBE_LOG="$WORK/sudo-probe.log" SUDO_PROBE_RC=1 lib_run '
+    PATH="$WORK/sudobin:$PATH" ha_check_app_restart_sudo "angie" >/dev/null'
+[ "$?" = "0" ] && echo "$OUT" | grep -q "post-promote app restart"
+report "sudo preflight: a failed probe WARNs (never dies) + names the inspection commands (0.3.35)" $?
+
+# the doctor tells the zombie's targeted verdict (record=primary,
+# local=standby - repmgrd's own refusal text) and warns on a
+# non-elevating repmgrd unit
+_dc335="$(sed -n '/^cmd_doctor()/,/^}/p' "$CLI")"
+echo "$_dc335" | grep -qF 'the metadata record says this node is PRIMARY but the local server runs as a STANDBY' \
+    && echo "$_dc335" | grep -qF 'node is registered as a primary but running as a' \
+    && echo "$_dc335" | grep -qF 'the metadata record says STANDBY but the local server is a PRIMARY' \
+    && echo "$_dc335" | grep -qF 'repmgr.service resolves NoNewPrivileges=yes'
+report "doctor: record-vs-role mismatch verdict + NoNewPrivileges warning (0.3.35)" $?
+
+# the manual repair's double-failure path neutralizes the zombie too (the
+# auto-rejoin's 14:0x leftover): attached = keep streaming, detached = stop
+_rr335="$(sed -n '/^rep_step_3_rejoin_or_clone()/,/^}/p' "$CLI")"
+echo "$_rr335" | grep -qF 'SELECT sender_host FROM pg_stat_wal_receiver' \
+    && echo "$_rr335" | grep -qF 'svc_stop "$HA_PG_SERVICE"'
+report "repair step 3: a double-failed rejoin leaves no zombie (attached keeps, detached stops) (0.3.35)" $?
 
 # ---------------------------------------------------------------------------
 echo

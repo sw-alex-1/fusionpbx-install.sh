@@ -1108,6 +1108,29 @@ rep_step_3_rejoin_or_clone() {
                     if [ "$_r3c_rc" -ne 0 ]; then
                         echo "$_r3c_out"
                         ha_rejoin_failure_forensics
+                        # 0.3.35: a rejoin that failed AFTER repmgr started
+                        # the server leaves a ZOMBIE standby (the 27.10 14:0x
+                        # boot: up on the new timeline, WAL receiver never
+                        # attached, the metadata record still 'primary' ->
+                        # repmgrd crash-loops and the startup process replays
+                        # the node's OWN divergent WAL tail onto the rewound
+                        # files). Attached = keep it streaming (the catchup is
+                        # valuable; a re-run of --repair finishes the
+                        # registration via the attached path); up but detached
+                        # = STOP (the documented SAFE state - the boot guard
+                        # admits the next repair's classification start).
+                        if pg_runuser_psql -tAc "SELECT 1" >/dev/null 2>&1; then
+                            if [ "$(pg_runuser_psql -tAc "SELECT sender_host FROM pg_stat_wal_receiver" | tr -d ' \r')" = "$(ha_peer_ip)" ]; then
+                                verbose "  the rejoin reported a failure twice, but the node IS up and"
+                                verbose "  streaming (catchup) - re-run --repair to finish the"
+                                verbose "  registration (the attached path does not interrupt it)"
+                            else
+                                verbose "  PostgreSQL is up but NOT attached - stopping it (the safe"
+                                verbose "  state: a zombie standby replays its own divergent WAL onto"
+                                verbose "  the rewound files and repmgrd crash-loops on the stale record)"
+                                svc_stop "$HA_PG_SERVICE"
+                            fi
+                        fi
                         die "node rejoin failed twice (see the forensics above).
 If the local PGDATA is damaged beyond rewind, re-run with: --repair --force-clone"
                     fi
@@ -1410,6 +1433,32 @@ Fix: fusionpbx-ha.sh --repair  (degrades to async) or restore the standby"
                 *) _dr_fail "repmgr sees ${_dc_nodes:-?}/3 active nodes - check the other nodes" ;;
             esac
         fi
+
+        # 4d. the metadata record vs the LOCAL role (0.3.35): the 27.10
+        # return of a crashed primary - the auto-rejoin's rejoin failed
+        # AFTER repmgr had started the server: PostgreSQL came up a
+        # standby on the new timeline, but the record still said 'primary'
+        # and repmgrd crash-looped ('node is registered as a primary but
+        # running as a standby'). A targeted verdict beats the generic
+        # 'service repmgr NOT active' journal tail. The local copy of the
+        # metadata is queryable on a read-only standby, so the check works
+        # in exactly the broken state it must describe.
+        if [ "$HA_NODE_ID" != "3" ]; then
+            _dcd_type="$(pg_runuser_psql -d "$HA_REPMGR_DB" -tAc \
+                "SELECT type FROM repmgr.nodes WHERE node_id=$HA_NODE_ID" 2>/dev/null | tr -d ' \r')"
+            if [ -n "$_dcd_type" ]; then
+                if [ "$_dcd_type" = "primary" ] && [ "$_dc_rc" = "1" ]; then
+                    _dr_fail "the metadata record says this node is PRIMARY but the local server runs as a STANDBY
+      (the return of a crashed primary whose rejoin did not complete - repmgrd
+      refuses to start: 'node is registered as a primary but running as a
+      standby'). Fix: fusionpbx-ha.sh --repair  (it re-classifies, rejoins if
+      diverged, refreshes the record and starts repmgrd)
+      (the doctor never modifies configurations)"
+                elif [ "$_dcd_type" = "standby" ] && [ "$_dc_rc" = "0" ]; then
+                    _dr_warn "the metadata record says STANDBY but the local server is a PRIMARY (a failover window or a stale record) - if it persists: fusionpbx-ha.sh --repair"
+                fi
+            fi
+        fi
     fi
 
     # 4b. failover quorum links (0.3.34): the 27.10 outage - the standby
@@ -1524,6 +1573,16 @@ Check: systemctl status haproxy $HA_AGENT_UNIT_NAME"
                 _dr_ok "PostgreSQL boot guard installed + automatic rejoin enabled (a crashed primary returns unattended)"
             else
                 _dr_warn "boot guard installed but the AUTOMATIC REJOIN is not enabled - a crashed primary stays down until a manual --repair (re-run this node's install command)"
+            fi
+            # 0.3.35: repmgrd must be able to ELEVATE - a stock-unit
+            # NoNewPrivileges=yes (the 27.10 13:57 promote: every sudo from
+            # the daemon died instantly and silently, the promoted node's
+            # apps hung on dead-peer sockets) breaks the post-promote app
+            # restart and every service_*_command. The drop-in sets 'no';
+            # this verifies the MERGED property.
+            _dc_nnp="$(systemctl show "$HA_REPMGRD_SERVICE" -p NoNewPrivileges --value 2>/dev/null | tr -d ' \r')"
+            if [ "$_dc_nnp" = "yes" ]; then
+                _dr_warn "repmgr.service resolves NoNewPrivileges=yes - sudo from repmgrd cannot elevate: the post-promote app restart dies silently (apps hang ~15-30 min after a failover). Re-run this node's install command (the drop-in fixes it)"
             fi
         else
             _dr_warn "PostgreSQL boot guard NOT installed - a hard-crashed primary will boot as a competing primary (re-run this node's install command)"

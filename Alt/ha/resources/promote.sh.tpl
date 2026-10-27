@@ -52,10 +52,19 @@ fi
 
 # Promote FIRST (the failover itself), then bring the local applications
 # back - never the other way around.
+# 0.3.35: the systemctl call is ABSOLUTE (the sudoers patterns are absolute
+# - a bare 'systemctl' leaves the match to sudo's PATH resolution, one more
+# way to fail) and the FIRST LINE of the captured error is printed - the
+# 27.10 13:57 promote swallowed the reason ('>/dev/null 2>&1') and all
+# three restarts died silently in the same second (the rules worked from
+# every other context; the reason never reached the log).
 if /usr/bin/repmgr standby promote -f "$REPMGR_CONF"; then
     for _psh_svc in @@APP_SERVICES@@; do
-        if ! sudo -n systemctl try-restart "$_psh_svc" >/dev/null 2>&1; then
-            echo "fusionpbx-ha promote.sh: WARNING: could not restart $_psh_svc - requests caught mid-flight to the dead peer hang until TCP timeout" >&2
+        _psh_rc=0
+        _psh_err="$(sudo -n /usr/bin/systemctl try-restart "$_psh_svc" 2>&1)" || _psh_rc=$?
+        if [ "$_psh_rc" -ne 0 ]; then
+            _psh_reason="$(printf '%s' "$_psh_err" | head -n 1)"
+            echo "fusionpbx-ha promote.sh: WARNING: could not restart $_psh_svc (rc=$_psh_rc: ${_psh_reason:-no output}) - requests caught mid-flight to the dead peer hang until TCP timeout" >&2
         fi
     done
     exit 0

@@ -41,8 +41,12 @@ cat > "$FB/systemctl" <<'EOF'
 # 0.3.15/0.3.16: selective stub - SYSTEMCTL_INACTIVE (space-separated unit
 # list) makes those units report is-active=3, so the doctor's read-only
 # FAIL branches (inline journal + repmgrd log tails) become reachable.
-# NOTE: the real callers pass flags before the unit ('is-active --quiet
-# repmgr') - the unit is the LAST non-flag argument, not $2
+# 0.3.35: SYSTEMCTL_NNPRIV answers the 'show -p NoNewPrivileges --value'
+# probe (the doctor warns when repmgrd cannot elevate).
+if [ "$1" = "show" ] && echo "$*" | grep -q "NoNewPrivileges"; then
+    echo "${SYSTEMCTL_NNPRIV:-no}"
+    exit 0
+fi
 _unit=""
 for _a in "$@"; do
     case "$_a" in
@@ -100,6 +104,7 @@ case "$_sql" in
     *"SHOW shared_preload_libraries"*) echo "${PSQL_PRELOAD-repmgr}" ;;
     *"ALTER SYSTEM SET shared_preload_libraries"*) echo alter >>"${PSQL_ALTER_LOG:-/dev/null}" 2>/dev/null; exit 0 ;;
     *"count(*) FROM repmgr.nodes"*) echo "${PSQL_NODES:-3}" ;;
+    *"SELECT type FROM repmgr.nodes"*) echo "${PSQL_NODE_TYPE:-}" ;;
     *"SELECT 1"*) echo 1 ;;
     *"SELECT 1 FROM pg_roles"*) echo 1 ;;
     *"SELECT 1 FROM pg_database"*) echo 1 ;;
@@ -277,6 +282,17 @@ chmod 600 "$WORK/sshdir/authorized_keys"
 } > "$WORK/.pgpass"
 chmod 600 "$WORK/.pgpass"
 cp "$WORK/.pgpass" "$WORK/.pgpass.pristine"
+
+# 0.3.35: the boot guard + auto-rejoin fixture (the installer flows die at
+# the packages step in the sandbox, so the files never appear on their own;
+# the doctor's guard-present branch - and the NoNewPrivileges warning inside
+# it - must be reachable)
+mkdir -p "$WORK/systemd/postgresql.service.d"
+printf '#!/bin/sh\nexit 0\n' > "$WORK/lib/pg-boot-guard.sh"
+printf '#!/bin/sh\nexit 0\n' > "$WORK/lib/pg-auto-rejoin.sh"
+chmod 755 "$WORK/lib/pg-boot-guard.sh" "$WORK/lib/pg-auto-rejoin.sh"
+: > "$WORK/etc/boot-guard.conf"
+: > "$WORK/systemd/postgresql.service.d/fusionpbx-ha.conf"
 
 # run the real script in the sandbox. Args after the environment file.
 ha_cli() {
@@ -565,6 +581,34 @@ ha_cli --doctor > "$WORK/out.log" 2>&1; _rc=$?
   && grep -q "cannot authenticate to ANY node" "$WORK/out.log"
 report "--doctor FAILS on a missing .pgpass" "$?"
 mv "$WORK/.pgpass.away" "$WORK/.pgpass"
+
+echo "== --doctor: metadata record says PRIMARY but the server runs as a STANDBY (0.3.35: the 27.10 return) =="
+# the auto-rejoin's rejoin failed after repmgr had started the server:
+# PostgreSQL up as a standby, the record still 'primary', repmgrd refusing
+# to start - the targeted verdict names the fix command
+PSQL_RECOVERY=t PSQL_NODE_TYPE=primary ha_cli --doctor > "$WORK/out.log" 2>&1; _rc=$?
+[ "$_rc" = "1" ] \
+  && grep -qF "the metadata record says this node is PRIMARY but the local server runs as a STANDBY" "$WORK/out.log" \
+  && grep -q "node is registered as a primary but running as a" "$WORK/out.log" \
+  && grep -q -- "--repair" "$WORK/out.log" \
+  && grep -q "never modifies configurations" "$WORK/out.log"
+report "--doctor FAILS on record=primary + local=standby with the fix command (0.3.35)" "$?" "$(grep -m1 'metadata record' "$WORK/out.log")"
+
+echo "== --doctor: record says STANDBY but the server is a PRIMARY (0.3.35) =="
+# a failover window or a stale record - a WARNING, the doctor stays green
+PSQL_RECOVERY=f PSQL_NODE_TYPE=standby ha_cli --doctor > "$WORK/out.log" 2>&1; _rc=$?
+[ "$_rc" = "0" ] \
+  && grep -qF "the metadata record says STANDBY but the local server is a PRIMARY" "$WORK/out.log"
+report "--doctor WARNs on record=standby + local=primary (stays green) (0.3.35)" "$?"
+
+echo "== --doctor: repmgrd cannot elevate (NoNewPrivileges, 0.3.35) =="
+# the 27.10 13:57 promote: every sudo from the daemon died instantly - the
+# post-promote app restart is dead while the rules are perfectly fine
+SYSTEMCTL_NNPRIV=yes ha_cli --doctor > "$WORK/out.log" 2>&1; _rc=$?
+[ "$_rc" = "0" ] \
+  && grep -qF "repmgr.service resolves NoNewPrivileges=yes" "$WORK/out.log" \
+  && grep -q "post-promote app restart dies silently" "$WORK/out.log"
+report "--doctor WARNs when repmgrd cannot elevate (NoNewPrivileges=yes) (0.3.35)" "$?"
 
 echo "== --doctor: NTP out of sync =="
 TIMEDATECTL_VALUE=no ha_cli --doctor > "$WORK/out.log" 2>&1; _rc=$?

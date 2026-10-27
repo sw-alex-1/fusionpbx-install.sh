@@ -192,6 +192,15 @@ StartLimitIntervalSec=0
 # /etc/sysconfig/repmgr ships the variable commented out - defining it as
 # empty keeps the command line identical and the warning gone
 Environment=REPMGRD_OPTS=
+# 0.3.35: the stock ALT unit may ship systemd hardening (NoNewPrivileges
+# and friends) - under NoNewPrivileges the setuid bit is IGNORED and every
+# sudo call from repmgrd's context dies instantly (the 27.10 13:57 promote:
+# all three post-promote app restarts failed in the same second while the
+# SAME rules worked from every other context - the repair SSH sessions and
+# the root-run auto-rejoin unit). repmgr's own design (service_*_command,
+# promote wrappers) REQUIRES elevation from this unit; NoNewPrivileges
+# breaks all of it, so it is explicitly turned off
+NoNewPrivileges=no
 # 0.3.21: repmgrd exits if the local database is not reachable within
 # reconnect_attempts*reconnect_interval (a boot race with a slow standby
 # replay is enough) - bring it back until PostgreSQL answers. An explicit
@@ -216,7 +225,16 @@ DROPIN
     }
     rm -f "$_hrd_tmp"
     systemctl daemon-reload 2>/dev/null || true
-    verbose "  repmgrd unit drop-in installed: $_hrd_conf (ordering + REPMGRD_OPTS + auto-restart)"
+    # 0.3.35: verify the merged property actually flipped - a stock unit
+    # directive a drop-in cannot override would keep repmgrd's sudo broken
+    # (the 27.10 promote: instant silent sudo failures from the daemon)
+    _hrd_nnp="$(systemctl show "$HA_REPMGRD_SERVICE" -p NoNewPrivileges --value 2>/dev/null | tr -d ' \r')"
+    if [ "$_hrd_nnp" = "yes" ]; then
+        warn "  repmgr.service still resolves NoNewPrivileges=yes after the drop-in -
+  every sudo call from repmgrd (the post-promote app restart, the
+  service_*_command paths) will fail instantly. Inspect: systemctl cat $HA_REPMGRD_SERVICE"
+    fi
+    verbose "  repmgrd unit drop-in installed: $_hrd_conf (ordering + REPMGRD_OPTS + auto-restart + NoNewPrivileges=no)"
     return 0
 }
 
@@ -1907,6 +1925,38 @@ inspect the unit:  systemctl status $HA_AGENT_UNIT_NAME -n 30 --no-pager"
     verbose "  role-agent is answering (HTTP $(ha_agent_code 127.0.0.1))"
 }
 
+# 0.3.35: pre-verify the post-promote app-restart sudo path (as user
+# postgres, the exact identity promote.sh runs under). WARN-only: sudo is
+# optional by design (the promote itself never depends on it), but the
+# 27.10 13:57 promote restarted NOTHING - all three 'sudo -n systemctl
+# try-restart' calls died instantly and silently (the reason was swallowed
+# by '>/dev/null 2>&1'), leaving the promoted node's apps hanging on
+# dead-peer sockets for tcp_retries2. NOTE: this probe runs from the
+# installer's context - it proves the RULE SET, not the repmgrd-unit
+# context (a stock-unit NoNewPrivileges=yes breaks sudo there regardless
+# of the rules; ha_install_repmgr_dropin verifies and overrides that).
+ha_check_app_restart_sudo() {
+    _cas_apps="${1:-}"
+    [ -n "$_cas_apps" ] || return 0
+    cmd_exists sudo || return 0
+    cmd_exists runuser || return 0
+    for _cas_svc in $_cas_apps; do
+        if ! runuser -u postgres -- sudo -n -l \
+                /usr/bin/systemctl try-restart "$_cas_svc" >/dev/null 2>&1; then
+            warn "  post-promote app restart: 'sudo -n -l /usr/bin/systemctl try-restart $_cas_svc' (as postgres) FAILED -
+      after a failover, promote.sh's app restart will die the same way and
+      the promoted node's apps will hang on dead-peer sockets (~15-30 min).
+      Inspect, in this order:
+        runuser -u postgres -- sudo -n -l
+        cat /etc/sudoers.d/fusionpbx-ha     (the APPS alias must list try-restart $_cas_svc)
+        cat /etc/sudoers.d/repmgr           (the RPM's own file - read AFTER ours, it can override)
+        systemctl cat repmgr                (NoNewPrivileges/ProtectSystem hardening breaks sudo from repmgrd)"
+            return 0
+        fi
+    done
+    verbose "  post-promote app restart: sudo path verified for: $_cas_apps"
+}
+
 ha_install_promote_sh() {
     mkdir -p "$HA_LIB_DIR" 2>/dev/null
     # 0.3.24: after a successful promote the wrapper restarts the local
@@ -1922,6 +1972,9 @@ ha_install_promote_sh() {
     ha_render "$HA_RES_DIR/promote.sh.tpl" "$HA_PROMOTE_SH" \
         "APP_SERVICES=$_hips_apps"
     chmod 0755 "$HA_PROMOTE_SH" 2>/dev/null || true
+    # 0.3.35: prove the sudo path while the operator is looking (the
+    # 27.10 promote proved the rules can be right and the calls still die)
+    ha_check_app_restart_sudo "$_hips_apps"
     verbose "  promote wrapper installed: $HA_PROMOTE_SH (post-promote app restart: $_hips_apps)"
 }
 
