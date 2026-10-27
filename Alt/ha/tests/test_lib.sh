@@ -1212,17 +1212,17 @@ echo "== the failover is not over until the apps are back (regression 0.3.24) ==
 
 rm -rf "$WORK/lib" "$WORK/sudoers"
 HA_LIB_DIR="$WORK/lib" HA_SUDOERS_DIR="$WORK/sudoers" lib_run 'ha_install_promote_sh'
-[ -x "$WORK/lib/promote.sh" ] && grep -qF 'sudo -n /usr/bin/systemctl try-restart' "$WORK/lib/promote.sh" \
+[ -x "$WORK/lib/promote.sh" ] && grep -qE 'sudo -n [^ ]+/systemctl try-restart "\$_psh_svc"' "$WORK/lib/promote.sh" \
     && grep -q 'for _psh_svc in' "$WORK/lib/promote.sh" \
     && grep -qF 'angie' "$WORK/lib/promote.sh" && grep -qF 'freeswitch' "$WORK/lib/promote.sh" \
     && ! grep -q '@@' "$WORK/lib/promote.sh"
-report "ha_install_promote_sh: renders executable, app list resolved (0.3.24; absolute systemctl 0.3.35)" $? "$(cat "$WORK/lib/promote.sh" 2>/dev/null | head -c 80)"
+report "ha_install_promote_sh: renders executable, app list resolved (0.3.24; absolute systemctl 0.3.35; the path RENDERED 0.3.36)" $? "$(cat "$WORK/lib/promote.sh" 2>/dev/null | head -c 80)"
 
 HA_SUDOERS_DIR="$WORK/sudoers" lib_run 'ha_install_sudoers'
 [ -f "$WORK/sudoers/fusionpbx-ha" ] && grep -q 'FUSIONPBX_HA_APPS' "$WORK/sudoers/fusionpbx-ha" \
-    && grep -qF '/usr/bin/systemctl try-restart php*-fpm' "$WORK/sudoers/fusionpbx-ha" \
-    && grep -qF '/usr/bin/systemctl try-restart angie' "$WORK/sudoers/fusionpbx-ha" \
-    && grep -qF '/usr/bin/systemctl try-restart freeswitch' "$WORK/sudoers/fusionpbx-ha" \
+    && grep -qE '[^ ]+/systemctl try-restart php\*-fpm' "$WORK/sudoers/fusionpbx-ha" \
+    && grep -qE '[^ ]+/systemctl try-restart angie' "$WORK/sudoers/fusionpbx-ha" \
+    && grep -qE '[^ ]+/systemctl try-restart freeswitch' "$WORK/sudoers/fusionpbx-ha" \
     && grep -q 'postgres ALL=(root) NOPASSWD: FUSIONPBX_HA_PGCTL, FUSIONPBX_HA_APPS' "$WORK/sudoers/fusionpbx-ha"
 report "sudoers: restart-only app verbs for the promote wrapper (0.3.24)" $?
 
@@ -1912,6 +1912,9 @@ if [ "${_peer:-0}" = "1" ]; then
         *pg_is_in_recovery*) printf '%s' "${AR_PEER_RECOVERY:-}"; exit 0 ;;
         *pg_control_checkpoint*) printf '%s' "${AR_PEER_TLI:-4}"; exit 0 ;;
         *pg_read_file*) printf '%b' "${AR_PEER_HISTORY:-}"; exit 0 ;;
+        # 0.3.36: the rescued rejoin's registration looks up the peer's
+        # primary node id on the peer
+        *"node_id FROM repmgr.nodes"*) printf '%s' "${AR_PEER_PRIMARY_ID:-2}"; exit 0 ;;
         *"SELECT state FROM pg_stat_replication"*) printf '%s' "${AR_PEER_STREAM:-streaming}"; exit 0 ;;
         *"SELECT sync_state FROM pg_stat_replication"*) printf '%s' "${AR_PEER_SYNC:-sync}"; exit 0 ;;
         *"ALTER SYSTEM"*) exit 0 ;;
@@ -1921,6 +1924,16 @@ if [ "${_peer:-0}" = "1" ]; then
 fi
 echo "LOCAL $*" >> "$AR_PSQL_LOG"
 case "$*" in
+    # 0.3.36: the root-start rescue - the server is DOWN until the
+    # systemctl stub's start lands (AR_STARTED_FLAG present but the flag
+    # file missing) - ar_local_pg_up needs psql's OWN exit code (the
+    # tr-pipe in ar_local_psql masks it); up = exit 0, down = exit 1
+    *"SELECT 1"*)
+        if [ -n "${AR_STARTED_FLAG:-}" ] && [ ! -e "$AR_STARTED_FLAG" ]; then
+            exit 1
+        fi
+        exit 0
+        ;;
     *pg_is_in_recovery*) printf 't'; exit 0 ;;
     # 0.3.35: the zombie-vs-catchup gate of the failed-rejoin path
     # (AR_LOCAL_SENDER: empty = the WAL receiver never attached - the
@@ -1936,6 +1949,16 @@ echo "$@" >> "$AR_SYSCTL"
 if [ "$1" = "is-active" ]; then
     echo "${AR_IS_ACTIVE:-inactive}"
     exit 0
+fi
+# 0.3.36: AR_SYSCTL_START_FAIL=1 - the start FAILS: no flag, the server
+# stays down (the honest-down triage scenario)
+if [ "$1" = "start" ] && [ "${AR_SYSCTL_START_FAIL:-0}" = "1" ]; then
+    exit 1
+fi
+# 0.3.36: a successful root 'start postgresql' brings the local psql
+# stub to life (AR_STARTED_FLAG)
+if [ "$1" = "start" ] && [ -n "${AR_STARTED_FLAG:-}" ]; then
+    : > "$AR_STARTED_FLAG"
 fi
 exit 0
 EOF
@@ -1966,8 +1989,31 @@ EOF
 cat > "$WORK/arbin/repmgr" <<'EOF'
 #!/bin/sh
 echo "repmgr $*" >> "$AR_REPMGR_LOG"
-printf '%b' "${AR_REJOIN_OUT:-}"
-exit "${AR_REJOIN_RC:-0}"
+# 0.3.36: repmgr's create_recovery_file() writes standby.signal inside
+# 'node rejoin' BEFORE the inner start (repmgr-action-standby.c:8309) -
+# the rescue's marker gate depends on it. AR_REJOIN_RC applies to the
+# rejoin ONLY - the rescued path's 'standby register' is its own call
+# (AR_REGISTER_RC, default 0)
+case "$*" in
+    *"node rejoin"*)
+        : > "${AR_PGDATA:?}/standby.signal"
+        printf '%b' "${AR_REJOIN_OUT:-}"
+        exit "${AR_REJOIN_RC:-0}"
+        ;;
+esac
+exit "${AR_REGISTER_RC:-0}"
+EOF
+
+# 0.3.36: the inlined sudo self-heal probes (AR_SUDO_RC: 0 = healthy;
+# the mode-aware variant used by the heal scenario replaces this stub)
+cat > "$WORK/arbin/id" <<'EOF'
+#!/bin/sh
+[ "${1:-}" = "postgres" ] && exit 0
+exec /usr/bin/id "$@"
+EOF
+cat > "$WORK/arbin/sudo" <<'EOF'
+#!/bin/sh
+exit "${AR_SUDO_RC:-0}"
 EOF
 
 cat > "$WORK/arbin/pg_rewind" <<'EOF'
@@ -1982,10 +2028,11 @@ echo "pg_ctl $*" >> "$AR_PGCTL_LOG"
 exit 0
 EOF
 chmod +x "$WORK/arbin/"*
-# the stub log paths are exported once for the whole harness
+# the stub log paths are exported once for the whole harness (AR_PGDATA:
+# the repmgr stub writes standby.signal there on 'node rejoin', 0.3.36)
 export AR_PSQL_LOG="$WORK/ar-psql.log" AR_SYSCTL="$WORK/ar-sysctl.log" \
        AR_REPMGR_LOG="$WORK/ar-repmgr.log" AR_REWIND_LOG="$WORK/ar-rewind.log" \
-       AR_PGCTL_LOG="$WORK/ar-pgctl.log"
+       AR_PGCTL_LOG="$WORK/ar-pgctl.log" AR_PGDATA="$WORK/ardata"
 
 AR_CONF="$WORK/arconf/boot-guard.conf"
 cat > "$AR_CONF" <<EOF
@@ -2008,6 +2055,11 @@ BG_LSYNCD_SERVICE="lsyncd"
 BG_REJOIN_ATTEMPTS="2"
 BG_REJOIN_SLEEP="0"
 BG_MAX_GAP_MB="128"
+# 0.3.36: the root-start rescue waits (fast in the sandbox)
+BG_RESCUE_ANSWER_TRIES="3"
+BG_RESCUE_ANSWER_SLEEP="0"
+BG_RESCUE_ATTACH_TRIES="2"
+BG_RESCUE_ATTACH_SLEEP="0"
 EOF
 
 ar_run() {
@@ -2070,6 +2122,7 @@ report "auto-rejoin: fork gap over budget -> REFUSE (a human must decide)" "$_g"
 # HAPPY PATH: single failover topology, small gap -> unattended rejoin +
 # systemd adopt + daemons + sync back on the peer
 : > "$WORK/ar-psql.log"; : > "$WORK/ar-sysctl.log"; : > "$WORK/ar-repmgr.log"
+rm -f "$WORK/ardata/standby.signal" "$WORK/ar-started.flag"
 AR_PEER_HISTORY="$(printf '2\t0/3000000\t\n3\t0/5000000\tfailover')" \
 AR_CTL_LSN="0/5001000" AR_PEER_TLI=4 AR_PEER_STREAM=streaming AR_PEER_SYNC=sync \
 AR_IS_ACTIVE="inactive" AR_REJOIN_RC=0 \
@@ -2095,6 +2148,7 @@ report "auto-rejoin: happy path (rejoin + adopt + daemons + sync on the peer)" "
 # zombie standby (stale 'primary' record, own-divergent-WAL replay,
 # repmgrd crash-loop) - it must be STOPPED (PG + repmgrd), not left behind
 : > "$WORK/ar-repmgr.log"; : > "$WORK/ar-rewind.log"; : > "$WORK/ar-sysctl.log"
+rm -f "$WORK/ardata/standby.signal" "$WORK/ar-started.flag"
 AR_PEER_HISTORY="$(printf '2\t0/3000000\t\n3\t0/5000000\tfailover')" \
 AR_CTL_LSN="0/5001000" AR_IS_ACTIVE="inactive" \
 AR_REJOIN_RC=1 AR_REJOIN_OUT='pg_rewind: error: unable to open temporary file\\n' \
@@ -2112,22 +2166,124 @@ if [ "$_g_rc" = "1" ] && echo "$OUT" | grep -q "REJOIN FAILED" \
     && [ ! -e "$WORK/ar-repair.flag" ]; then _g=0; fi
 report "auto-rejoin: failed rejoin, PG up but NOT attached -> zombie STOPPED (PG + repmgrd), rewind --debug captured, one retry, guard flag closed" "$_g" "$(echo "$OUT" | tail -3)"
 
-# the other leftover (0.3.35): the rejoin failed at a LATER stage - the WAL
-# receiver IS attached (catchup): the catchup is valuable, the node must be
-# left RUNNING with an actionable message (a reboot would waste it)
+# the other leftover (0.3.35 -> rescued by 0.3.36): the rejoin failed at a
+# LATER stage - the WAL receiver IS attached (catchup): the catchup is
+# valuable. 0.3.35 left it running with a 'run --repair' message and a
+# STALE record (repmgrd would crash-loop on it); 0.3.36 finishes the job
+# right there: the rescue returns attached, the record is refreshed
+# ('standby register --force' - a metadata write, the streaming keeps
+# going), the daemons converge, sync re-enables - AUTO-REJOIN COMPLETE
 : > "$WORK/ar-repmgr.log"; : > "$WORK/ar-sysctl.log"
+rm -f "$WORK/ardata/standby.signal" "$WORK/ar-started.flag"
 AR_PEER_HISTORY="$(printf '2\t0/3000000\t\n3\t0/5000000\tfailover')" \
 AR_CTL_LSN="0/5001000" AR_IS_ACTIVE="inactive" \
 AR_REJOIN_RC=1 AR_REJOIN_OUT='ERROR: timeout waiting for node to attach\\n' \
-AR_LOCAL_SENDER="10.0.0.12" \
+AR_LOCAL_SENDER="10.0.0.12" AR_PEER_STREAM=streaming AR_PEER_SYNC=sync \
 AR_CURL_CODE=200 AR_PEER_RECOVERY="" AR_CTL_STATE="in production" ar_run; _g_rc=$?
 _g=1
-if [ "$_g_rc" = "1" ] && echo "$OUT" | grep -q "REJOIN FAILED" \
-    && echo "$OUT" | grep -q "IS up and streaming from the peer" \
-    && echo "$OUT" | grep -q "Do NOT" \
-    && ! grep -q '^stop repmgr$' "$WORK/ar-sysctl.log" \
+if [ "$_g_rc" = "0" ] && echo "$OUT" | grep -q "AUTO-REJOIN COMPLETE" \
+    && [ "$(grep -c 'node rejoin' "$WORK/ar-repmgr.log")" = "1" ] \
+    && grep -q 'standby register --upstream-node-id=2 --force' "$WORK/ar-repmgr.log" \
+    && echo "$OUT" | grep -q "record refreshed" \
+    && grep -q '^restart repmgr$' "$WORK/ar-sysctl.log" \
+    && echo "$OUT" | grep -q "synchronous replication re-enabled" \
     && [ ! -e "$WORK/ar-repair.flag" ]; then _g=0; fi
-report "auto-rejoin: failed rejoin, PG up AND attached -> left running, --repair named (0.3.35)" "$_g" "$(echo "$OUT" | tail -3)"
+report "auto-rejoin: failed rejoin, PG up AND attached -> RESCUED: register + daemons + sync, NO double rewind (0.3.36)" "$_g" "$(echo "$OUT" | tail -3)"
+
+# 0.3.36: the 27.10 14:0x shape - the rejoin's DATA work done (rewind,
+# standby.signal, primary_conninfo) but the inner 'sudo systemctl start'
+# DEAD (the exec-level sudo breakage) and the server DOWN: the unit runs
+# as ROOT - it starts PostgreSQL itself, waits for the answer, proves the
+# WAL receiver attached and finishes the registration; the rejoin retry
+# (a second pg_rewind over the finished rewind - the WAL-limbo deepener)
+# never happens
+: > "$WORK/ar-repmgr.log"; : > "$WORK/ar-sysctl.log"; : > "$WORK/ar-psql.log"
+rm -f "$WORK/ardata/standby.signal" "$WORK/ar-started.flag"
+AR_PEER_HISTORY="$(printf '2\t0/3000000\t\n3\t0/5000000\tfailover')" \
+AR_CTL_LSN="0/5001000" AR_IS_ACTIVE="inactive" \
+AR_REJOIN_RC=1 AR_REJOIN_OUT='NOTICE: executing pg_rewind\\nERROR: unable to start server\\n' \
+AR_STARTED_FLAG="$WORK/ar-started.flag" \
+AR_LOCAL_SENDER="10.0.0.12" AR_PEER_STREAM=streaming AR_PEER_SYNC=sync \
+AR_CURL_CODE=200 AR_PEER_RECOVERY="" AR_CTL_STATE="in production" ar_run; _g_rc=$?
+_g=1
+if [ "$_g_rc" = "0" ] && echo "$OUT" | grep -q "AUTO-REJOIN COMPLETE" \
+    && echo "$OUT" | grep -q "rescue: the rejoin's data work is done" \
+    && [ "$(grep -c 'node rejoin' "$WORK/ar-repmgr.log")" = "1" ] \
+    && grep -q 'standby register --upstream-node-id=2 --force' "$WORK/ar-repmgr.log" \
+    && grep -q '^start postgresql$' "$WORK/ar-sysctl.log" \
+    && grep -q '^restart repmgr$' "$WORK/ar-sysctl.log" \
+    && echo "$OUT" | grep -q "synchronous replication re-enabled" \
+    && [ ! -e "$WORK/ar-repair.flag" ]; then _g=0; fi
+report "auto-rejoin: inner start DEAD, data work done -> ROOT-START RESCUE + register + complete (0.3.36)" "$_g" "$(echo "$OUT" | tail -3)"
+
+# 0.3.36: the start itself FAILS (a damaged data dir, a systemd refusal):
+# the rescue declines twice, the rejoin is retried once, the triage
+# honestly reports the server DOWN (ar_local_pg_up - psql's own exit
+# code, not the tr-masked pipeline that called every server 'up') - the
+# SAFE state, --repair named
+: > "$WORK/ar-repmgr.log"; : > "$WORK/ar-sysctl.log"
+rm -f "$WORK/ardata/standby.signal" "$WORK/ar-started.flag"
+AR_PEER_HISTORY="$(printf '2\t0/3000000\t\n3\t0/5000000\tfailover')" \
+AR_CTL_LSN="0/5001000" AR_IS_ACTIVE="inactive" \
+AR_REJOIN_RC=1 AR_REJOIN_OUT='ERROR: unable to start server\\n' \
+AR_STARTED_FLAG="$WORK/ar-started.flag" AR_SYSCTL_START_FAIL=1 \
+AR_LOCAL_SENDER="" \
+AR_CURL_CODE=200 AR_PEER_RECOVERY="" AR_CTL_STATE="in production" ar_run; _g_rc=$?
+_g=1
+if [ "$_g_rc" = "1" ] && echo "$OUT" | grep -q "rescue: PostgreSQL did not start" \
+    && echo "$OUT" | grep -q "PostgreSQL stays down (the SAFE state)" \
+    && [ "$(grep -c 'node rejoin' "$WORK/ar-repmgr.log")" = "2" ] \
+    && [ ! -e "$WORK/ar-repair.flag" ]; then _g=0; fi
+report "auto-rejoin: the rescue start fails -> honest 'stays down' verdict + one retry (0.3.36)" "$_g" "$(echo "$OUT" | tail -3)"
+
+# 0.3.36: the inlined sudo self-heal - the 27.10 shape: postgres cannot
+# EXECUTE sudo (the stub returns failure while its own mode is 0755 - no
+# setuid, the 'runuser: невозможно выполнить sudo: Отказано в доступе'
+# bench shape). The heal chmods 4755 (setuid root), re-probes, verifies -
+# and the rejoin then completes through the rescue belt anyway
+mv "$WORK/arbin/sudo" "$WORK/arbin/sudo.rc-knob"
+cat > "$WORK/arbin/sudo" <<'EOF'
+#!/bin/sh
+# healthy only after the heal: rc 0 iff this very file is setuid 4755
+[ "$(stat -c %a "$0")" = "4755" ] && exit 0
+exit 1
+EOF
+chmod 755 "$WORK/arbin/sudo"
+: > "$WORK/ar-repmgr.log"; : > "$WORK/ar-sysctl.log"
+rm -f "$WORK/ardata/standby.signal" "$WORK/ar-started.flag"
+AR_PEER_HISTORY="$(printf '2\t0/3000000\t\n3\t0/5000000\tfailover')" \
+AR_CTL_LSN="0/5001000" AR_IS_ACTIVE="inactive" \
+AR_REJOIN_RC=1 AR_REJOIN_OUT='ERROR: unable to start server\\n' \
+AR_STARTED_FLAG="$WORK/ar-started.flag" \
+AR_LOCAL_SENDER="10.0.0.12" AR_PEER_STREAM=streaming AR_PEER_SYNC=sync \
+AR_CURL_CODE=200 AR_PEER_RECOVERY="" AR_CTL_STATE="in production" ar_run; _g_rc=$?
+_g=1
+if [ "$_g_rc" = "0" ] && echo "$OUT" | grep -q "sudo AS THE POSTGRES USER FAILED" \
+    && echo "$OUT" | grep -q "healed: " \
+    && echo "$OUT" | grep -q "sudo as the postgres user: HEALED" \
+    && [ "$(stat -c %a "$WORK/arbin/sudo")" = "4755" ] \
+    && echo "$OUT" | grep -q "AUTO-REJOIN COMPLETE"; then _g=0; fi
+report "auto-rejoin: the inlined sudo heal (chmod 4755, re-probe, verified) before the rejoin (0.3.36)" "$_g" "$(echo "$OUT" | grep -m1 'sudo' | head -1)"
+mv "$WORK/arbin/sudo.rc-knob" "$WORK/arbin/sudo"
+
+# 0.3.36: an UNHEALABLE sudo - the heal warns (the ROOT-START RESCUE is
+# named as the fallback) and the flow continues to a full rescue anyway
+: > "$WORK/ar-repmgr.log"; : > "$WORK/ar-sysctl.log"
+rm -f "$WORK/ardata/standby.signal" "$WORK/ar-started.flag"
+AR_SUDO_RC=1 \
+AR_PEER_HISTORY="$(printf '2\t0/3000000\t\n3\t0/5000000\tfailover')" \
+AR_CTL_LSN="0/5001000" AR_IS_ACTIVE="inactive" \
+AR_REJOIN_RC=1 AR_REJOIN_OUT='ERROR: unable to start server\\n' \
+AR_STARTED_FLAG="$WORK/ar-started.flag" \
+AR_LOCAL_SENDER="10.0.0.12" AR_PEER_STREAM=streaming AR_PEER_SYNC=sync \
+AR_CURL_CODE=200 AR_PEER_RECOVERY="" AR_CTL_STATE="in production" ar_run; _g_rc=$?
+chmod 755 "$WORK/arbin/sudo"   # restore the knob stub the heal chmod'ed
+_g=1
+if [ "$_g_rc" = "0" ] && echo "$OUT" | grep -q "the heal did not help" \
+    && echo "$OUT" | grep -q "ROOT-START RESCUE" \
+    && echo "$OUT" | grep -q "AUTO-REJOIN COMPLETE"; then _g=0; fi
+report "auto-rejoin: an unhealable sudo WARNs and the rescue completes the rejoin anyway (0.3.36)" "$_g" "$(echo "$OUT" | tail -3)"
+rm -f "$WORK/ardata/standby.signal" "$WORK/ar-started.flag"
 
 # installer contract: the auto-rejoin script + unit + new conf keys
 HA_LIB_DIR="$WORK/lib" HA_SYSTEMD_DIR="$WORK/systemd" lib_run '
@@ -2146,8 +2302,10 @@ if [ -x "$WORK/lib/pg-auto-rejoin.sh" ] \
     && grep -q '^BG_REJOIN_ATTEMPTS="45"$' "$WORK/etc/boot-guard.conf" \
     && grep -q '^BG_MAX_GAP_MB="128"$' "$WORK/etc/boot-guard.conf" \
     && grep -q '^BG_PG_SERVICE="postgresql"$' "$WORK/etc/boot-guard.conf" \
+    && grep -q '^BG_RESCUE_ANSWER_TRIES="60"$' "$WORK/etc/boot-guard.conf" \
+    && grep -q '^BG_RESCUE_ATTACH_TRIES="15"$' "$WORK/etc/boot-guard.conf" \
     && ! grep -q 'PASSWORD' "$WORK/etc/boot-guard.conf"; then _g=0; fi
-report "auto-rejoin install: script + unit + rendered conf keys (secret-free)" "$_g" "$(echo "$OUT" | head -3)"
+report "auto-rejoin install: script + unit + rendered conf keys incl. the rescue waits (secret-free)" "$_g" "$(echo "$OUT" | head -3)"
 
 # 0.3.30: repmgr (as postgres) must never inherit a pam_mktemp-poisoned
 # TMPDIR from a manual SSH run - "unable to open temporary file" died
@@ -2215,9 +2373,11 @@ report "scrub: called in repair step 4, primary repair step 3, init register, jo
 report "repmgr.conf.tpl: conninfo carries no password token (0.3.33)" $?
 
 # sudoers alias carries the read-only 'show' verb for the preflight probe
+# (0.3.36: the alias is BUILT per systemctl path - grep the verb, not a
+# hard-coded binary path)
 _sud333="$(sed -n '/^ha_install_sudoers()/,/^}/p' "$LIB")"
-echo "$_sud333" | grep -q 'systemctl show postgresql'
-report "sudoers: read-only 'show' verb for the rejoin preflight (0.3.33)" $?
+echo "$_sud333" | grep -q 'show postgresql'
+report "sudoers: read-only 'show' verb for the rejoin preflight (0.3.33/0.3.36)" $?
 
 # the preflight proves the path AS POSTGRES (runuser + sudo -n)
 _pre333="$(sed -n '/^ha_preflight_repmgr_service_commands()/,/^}/p' "$LIB")"
@@ -2277,12 +2437,14 @@ report "layout: dual resource-dir resolution, exported HA_RES_DIR wins (0.3.34)"
 
 # promote.sh: ABSOLUTE systemctl (the sudoers patterns are absolute) and
 # the FIRST LINE of the captured error in the warning (the reason must
-# reach repmgrd.log - the 13:57 promote left nothing to diagnose)
+# reach repmgrd.log - the 13:57 promote left nothing to diagnose).
+# 0.3.36: the path is the @@SYSTEMCTL_PATH@@ render (the resolved binary
+# of THIS node - /usr/bin and /sbin systemctl both exist in the ALT world)
 _tpl335="$(cat "$RES/promote.sh.tpl")"
-echo "$_tpl335" | grep -qF 'sudo -n /usr/bin/systemctl try-restart "$_psh_svc" 2>&1' \
+echo "$_tpl335" | grep -qF 'sudo -n @@SYSTEMCTL_PATH@@ try-restart "$_psh_svc" 2>&1' \
     && echo "$_tpl335" | grep -qF 'head -n 1' \
     && echo "$_tpl335" | grep -qF 'rc=$_psh_rc: ${_psh_reason:-no output}'
-report "promote.sh: absolute systemctl + the captured sudo reason in the warning (0.3.35)" $?
+report "promote.sh: rendered absolute systemctl + the captured sudo reason in the warning (0.3.35/0.3.36)" $?
 
 # the repmgrd drop-in turns NoNewPrivileges off (the only context where
 # sudo was ever seen failing is the daemon's own unit) and VERIFIES the
@@ -2296,10 +2458,11 @@ report "repmgrd drop-in: NoNewPrivileges=no + merged-property verification (0.3.
 # postgres, sudo -n -l) and stays WARN-only tolerant
 _chk335="$(sed -n '/^ha_check_app_restart_sudo()/,/^}/p' "$LIB")"
 echo "$_chk335" | grep -qF 'runuser -u postgres -- sudo -n -l' \
-    && echo "$_chk335" | grep -qF '/usr/bin/systemctl try-restart' \
+    && echo "$_chk335" | grep -qF '"$_cas_bin" try-restart "$_cas_svc"' \
+    && echo "$_chk335" | grep -qF 'ha_systemctl_path' \
     && echo "$_chk335" | grep -qF 'cmd_exists sudo || return 0' \
     && echo "$_chk335" | grep -qF 'cat /etc/sudoers.d/repmgr'
-report "sudo preflight: sudo -n -l as postgres, tolerant, names the RPM's own sudoers file (0.3.35)" $?
+report "sudo preflight: sudo -n -l as postgres (the RESOLVED systemctl path), tolerant, names the RPM's own sudoers file (0.3.35/0.3.36)" $?
 _prom335="$(sed -n '/^ha_install_promote_sh()/,/^}/p' "$LIB")"
 echo "$_prom335" | grep -qF 'ha_check_app_restart_sudo "$_hips_apps"'
 report "sudo preflight: called from every promote-wrapper install (0.3.35)" $?
@@ -2327,8 +2490,11 @@ chmod +x "$WORK/sudobin/"*
 : > "$WORK/sudo-probe.log"
 SUDO_PROBE_LOG="$WORK/sudo-probe.log" SUDO_PROBE_RC=0 lib_run '
     PATH="$WORK/sudobin:$PATH" ha_check_app_restart_sudo "php8.3-fpm angie freeswitch" >/dev/null'
-[ "$?" = "0" ] && [ "$(grep -c 'sudo -n -l /usr/bin/systemctl try-restart' "$WORK/sudo-probe.log")" = "3" ]
-report "sudo preflight: 3 probes, rc=0 path silent (0.3.35)" $?
+# 0.3.36: the probe carries the RESOLVED systemctl path (in this sandbox
+# lib_run's fakebin provides its own systemctl stub - the path is whatever
+# ha_systemctl_path resolves on the machine running the tests)
+[ "$?" = "0" ] && [ "$(grep -cE 'sudo -n -l .*systemctl try-restart' "$WORK/sudo-probe.log")" = "3" ]
+report "sudo preflight: 3 probes (the RESOLVED systemctl path), rc=0 path silent (0.3.35/0.3.36)" $?
 SUDO_PROBE_LOG="$WORK/sudo-probe.log" SUDO_PROBE_RC=1 lib_run '
     PATH="$WORK/sudobin:$PATH" ha_check_app_restart_sudo "angie" >/dev/null'
 [ "$?" = "0" ] && echo "$OUT" | grep -q "post-promote app restart"
@@ -2350,6 +2516,149 @@ _rr335="$(sed -n '/^rep_step_3_rejoin_or_clone()/,/^}/p' "$CLI")"
 echo "$_rr335" | grep -qF 'SELECT sender_host FROM pg_stat_wal_receiver' \
     && echo "$_rr335" | grep -qF 'svc_stop "$HA_PG_SERVICE"'
 report "repair step 3: a double-failed rejoin leaves no zombie (attached keeps, detached stops) (0.3.35)" $?
+
+# ---------------------------------------------------------------------------
+# 0.3.36: the 27.10 forensics closed the 0.3.35 question - sudo died at
+# the EXEC level for the postgres user (EACCES on the binary itself: ALT's
+# 'control sudo' restriction / a mode drift) on BOTH data nodes; the
+# rejoin's DATA work completed before its inner start died, the repair
+# preflight stopped PostgreSQL BEFORE dying itself, and lsyncd died at
+# boot on the client -s (lsyncd's protect_args default) that the hardened
+# ALT rrsync refuses.
+# ---------------------------------------------------------------------------
+
+# ha_systemctl_path: the RESOLVED binary (a stub via PATH) with the
+# /usr/bin fallback when nothing resolves
+mkdir -p "$WORK/sysctlbin"
+printf '#!/bin/sh\nexit 0\n' > "$WORK/sysctlbin/systemctl"
+chmod 755 "$WORK/sysctlbin/systemctl"
+lib_run 'PATH="$WORK/sysctlbin:$PATH" ha_systemctl_path'
+[ "$OUT" = "$WORK/sysctlbin/systemctl" ]
+report "ha_systemctl_path: resolves the PATH binary (0.3.36)" $?
+lib_run 'PATH="/nonexistent-ha-test-bin" ha_systemctl_path'
+[ "$OUT" = "/usr/bin/systemctl" ]
+report "ha_systemctl_path: /usr/bin/systemctl fallback (0.3.36)" $?
+
+# ha_sudo_probe / ha_sudo_heal: behavioral (scoped stubs - id: the
+# postgres existence probe; runuser: the argument stripper; sudo: rc knob
+# or the mode-aware heal variant). On the 27.10 bench the real shape was
+# exec-level EACCES - the heal restores 4755 (setuid root, executable by
+# every user; sudoers still bounds WHAT postgres may run).
+mkdir -p "$WORK/sudobin36"
+cat > "$WORK/sudobin36/id" <<'EOF'
+#!/bin/sh
+[ "${1:-}" = "postgres" ] && exit 0
+exec /usr/bin/id "$@"
+EOF
+cat > "$WORK/sudobin36/runuser" <<'EOF'
+#!/bin/sh
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -u) shift 2 ;;
+        --) shift; break ;;
+        *) break ;;
+    esac
+done
+exec "$@"
+EOF
+cat > "$WORK/sudobin36/sudo" <<'EOF'
+#!/bin/sh
+exit "${SUDO_PROBE_RC:-0}"
+EOF
+chmod 755 "$WORK/sudobin36/"*
+SUDO_PROBE_RC=0 lib_run 'PATH="$WORK/sudobin36:$PATH" ha_sudo_probe'
+[ "$?" = "0" ]
+report "ha_sudo_probe: a healthy postgres->sudo path -> rc 0 (0.3.36)" $?
+SUDO_PROBE_RC=0 lib_run 'PATH="$WORK/sudobin36:$PATH" ha_sudo_heal >/dev/null; echo rc=$?'
+[ "$(echo "$OUT" | tail -1)" = "rc=0" ] && ! echo "$OUT" | grep -q "BROKEN"
+report "ha_sudo_heal: a healthy path is silent, rc 0 (0.3.36)" $?
+# the HEALED shape: the stub is healthy only once its own mode is 4755
+mv "$WORK/sudobin36/sudo" "$WORK/sudobin36/sudo.rc"
+cat > "$WORK/sudobin36/sudo" <<'EOF'
+#!/bin/sh
+[ "$(stat -c %a "$0")" = "4755" ] && exit 0
+exit 1
+EOF
+chmod 755 "$WORK/sudobin36/sudo"
+SUDO_PROBE_LOG="$WORK/sudo-heal.log" lib_run 'PATH="$WORK/sudobin36:$PATH" ha_sudo_heal >/dev/null 2>&1; echo rc=$?'
+[ "$(echo "$OUT" | tail -1)" = "rc=0" ] \
+    && [ "$(stat -c %a "$WORK/sudobin36/sudo")" = "4755" ]
+report "ha_sudo_heal: the exec-level breakage healed (mode -> 4755, re-probe verified) (0.3.36)" "$?" "mode=$(stat -c %a "$WORK/sudobin36/sudo" 2>/dev/null)"
+mv "$WORK/sudobin36/sudo.rc" "$WORK/sudobin36/sudo"
+# the UNHEALABLE shape: the heal warns (naming the rescue as the fallback
+# + the inspection commands) and returns 1 - never dies
+SUDO_PROBE_RC=1 lib_run 'PATH="$WORK/sudobin36:$PATH" ha_sudo_heal >/dev/null 2>&1; echo rc=$?'
+[ "$(echo "$OUT" | tail -1)" = "rc=1" ]
+chmod 755 "$WORK/sudobin36/sudo"   # restore the rc-knob stub the heal chmod'ed
+report "ha_sudo_heal: an unhealable path warns + rc 1, never dies (0.3.36)" $?
+
+# the sudoers alias covers EVERY systemctl path that exists on the node
+# (the ALT world offers both /usr/bin/systemctl and /sbin/systemctl; the
+# repmgr RPM's own sudoers file pins the latter, our old alias only the
+# former) - render with a stub PATH binary and count the stanzas
+rm -rf "$WORK/sudoers36"; mkdir -p "$WORK/sudoers36"
+HA_SUDOERS_DIR="$WORK/sudoers36" lib_run '
+    HA_SUDOERS_DIR="$WORK/sudoers36"
+    PATH="$WORK/sysctlbin:$PATH" ha_install_sudoers >/dev/null 2>&1'
+_g=1
+[ -f "$WORK/sudoers36/fusionpbx-ha" ] \
+    && grep -qF "$WORK/sysctlbin/systemctl show postgresql" "$WORK/sudoers36/fusionpbx-ha" \
+    && grep -qE '[^ ]+/systemctl show postgresql' "$WORK/sudoers36/fusionpbx-ha" \
+    && [ "$(grep -c 'show postgresql' "$WORK/sudoers36/fusionpbx-ha")" -ge 2 ] \
+    && grep -q 'try-restart php\*-fpm' "$WORK/sudoers36/fusionpbx-ha" \
+    && [ "$(stat -c %a "$WORK/sudoers36/fusionpbx-ha")" = "440" ] && _g=0
+report "sudoers: one stanza per existing systemctl path (resolved + every candidate, mode 440) (0.3.36)" "$_g"
+_sud36="$(sed -n '/^ha_install_sudoers()/,/^}/p' "$LIB")"
+echo "$_sud36" | grep -qF 'ha_sudo_heal || true'
+report "sudoers install: heals the postgres->sudo exec path at every install point (0.3.36)" $?
+
+# the repair preflight: heal first, WARN instead of dying (the 27.10 16:36
+# bench: the preflight ran AFTER svc_stop and left the node down for
+# nothing); the root-start rescue completes the rejoin anyway
+_pre36="$(sed -n '/^ha_preflight_repmgr_service_commands()/,/^}/p' "$LIB")"
+echo "$_pre36" | grep -qF 'ha_sudo_heal || true' && ! echo "$_pre36" | grep -qF 'die '
+report "preflight: heals first, WARNs (never dies) - the rescue owns the flow (0.3.36)" $?
+
+# the ROOT-START RESCUE (ha-lib): the marker gate (standby.signal), the
+# root start under systemd, the WAL-receiver attachment proof
+_res36="$(sed -n '/^ha_rejoin_rescue()/,/^}/p' "$LIB")"
+echo "$_res36" | grep -qF 'standby.signal' \
+    && echo "$_res36" | grep -qF 'ha_pg_start_tracked' \
+    && echo "$_res36" | grep -qF 'ha_pg_wait_answer' \
+    && echo "$_res36" | grep -qF 'SELECT sender_host FROM pg_stat_wal_receiver'
+report "ha_rejoin_rescue: standby.signal gate + root start + WAL-receiver proof (0.3.36)" $?
+
+# the repair step 3: the preflight BEFORE the stop (the 16:36 ordering
+# bug), the rescue around both attempts, the register after any rescue
+_rr36="$(sed -n '/^rep_step_3_rejoin_or_clone()/,/^}/p' "$CLI")"
+_g=1
+_pf36="$(echo "$_rr36" | grep -n 'ha_preflight_repmgr_service_commands' | head -1 | cut -d: -f1)"
+_div36="$(echo "_rr36" | grep -n 'local database diverged' | head -1 | cut -d: -f1)"
+_stop36="$(echo "$_rr36" | grep -n 'svc_stop "\$HA_PG_SERVICE"' | tail -1 | cut -d: -f1)"
+[ -n "$_pf36" ] && [ -n "$_stop36" ] && [ "$_pf36" -lt "$_stop36" ] \
+    && [ "$(echo "$_rr36" | grep -cF 'ha_rejoin_rescue "$(ha_peer_ip)"')" = "2" ] \
+    && echo "$_rr36" | grep -qF '"$_r3c_rescued" = "1"' \
+    && echo "$_rr36" | grep -qF 'rejoin RESCUED' \
+    && echo "$_rr36" | grep -qF 'standby register --upstream-node-id="$(ha_peer_id)" --force' && _g=0
+report "repair step 3: preflight BEFORE the stop, rescue x2, register after any rescue (0.3.36)" "$_g"
+
+# the auto-rejoin: the same rescue inline (POSIX sh) + the inlined heal
+_ar36="$(cat "$RES/pg-auto-rejoin.sh")"
+echo "$_ar36" | grep -q '^ar_rescue()' \
+    && echo "$_ar36" | grep -q '^ar_register()' \
+    && echo "$_ar36" | grep -qF 'standby register --upstream-node-id="$_ar_upid" --force' \
+    && echo "$_ar36" | grep -qF 'chmod 4755' \
+    && echo "$_ar36" | grep -qF 'ar_sudo_ok'
+report "auto-rejoin: the root-start rescue + register + the inlined sudo heal (0.3.36)" $?
+
+# the doctor: the postgres->sudo exec check (4e) - OK / dormant / FAIL
+# with the self-heal commands
+_dc36="$(sed -n '/^cmd_doctor()/,/^}/p' "$CLI")"
+echo "$_dc36" | grep -qF 'sudo works for the postgres user' \
+    && echo "$_dc36" | grep -qF 'sudo FAILS for the postgres user' \
+    && echo "$_dc36" | grep -qF 'ha_sudo_probe' \
+    && echo "$_dc36" | grep -qF 'control sudo public'
+report "doctor: the postgres->sudo exec check with the heal commands (0.3.36)" $?
 
 # ---------------------------------------------------------------------------
 echo

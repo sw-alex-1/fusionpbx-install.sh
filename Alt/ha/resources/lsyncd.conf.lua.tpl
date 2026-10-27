@@ -40,7 +40,24 @@ sync {
                 archive  = true,
                 compress = true,
                 verbose  = false,
-                _extra   = { "--fuzzy" },
+                -- 0.3.36: lsyncd 2.3.x defaults protect_args=true - the
+                -- 's' in the '-lts' short bundle (default-rsync.lua
+                -- builds the flags from the links/times/protect_args
+                -- booleans; there is NO rsyncOpts list in this layer).
+                -- The hardened ALT rrsync refuses the client -s:
+                --   "/usr/local/bin/rrsync error: option -s has been
+                --    disabled on this server"
+                -- and the 27.10 14:00 boot died exactly there: the
+                -- startup full rsync failed -> "Terminating since
+                -- 'insist' is not set" -> lsyncd dead, systemd
+                -- restarting it into the same death every 10s. And
+                -- rsync >= 3.2.4 turns --protect-args on BY ITSELF,
+                -- so _extra carries the explicit --no- negation too.
+                -- Media names are call UUIDs - no spaces, no shell
+                -- metacharacters - nothing needs the protected
+                -- encoding.
+                protect_args = false,
+                _extra   = { "--fuzzy", "--no-protect-args" },
                 rsh      = "/usr/bin/ssh -i /etc/fusionpbx-ha/sync_key -o UserKnownHostsFile=/etc/fusionpbx-ha/known_hosts -o StrictHostKeyChecking=accept-new -o BatchMode=yes",
         },
 }

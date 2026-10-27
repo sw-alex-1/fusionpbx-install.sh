@@ -1045,6 +1045,15 @@ rep_step_3_rejoin_or_clone() {
             fi
             verbose "  already a healthy standby of $(ha_peer_name) - rejoin not needed, replication left running"
         else
+            # 0.3.36: the sudo heal + preflight BEFORE the stop - the 27.10
+            # 16:36 bench: the preflight ran AFTER svc_stop and died on the
+            # exec-level sudo breakage (EACCES for postgres on the sudo
+            # binary itself - ALT's 'control sudo' restriction / a mode
+            # drift), leaving PostgreSQL DOWN for nothing. The heal runs
+            # first now, and a still-broken sudo is only a WARN: the
+            # ROOT-START RESCUE below (ha_rejoin_rescue) completes a rejoin
+            # whose inner 'sudo systemctl start' dies.
+            ha_preflight_repmgr_service_commands
             verbose "  local database diverged from $(ha_peer_name) - stopping it for the rejoin (pg_rewind)"
             svc_stop "$HA_PG_SERVICE"
             # 0.3.25: repmgr builds the 'node rejoin' upstream connection from
@@ -1068,9 +1077,8 @@ rep_step_3_rejoin_or_clone() {
             # fork gap), repmgr wrote standby.signal + primary_conninfo
             # and called 'sudo systemctl start postgresql' ... which failed
             # with NOTHING: repmgr discards the captured child output when
-            # the command fails (repmgr-action-standby.c:3553). Three
-            # belt-and-braces measures, all verified against repmgr 5.5.0
-            # sources:
+            # the command fails (repmgr-action-standby.c:3553). Belt and
+            # braces, verified against repmgr 5.5.0 sources:
             #   a) 'systemctl reset-failed' first: the classifier's own
             #      start attempt (this same run, on the un-rewound zombie)
             #      crash-looped PostgreSQL and systemd's start-rate limiter
@@ -1080,11 +1088,17 @@ rep_step_3_rejoin_or_clone() {
             #   b) the guard flag covers the WHOLE rejoin call (repmgr's
             #      systemctl start happens INSIDE it; see
             #      ha_repair_start_window_open);
-            #   c) the sudo privilege path is proven BEFORE the rejoin
-            #      (ha_preflight_repmgr_service_commands) and a failure now
-            #      prints the journal + the PostgreSQL log (repmgr will not).
+            #   c) the ROOT-START RESCUE (0.3.36, ha_rejoin_rescue): the
+            #      rejoin can die AFTER its data work (rewind, signal,
+            #      conninfo) - the repair runs as ROOT, so IT starts
+            #      PostgreSQL, proves the WAL receiver attached to the peer
+            #      and finishes the registration. Between the attempts: the
+            #      27.10 shape was a start-step failure over COMPLETE data
+            #      work, and re-running pg_rewind over a finished rewind
+            #      only deepened the WAL-limbo; the retry stays for REAL
+            #      rewind failures (pg_rewind is re-runnable).
+            _r3c_rescued=0
             systemctl reset-failed "$HA_PG_SERVICE" >/dev/null 2>&1 || true
-            ha_preflight_repmgr_service_commands
             ha_repair_start_window_open
             _r3c_out="$(repmgr_cmd node rejoin --force-rewind -h "$(ha_peer_ip)" -U "$HA_REPMGR_USER" -d "$HA_REPMGR_DB")"
             _r3c_rc=$?
@@ -1092,13 +1106,11 @@ rep_step_3_rejoin_or_clone() {
             if [ "$_r3c_rc" -ne 0 ]; then
                 echo "$_r3c_out"
                 ha_rejoin_failure_forensics
-                if pg_runuser_psql -tAc "SELECT 1" >/dev/null 2>&1 \
-                        && [ "$(ha_rejoin_plan "$(ha_peer_ip)")" = "attached" ]; then
-                    verbose "  the rejoin reported a failure, but the node IS up and"
-                    verbose "  streaming as an attached standby (slow catchup) - continuing"
+                if ha_rejoin_rescue "$(ha_peer_ip)"; then
+                    _r3c_rescued=1
                 else
                     # retry once: pg_rewind is re-runnable, and the first
-                    # attempt may have died on the start-rate poison or a
+                    # attempt may have died on a REAL rewind failure or a
                     # transient peer hiccup (the auto-rejoin does the same)
                     systemctl reset-failed "$HA_PG_SERVICE" >/dev/null 2>&1 || true
                     ha_repair_start_window_open
@@ -1108,33 +1120,50 @@ rep_step_3_rejoin_or_clone() {
                     if [ "$_r3c_rc" -ne 0 ]; then
                         echo "$_r3c_out"
                         ha_rejoin_failure_forensics
-                        # 0.3.35: a rejoin that failed AFTER repmgr started
-                        # the server leaves a ZOMBIE standby (the 27.10 14:0x
-                        # boot: up on the new timeline, WAL receiver never
-                        # attached, the metadata record still 'primary' ->
-                        # repmgrd crash-loops and the startup process replays
-                        # the node's OWN divergent WAL tail onto the rewound
-                        # files). Attached = keep it streaming (the catchup is
-                        # valuable; a re-run of --repair finishes the
-                        # registration via the attached path); up but detached
-                        # = STOP (the documented SAFE state - the boot guard
-                        # admits the next repair's classification start).
-                        if pg_runuser_psql -tAc "SELECT 1" >/dev/null 2>&1; then
-                            if [ "$(pg_runuser_psql -tAc "SELECT sender_host FROM pg_stat_wal_receiver" | tr -d ' \r')" = "$(ha_peer_ip)" ]; then
-                                verbose "  the rejoin reported a failure twice, but the node IS up and"
-                                verbose "  streaming (catchup) - re-run --repair to finish the"
-                                verbose "  registration (the attached path does not interrupt it)"
-                            else
-                                verbose "  PostgreSQL is up but NOT attached - stopping it (the safe"
-                                verbose "  state: a zombie standby replays its own divergent WAL onto"
-                                verbose "  the rewound files and repmgrd crash-loops on the stale record)"
-                                svc_stop "$HA_PG_SERVICE"
+                        if ha_rejoin_rescue "$(ha_peer_ip)"; then
+                            _r3c_rescued=1
+                        else
+                            # 0.3.35: a rejoin that failed AFTER repmgr started
+                            # the server leaves a ZOMBIE standby (the 27.10 14:0x
+                            # boot: up on the new timeline, WAL receiver never
+                            # attached, the metadata record still 'primary' ->
+                            # repmgrd crash-loops and the startup process replays
+                            # the node's OWN divergent WAL tail onto the rewound
+                            # files). Attached = keep it streaming (the catchup is
+                            # valuable; a re-run of --repair finishes the
+                            # registration via the attached path); up but detached
+                            # = STOP (the documented SAFE state - the boot guard
+                            # admits the next repair's classification start).
+                            if pg_runuser_psql -tAc "SELECT 1" >/dev/null 2>&1; then
+                                if [ "$(pg_runuser_psql -tAc "SELECT sender_host FROM pg_stat_wal_receiver" | tr -d ' \r')" = "$(ha_peer_ip)" ]; then
+                                    verbose "  the rejoin reported a failure twice, but the node IS up and"
+                                    verbose "  streaming (catchup) - re-run --repair to finish the"
+                                    verbose "  registration (the attached path does not interrupt it)"
+                                else
+                                    verbose "  PostgreSQL is up but NOT attached - stopping it (the safe"
+                                    verbose "  state: a zombie standby replays its own divergent WAL onto"
+                                    verbose "  the rewound files and repmgrd crash-loops on the stale record)"
+                                    svc_stop "$HA_PG_SERVICE"
+                                fi
                             fi
-                        fi
-                        die "node rejoin failed twice (see the forensics above).
+                            die "node rejoin failed twice (see the forensics above).
 If the local PGDATA is damaged beyond rewind, re-run with: --repair --force-clone"
+                        fi
                     fi
                 fi
+            fi
+            if [ "$_r3c_rescued" = "1" ]; then
+                # 0.3.36: the rescued rejoin never reached repmgr's own
+                # registration - refresh the record (a metadata write on the
+                # peer; the attached standby keeps streaming through it)
+                _r3c_out="$(repmgr_cmd standby register --upstream-node-id="$(ha_peer_id)" --force)"
+                if [ $? -ne 0 ]; then
+                    echo "$_r3c_out"
+                    die "'standby register' failed after the rescued start - the node IS streaming;
+re-run the SAME command (the attached path finishes the registration)"
+                fi
+                verbose "  rejoin RESCUED: repmgr's inner start had failed - PostgreSQL was started"
+                verbose "  by this repair, verified attached to $(ha_peer_name), the record refreshed"
             fi
             ha_pg_adopt_after_rejoin
             ha_scrub_conninfo_secrets   # 0.3.33: the peer's node record still
@@ -1535,6 +1564,35 @@ Fix: fusionpbx-ha.sh --repair  (degrades to async) or restore the standby"
             [ "$(stat -c %a "$_dcp_file" 2>/dev/null)" = "600" ] \
                 || _dr_warn ".pgpass mode is not 600 - libpq refuses to read it ('fusionpbx-ha.sh --repair' rewrites it)"
         fi
+    fi
+
+    # 4e. sudo for the postgres user (0.3.36, data nodes only): the 27.10
+    # forensics - on BOTH data nodes every postgres->sudo call died at the
+    # EXEC level ('runuser: невозможно выполнить sudo: Отказано в доступе'
+    # = EACCES; the ALT 'control sudo' restriction or a mode drift on the
+    # binary) while root kept working. That silently killed: the
+    # auto-rejoin's inner service_start_command start (repmgr printed only
+    # 'unable to start server'), ALL post-promote app restarts (13:57) and
+    # the repair preflight. repmgr's design (the service_*_command paths,
+    # the promote wrapper) NEEDS this elevation path. Runs even while
+    # PostgreSQL is down - exactly the 27.10 shape.
+    # Root only (the probe runs as postgres via runuser; a non-root doctor
+    # cannot see the truth and must not guess) - HA_SANDBOX exempts the
+    # test harness, where the runuser/sudo/id stubs play the roles.
+    if [ "$HA_NODE_ID" != "3" ] && { [ "${HA_SANDBOX:-0}" = "1" ] || [ "$(id -u 2>/dev/null)" = "0" ]; }; then
+        _dce_rc=0; ha_sudo_probe || _dce_rc=$?
+        case "$_dce_rc" in
+            0) _dr_ok "sudo works for the postgres user (repmgr service commands + the post-promote app restart)" ;;
+            2) _dr_warn "sudo not installed / no postgres user yet - repmgr service commands stay dormant" ;;
+            *) _dr_fail "sudo FAILS for the postgres user - every postgres->sudo path dies with the reason
+      swallowed: the rejoin's inner 'systemctl start' (only 'unable to start
+      server' is printed), ALL post-promote app restarts, the repair
+      preflight (the 27.10 bench).
+      Fix: 'fusionpbx-ha.sh --repair' on this node (it self-heals: ALT
+      'control sudo public' / chmod 4755 on the sudo binary), or manually:
+        control sudo public; chmod 4755 \$(command -v sudo)
+      (the doctor never modifies configurations)" ;;
+        esac
     fi
 
     # 5. entry point (data nodes)

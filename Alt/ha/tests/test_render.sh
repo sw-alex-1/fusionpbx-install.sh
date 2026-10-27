@@ -119,6 +119,16 @@ check_line "$HA_LSYNCD_CONF" 'delay *= *5' "delay from cluster.conf"
 check_line "$HA_LSYNCD_CONF" '/etc/fusionpbx-ha/sync_key' "dedicated sync key"
 check_line "$HA_LSYNCD_CONF" 'StrictHostKeyChecking=accept-new' "TOFU known_hosts (design 6.3)"
 check_line "$HA_LSYNCD_CONF" 'statusFile *= *"/var/log/lsyncd/lsyncd.status"' "status file (doctor reads it)"
+# 0.3.36: lsyncd 2.3.x defaults protect_args=true (the 's' in the '-lts'
+# short bundle - default-rsync.lua builds the flags from the
+# links/times/protect_args booleans; there is NO rsyncOpts list in this
+# layer) and the hardened ALT rrsync refuses the client -s: the 27.10
+# 14:00 boot died on the startup full rsync and lsyncd with it. The
+# template must turn the default OFF and rsync >= 3.2.4 defaults
+# protect-args back ON by itself - the explicit --no- negation covers it
+check_line "$HA_LSYNCD_CONF" 'protect_args *= *false' "protect_args=false (the hardened rrsync refuses the client -s, 0.3.36)"
+check_line "$HA_LSYNCD_CONF" '"--no-protect-args"' "--no-protect-args in _extra (rsync >= 3.2.4 defaults it back on, 0.3.36)"
+check_absent "$HA_LSYNCD_CONF" '^[[:space:]]*rsyncOpts' "no rsyncOpts key (unknown to default.rsync 2.3.x - lsyncd would refuse to start)"
 # structural: braces balanced
 _o=$(grep -o '{' "$HA_LSYNCD_CONF" | wc -l); _c=$(grep -o '}' "$HA_LSYNCD_CONF" | wc -l)
 [ "$_o" = "$_c" ]
@@ -142,7 +152,7 @@ report "promote.sh passes sh -n" $?
 # (hard power-off sends no RST; app sockets to the dead peer hang for
 # tcp_retries2 ~15-30 minutes)
 check_line "$HA_PROMOTE_SH" 'for _psh_svc in' "restarts the local app services"
-check_line "$HA_PROMOTE_SH" 'sudo -n /usr/bin/systemctl try-restart' "app restart via sudoers, try-restart verb, absolute path (restart-only, 0.3.35)"
+check_line "$HA_PROMOTE_SH" 'sudo -n [^ ]+/systemctl try-restart' "app restart via sudoers, try-restart verb, the RENDERED absolute path (restart-only, 0.3.35/0.3.36)"
 check_line "$HA_PROMOTE_SH" 'angie' "app list: angie"
 check_line "$HA_PROMOTE_SH" 'freeswitch' "app list: freeswitch"
 check_line "$HA_PROMOTE_SH" 'could not restart' "restart failure is a warning, never a failed promote"

@@ -853,21 +853,32 @@ ha_repair_start_window_close() {
 # change state and succeeds for an existing unit). repmgr discards the
 # captured child output when the command FAILS (only "unable to start
 # server" is printed), so a broken sudo path inside the rejoin is
-# otherwise invisible; this preflight turns it into an actionable die.
+# otherwise invisible; this preflight heals it and turns the rest into
+# an actionable warning (0.3.36 - see ha_sudo_heal / ha_rejoin_rescue).
 ha_preflight_repmgr_service_commands() {
+    # 0.3.36: HEAL first, WARN instead of dying. The 27.10 16:36 bench:
+    # this preflight ran AFTER the step had already STOPPED PostgreSQL
+    # and died on the exec-level sudo breakage (EACCES for postgres on
+    # the sudo binary itself - see ha_sudo_heal), leaving the node down
+    # for nothing. The heal fixes the ALT 'control sudo' restriction /
+    # a binary mode drift; a still-broken sudo is only a WARN now: the
+    # 0.3.36 ROOT-START RESCUE (ha_rejoin_rescue) completes a rejoin
+    # whose inner 'sudo systemctl start' dies.
+    ha_sudo_heal || true
     cmd_exists sudo || return 0
     runuser -u postgres -- sudo -n systemctl show "$HA_PG_SERVICE" >/dev/null 2>&1
     [ $? -eq 0 ] && return 0
-    die "repmgr cannot control PostgreSQL as user postgres:
+    warn "repmgr cannot control PostgreSQL as user postgres:
 'sudo -n systemctl show $HA_PG_SERVICE' (run as postgres) failed - the
 rejoin's 'systemctl start' (repmgr.conf service_start_command) would die
-the same way, with the reason swallowed by repmgr.
-Check, in this order:
-  1. visudo -c  (sudoers syntax)
-  2. /etc/sudoers.d/fusionpbx-ha exists and contains the PGCTL alias
-  3. 'Defaults requiretty' in /etc/sudoers (must NOT apply to postgres:
-     add 'Defaults!postgres !requiretty')
-  4. manual proof: runuser -u postgres -- sudo -n systemctl show $HA_PG_SERVICE"
+the same way, with the reason swallowed by repmgr ('unable to start
+server'). The root-start rescue below completes the rejoin anyway; the
+post-promote app restart stays broken until sudo works. Check, in order:
+  1. runuser -u postgres -- sudo -n -l
+  2. visudo -c  (sudoers syntax)
+  3. /etc/sudoers.d/fusionpbx-ha exists and contains the PGCTL alias
+  4. 'Defaults requiretty' in /etc/sudoers (must NOT apply to postgres:
+     add 'Defaults!postgres !requiretty')"
 }
 
 # 0.3.33: repmgr's local_command() discards the captured child output
@@ -989,6 +1000,48 @@ ha_rejoin_plan() {
     fi
     ha_rejoin_plan_classify "${_hrp_in_recovery:-?}" "${_hrp_sender:-}" "$_hrp_peer_ip" \
         "$_hrp_peer_streaming" "$_hrp_replay_advancing"
+}
+
+# 0.3.36: the ROOT-START RESCUE. 'repmgr node rejoin' can die AFTER its
+# data work is complete - the 27.10 14:0x bench: pg_rewind done,
+# standby.signal + primary_conninfo written, then repmgr's inner
+# 'sudo systemctl start postgresql' failed (the exec-level sudo breakage;
+# repmgr swallowed the reason as 'unable to start server') and the NODE
+# REJOIN failed with the metadata record unrefreshed. What followed was
+# the zombie standby: repmgr.service's own Wants=postgresql pulled the
+# start 8 seconds later (the boot guard allowed it - standby.signal was
+# there), the WAL receiver never attached to the peer and the startup
+# process kept re-reading the node's own divergent WAL tail - while the
+# record still said 'primary' and repmgrd crash-looped ('node is
+# registered as a primary but running as a standby'). Both the manual
+# repair and the auto-rejoin unit run as ROOT: finish the start
+# OURSELVES and prove the result by the WAL receiver. Returns 0 ONLY
+# when the local server answers AND its WAL receiver is attached to the
+# given peer - the caller must then refresh the metadata record
+# ('standby register --force': a failed rejoin never reaches repmgr's
+# own registration).
+ha_rejoin_rescue() {
+    _hrr_peer="$1"
+    if ! pg_runuser_psql -tAc "SELECT 1" >/dev/null 2>&1; then
+        # no standby.signal = the rejoin died before its data work - a
+        # root start would boot the STALE PRIMARY the boot guard exists
+        # to stop (never rescue without the marker)
+        [ -f "$(ha_pg_data_dir)/standby.signal" ] || return 1
+        verbose "  rescue: the rejoin's data work is done (standby.signal present) but its inner"
+        verbose "  start failed - starting PostgreSQL as root (this repair) and verifying the WAL receiver"
+        systemctl reset-failed "$HA_PG_SERVICE" >/dev/null 2>&1 || true
+        ha_pg_start_tracked || { verbose "  rescue: PostgreSQL did not start"; return 1; }
+        ha_pg_wait_answer || { verbose "  rescue: PostgreSQL is not answering"; return 1; }
+    fi
+    _hrr_try=0
+    while [ "$_hrr_try" -lt "${HA_RESCUE_ATTACH_TRIES:-15}" ]; do
+        _hrr_sender="$(pg_runuser_psql -tAc "SELECT sender_host FROM pg_stat_wal_receiver" 2>/dev/null | head -n 1 | tr -d ' \r')"
+        [ "$_hrr_sender" = "$_hrr_peer" ] && return 0
+        sleep "${HA_RESCUE_ATTACH_SLEEP:-2}"
+        _hrr_try=$((_hrr_try + 1))
+    done
+    verbose "  rescue: the WAL receiver never attached to $_hrr_peer (the zombie-standby shape)"
+    return 1
 }
 
 # 0.3.22: 'repmgr node rejoin' may (re)start PostgreSQL itself via pg_ctl,
@@ -1199,6 +1252,102 @@ ha_ensure_repmgr_preload() {
 # PostgreSQL service only (DESIGN.md 13.2; the repmgr RPM may ship its own
 # /etc/sudoers.d/repmgr - ours is a belt-and-braces duplicate, they coexist).
 # -----------------------------------------------------------------------------
+# 0.3.36: the resolved systemctl path. The 27.10 forensics: our sudoers
+# alias carried /usr/bin/systemctl only, while the ALT repmgr RPM's own
+# /etc/sudoers.d/repmgr allows /sbin/systemctl - sudo matches the command
+# as ITS secure_path resolves it, so a bare 'sudo systemctl ...' (exactly
+# what repmgr.conf's service_*_command says) matched only one of the two
+# worlds. The render now pins the resolved path everywhere it is spelled
+# out (promote.sh) and the sudoers alias covers EVERY path that exists
+# on this node (see ha_install_sudoers).
+ha_systemctl_path() {
+    _hsp_bin="$(command -v systemctl 2>/dev/null || true)"
+    [ -n "$_hsp_bin" ] || _hsp_bin="/usr/bin/systemctl"
+    echo "$_hsp_bin"
+}
+
+# 0.3.36: prove the EXEC path of sudo for the postgres OS user.
+#   rc 0 = postgres can execute sudo and list its rights
+#   rc 2 = nothing to prove (no sudo on the box / no postgres user yet)
+#   rc 1 = BROKEN - the 27.10 forensics: on BOTH data nodes
+#     'runuser -u postgres -- sudo -n -l' died at the EXEC level
+#     ("runuser: невозможно выполнить sudo: Отказано в доступе" = EACCES -
+#     the postgres user cannot execute the sudo BINARY at all) while root
+#     kept working. That killed, with the reason swallowed every time:
+#       - the auto-rejoin's inner 'sudo systemctl start postgresql'
+#         (repmgr prints only "unable to start server", 14:00 27.10),
+#       - all three post-promote app restarts on the promoted node
+#         (13:57 27.10),
+#       - the repair's sudo preflight (16:36 27.10 - after it had already
+#         STOPPED PostgreSQL, leaving the node down for nothing).
+#     Not the systemd hardening (0.3.35's prime suspect: the stock ALT
+#     repmgr unit ships no NoNewPrivileges - the bench grep came back
+#     empty) and not the sudoers rules (visudo-clean): the known mechanism
+#     producing exactly this EACCES-only-for-postgres shape is ALT's
+#     'control' facility (control sudo restricted -> 0700 root-only,
+#     wheel -> root:wheel only) or a plain mode drift on the binary.
+ha_sudo_probe() {
+    cmd_exists sudo || return 2
+    id postgres >/dev/null 2>&1 || return 2
+    runuser -u postgres -- sudo -n -l >/dev/null 2>&1 && return 0
+    return 1
+}
+
+# 0.3.36: restore the package default the RPM itself expects (its own
+# /etc/sudoers.d/repmgr grants postgres NOPASSWD systemctl verbs - that
+# file is useless unless postgres can EXECUTE sudo): ALT 'control sudo
+# public' first (the facility survives package updates), then chmod 4755
+# (setuid root, executable by every user) on every sudo binary found -
+# WHAT postgres may run stays bounded by the sudoers NOPASSWD verbs.
+# Loud either way; returns 1 (after warning) when unhealable.
+ha_sudo_heal() {
+    _hsh_rc=0; ha_sudo_probe || _hsh_rc=$?
+    [ "$_hsh_rc" = "0" ] && return 0
+    [ "$_hsh_rc" = "2" ] && return 0
+    warn "sudo AS THE POSTGRES USER IS BROKEN -
+  $(runuser -u postgres -- sudo -n -l 2>&1 | head -n 1)
+  Every postgres->sudo path dies with the reason swallowed: repmgr's
+  'systemctl start' inside 'node rejoin' (only 'unable to start server'
+  is printed), the post-promote app restart, the repair preflight.
+  Healing (the ALT 'control' facility first, then the binary modes):"
+    if command -v control >/dev/null 2>&1; then
+        if _hsh_mode_was="$(control sudo 2>/dev/null)" && [ -n "$_hsh_mode_was" ]; then
+            if control sudo public >/dev/null 2>&1; then
+                verbose "  ALT control: the sudo facility was '$_hsh_mode_was', set to 'public'"
+            fi
+        fi
+    fi
+    _hsh_seen=""
+    for _hsh_bin in "$(command -v sudo 2>/dev/null || true)" \
+            /usr/bin/sudo /usr/sbin/sudo /sbin/sudo /bin/sudo \
+            /usr/local/bin/sudo /usr/local/sbin/sudo; do
+        [ -n "$_hsh_bin" ] && [ -f "$_hsh_bin" ] || continue
+        case " $_hsh_seen " in *" $_hsh_bin "*) continue ;; esac
+        _hsh_seen="$_hsh_seen $_hsh_bin"
+        _hsh_mode="$(stat -c %a "$_hsh_bin" 2>/dev/null || true)"
+        [ -n "$_hsh_mode" ] || continue
+        if [ "$_hsh_mode" != "4755" ]; then
+            chown root:root "$_hsh_bin" 2>/dev/null || true
+            chmod 4755 "$_hsh_bin" 2>/dev/null || true
+            warn "  healed: $_hsh_bin mode $_hsh_mode -> 4755 (setuid root, executable by every user - sudoers still bounds what postgres may run)"
+        fi
+    done
+    if ha_sudo_probe; then
+        verbose "  sudo as the postgres user: HEALED (verified)"
+        return 0
+    fi
+    warn "  the heal did not help - the ROOT-START RESCUE (0.3.36) completes the
+  rejoin paths anyway (the repair and the auto-rejoin start PostgreSQL
+  themselves), but the post-promote app restart stays broken until sudo
+  works. Inspect:
+    ls -l \$(command -v sudo); stat -c '%A %U:%G %n' \$(command -v sudo)
+    control sudo                        (ALT: the facility mode)
+    rpm -V sudo                         (mode drift vs the package)
+    getfacl \$(command -v sudo)          (an ACL may deny postgres)
+    visudo -c                           (sudoers syntax)"
+    return 1
+}
+
 ha_install_sudoers() {
     _hisd_dir="${HA_SUDOERS_DIR:-/etc/sudoers.d}"
     if ! cmd_exists sudo; then
@@ -1207,18 +1356,41 @@ ha_install_sudoers() {
     fi
     mkdir -p "$_hisd_dir" 2>/dev/null || { warn "cannot create $_hisd_dir - repmgr service commands stay dormant"; return 0; }
     _hisd_file="$_hisd_dir/fusionpbx-ha"
-    cat > "$_hisd_file" <<'EOSUDO'
+    # 0.3.36: the alias covers EVERY systemctl path that exists on this
+    # node - sudo matches the command as its secure_path resolves it, and
+    # the ALT world offers both /usr/bin/systemctl and /sbin/systemctl
+    # (the repmgr RPM's own sudoers file pins the latter, our previous
+    # alias only the former; a bare 'sudo systemctl ...' matched only one
+    # of the two worlds)
+    _hisd_paths=""
+    for _hisd_bin in "$(ha_systemctl_path)" /usr/bin/systemctl /usr/sbin/systemctl /sbin/systemctl /bin/systemctl; do
+        [ -n "$_hisd_bin" ] && [ -x "$_hisd_bin" ] || continue
+        case " $_hisd_paths " in *" $_hisd_bin "*) continue ;; esac
+        _hisd_paths="$_hisd_paths $_hisd_bin"
+    done
+    [ -n "${_hisd_paths# }" ] || _hisd_paths=" /usr/bin/systemctl"
+    _hisd_pgctl=""
+    _hisd_apps=""
+    for _hisd_bin in $_hisd_paths; do
+        _hisd_pgctl="$_hisd_pgctl$_hisd_bin start postgresql, $_hisd_bin stop postgresql, \\
+    $_hisd_bin restart postgresql, $_hisd_bin reload postgresql, \\
+    $_hisd_bin status postgresql, $_hisd_bin show postgresql, "
+        _hisd_apps="$_hisd_apps$_hisd_bin try-restart php*-fpm, \\
+    $_hisd_bin try-restart angie, \\
+    $_hisd_bin try-restart freeswitch, "
+    done
+    _hisd_pgctl="${_hisd_pgctl%, }"
+    _hisd_apps="${_hisd_apps%, }"
+    cat > "$_hisd_file" <<EOSUDO
 # fusionpbx-ha: managed file - repmgrd (User=postgres) controls the local
 # PostgreSQL service (repmgr node rejoin / clone edge paths) and, after a
 # successful promote (0.3.24), drops the local applications' dead sockets
 # to the failed peer (restart-only verbs - no start/stop privilege).
-Cmnd_Alias FUSIONPBX_HA_PGCTL = /usr/bin/systemctl start postgresql, \
-    /usr/bin/systemctl stop postgresql, /usr/bin/systemctl restart postgresql, \
-    /usr/bin/systemctl reload postgresql, /usr/bin/systemctl status postgresql, \
-    /usr/bin/systemctl show postgresql
-Cmnd_Alias FUSIONPBX_HA_APPS = /usr/bin/systemctl try-restart php*-fpm, \
-    /usr/bin/systemctl try-restart angie, \
-    /usr/bin/systemctl try-restart freeswitch
+# 0.3.36: one stanza per systemctl path that exists on this node (sudo
+# resolves bare names through its own secure_path - /usr/bin on some
+# layouts, /sbin on the ALT repmgr RPM's).
+Cmnd_Alias FUSIONPBX_HA_PGCTL = $_hisd_pgctl
+Cmnd_Alias FUSIONPBX_HA_APPS = $_hisd_apps
 postgres ALL=(root) NOPASSWD: FUSIONPBX_HA_PGCTL, FUSIONPBX_HA_APPS
 EOSUDO
     chmod 440 "$_hisd_file" 2>/dev/null || true
@@ -1229,7 +1401,11 @@ EOSUDO
             return 0
         fi
     fi
-    verbose "  sudoers drop-in installed: $_hisd_file (repmgrd may control postgresql)"
+    verbose "  sudoers drop-in installed: $_hisd_file (systemctl paths:$(echo "$_hisd_paths" | tr '\n' ' '))"
+    # 0.3.36: the rules are useless while postgres cannot EXECUTE sudo -
+    # heal the exec path (ALT 'control sudo' / the binary mode) at every
+    # install point; silent when healthy, loud when it heals or fails
+    ha_sudo_heal || true
 }
 
 # -----------------------------------------------------------------------------
@@ -1285,6 +1461,10 @@ ha_install_pg_boot_guard() {
         -e "s|@@REJOIN_ATTEMPTS@@|${HA_AUTO_REJOIN_ATTEMPTS:-45}|g" \
         -e "s|@@REJOIN_SLEEP@@|${HA_AUTO_REJOIN_SLEEP:-2}|g" \
         -e "s|@@MAX_GAP_MB@@|${HA_AUTO_REJOIN_MAX_GAP_MB:-128}|g" \
+        -e "s|@@RESCUE_ANSWER_TRIES@@|${HA_RESCUE_ANSWER_TRIES:-60}|g" \
+        -e "s|@@RESCUE_ANSWER_SLEEP@@|${HA_RESCUE_ANSWER_SLEEP:-1}|g" \
+        -e "s|@@RESCUE_ATTACH_TRIES@@|${HA_RESCUE_ATTACH_TRIES:-15}|g" \
+        -e "s|@@RESCUE_ATTACH_SLEEP@@|${HA_RESCUE_ATTACH_SLEEP:-2}|g" \
         "$HA_RES_DIR/boot-guard.conf.tpl" > "$_hibg_tmp" || { rm -f "$_hibg_tmp"; return 1; }
     if ! cmp -s "$_hibg_tmp" "$_hibg_conf" 2>/dev/null; then
         install -m 0644 "$_hibg_tmp" "$_hibg_conf" 2>/dev/null \
@@ -1940,17 +2120,22 @@ ha_check_app_restart_sudo() {
     [ -n "$_cas_apps" ] || return 0
     cmd_exists sudo || return 0
     cmd_exists runuser || return 0
+    # 0.3.36: the rendered absolute path (0.3.35 pinned /usr/bin/systemctl
+    # - the ALT world also offers /sbin/systemctl; promote.sh now carries
+    # the resolved path of THIS node, and the sudoers alias covers both)
+    _cas_bin="$(ha_systemctl_path)"
     for _cas_svc in $_cas_apps; do
         if ! runuser -u postgres -- sudo -n -l \
-                /usr/bin/systemctl try-restart "$_cas_svc" >/dev/null 2>&1; then
-            warn "  post-promote app restart: 'sudo -n -l /usr/bin/systemctl try-restart $_cas_svc' (as postgres) FAILED -
+                "$_cas_bin" try-restart "$_cas_svc" >/dev/null 2>&1; then
+            warn "  post-promote app restart: 'sudo -n -l $_cas_bin try-restart $_cas_svc' (as postgres) FAILED -
       after a failover, promote.sh's app restart will die the same way and
       the promoted node's apps will hang on dead-peer sockets (~15-30 min).
       Inspect, in this order:
         runuser -u postgres -- sudo -n -l
         cat /etc/sudoers.d/fusionpbx-ha     (the APPS alias must list try-restart $_cas_svc)
         cat /etc/sudoers.d/repmgr           (the RPM's own file - read AFTER ours, it can override)
-        systemctl cat repmgr                (NoNewPrivileges/ProtectSystem hardening breaks sudo from repmgrd)"
+        systemctl cat repmgr                (NoNewPrivileges/ProtectSystem hardening breaks sudo from repmgrd)
+        ls -l $_cas_bin; control sudo       (0.3.36: an exec-level sudo breakage - EACCES for postgres)"
             return 0
         fi
     done
@@ -1970,7 +2155,8 @@ ha_install_promote_sh() {
     _hips_php="$(ha_detect_php_fpm)"
     [ -n "$_hips_php" ] && _hips_apps="$_hips_php $_hips_apps"
     ha_render "$HA_RES_DIR/promote.sh.tpl" "$HA_PROMOTE_SH" \
-        "APP_SERVICES=$_hips_apps"
+        "APP_SERVICES=$_hips_apps" \
+        "SYSTEMCTL_PATH=$(ha_systemctl_path)"
     chmod 0755 "$HA_PROMOTE_SH" 2>/dev/null || true
     # 0.3.35: prove the sudo path while the operator is looking (the
     # 27.10 promote proved the rules can be right and the calls still die)

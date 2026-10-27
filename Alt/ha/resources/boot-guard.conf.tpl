@@ -27,3 +27,11 @@ BG_LSYNCD_SERVICE="@@LSYNCD_SERVICE@@"
 BG_REJOIN_ATTEMPTS="@@REJOIN_ATTEMPTS@@"
 BG_REJOIN_SLEEP="@@REJOIN_SLEEP@@"
 BG_MAX_GAP_MB="@@MAX_GAP_MB@@"
+# 0.3.36: the ROOT-START RESCUE (see pg-auto-rejoin.sh): the wait for the
+# rescued PostgreSQL to answer psql and for its WAL receiver to attach
+# to the peer (the zombie detector). Rendered knobs - a slow catchup on
+# a big cluster may need more attach tries.
+BG_RESCUE_ANSWER_TRIES="@@RESCUE_ANSWER_TRIES@@"
+BG_RESCUE_ANSWER_SLEEP="@@RESCUE_ANSWER_SLEEP@@"
+BG_RESCUE_ATTACH_TRIES="@@RESCUE_ATTACH_TRIES@@"
+BG_RESCUE_ATTACH_SLEEP="@@RESCUE_ATTACH_SLEEP@@"

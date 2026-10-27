@@ -58,10 +58,16 @@ fi
 # 27.10 13:57 promote swallowed the reason ('>/dev/null 2>&1') and all
 # three restarts died silently in the same second (the rules worked from
 # every other context; the reason never reached the log).
+# 0.3.36: the path is RENDERED (the resolved systemctl of THIS node -
+# /usr/bin/systemctl on some layouts, /sbin/systemctl on the ALT repmgr
+# RPM's world; the sudoers alias covers every existing path). The 27.10
+# forensics: the real killer was deeper - postgres could not EXECUTE sudo
+# at all (EACCES) - the installer's ha_sudo_heal fixes that one at every
+# install/repair point; this printout names it if it ever returns.
 if /usr/bin/repmgr standby promote -f "$REPMGR_CONF"; then
     for _psh_svc in @@APP_SERVICES@@; do
         _psh_rc=0
-        _psh_err="$(sudo -n /usr/bin/systemctl try-restart "$_psh_svc" 2>&1)" || _psh_rc=$?
+        _psh_err="$(sudo -n @@SYSTEMCTL_PATH@@ try-restart "$_psh_svc" 2>&1)" || _psh_rc=$?
         if [ "$_psh_rc" -ne 0 ]; then
             _psh_reason="$(printf '%s' "$_psh_err" | head -n 1)"
             echo "fusionpbx-ha promote.sh: WARNING: could not restart $_psh_svc (rc=$_psh_rc: ${_psh_reason:-no output}) - requests caught mid-flight to the dead peer hang until TCP timeout" >&2

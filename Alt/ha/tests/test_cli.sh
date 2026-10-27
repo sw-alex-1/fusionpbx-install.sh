@@ -124,6 +124,20 @@ cat > "$FB/runuser" <<'EOF'
 exec "$@"
 EOF
 
+# 0.3.36: the doctor's sudo-exec probe (4e) - the postgres user must be
+# able to EXECUTE sudo (the 27.10 bench: EACCES on the binary itself on
+# BOTH data nodes). id: only the 'postgres' existence probe is stubbed
+# (everything else falls through to the real id); sudo: rc knob.
+cat > "$FB/id" <<'EOF'
+#!/bin/sh
+[ "${1:-}" = "postgres" ] && exit 0
+exec /usr/bin/id "$@"
+EOF
+cat > "$FB/sudo" <<'EOF'
+#!/bin/sh
+exit "${SUDO_PROBE_RC:-0}"
+EOF
+
 cat > "$FB/repmgr" <<'EOF'
 #!/bin/sh
 echo "repmgr: stub cluster show"
@@ -221,7 +235,7 @@ echo "apt-get: stub - no repository in the test sandbox" >&2
 exit 100
 EOF
 
-for _fb in systemctl timedatectl psql runuser repmgr curl ip pg_isready ssh-keygen ss ping rpm apt-get iptables iptables-save; do
+for _fb in systemctl timedatectl psql runuser repmgr curl ip pg_isready ssh-keygen ss ping rpm apt-get iptables iptables-save id sudo; do
     chmod +x "$FB/$_fb"
 done
 
@@ -523,6 +537,7 @@ ha_cli --doctor > "$WORK/out.log" 2>&1; _rc=$?
   && grep -q "repmgr sees all 3 nodes active" "$WORK/out.log" \
   && grep -qF "quorum link to fpbx-witness (10.0.0.13): authenticated as repmgr" "$WORK/out.log" \
   && grep -qF ".pgpass covers every cluster node" "$WORK/out.log" \
+  && grep -q "sudo works for the postgres user" "$WORK/out.log" \
   && grep -q "routes to the primary" "$WORK/out.log" \
   && grep -q "Doctor result: healthy" "$WORK/out.log"
 report "--doctor healthy cluster -> exit 0" "$?" "$(grep -c FAIL "$WORK/out.log") failures shown"
@@ -609,6 +624,20 @@ SYSTEMCTL_NNPRIV=yes ha_cli --doctor > "$WORK/out.log" 2>&1; _rc=$?
   && grep -qF "repmgr.service resolves NoNewPrivileges=yes" "$WORK/out.log" \
   && grep -q "post-promote app restart dies silently" "$WORK/out.log"
 report "--doctor WARNs when repmgrd cannot elevate (NoNewPrivileges=yes) (0.3.35)" "$?"
+
+echo "== --doctor: sudo broken for the postgres user (0.3.36: the 27.10 exec-level EACCES) =="
+# on BOTH data nodes every postgres->sudo call died at the EXEC level
+# ('runuser: невозможно выполнить sudo: Отказано в доступе') - the
+# auto-rejoin's inner start ('unable to start server' only), ALL
+# post-promote app restarts (13:57), the repair preflight (16:36). The
+# doctor names the self-healing fix commands.
+SUDO_PROBE_RC=1 ha_cli --doctor > "$WORK/out.log" 2>&1; _rc=$?
+[ "$_rc" = "1" ] \
+  && grep -qF "sudo FAILS for the postgres user" "$WORK/out.log" \
+  && grep -q "control sudo public" "$WORK/out.log" \
+  && grep -q "chmod 4755" "$WORK/out.log" \
+  && grep -q "never modifies configurations" "$WORK/out.log"
+report "--doctor FAILS on a broken postgres->sudo exec path, names the heal commands (0.3.36)" "$?" "$(grep -m1 'sudo FAILS' "$WORK/out.log")"
 
 echo "== --doctor: NTP out of sync =="
 TIMEDATECTL_VALUE=no ha_cli --doctor > "$WORK/out.log" 2>&1; _rc=$?

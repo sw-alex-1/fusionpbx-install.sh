@@ -53,6 +53,9 @@ CONF="${PG_AUTO_REJOIN_CONF:-/etc/fusionpbx-ha/boot-guard.conf}"
 : "${BG_LSYNCD_SERVICE:=lsyncd}"
 : "${BG_REJOIN_ATTEMPTS:=45}" "${BG_REJOIN_SLEEP:=2}" "${BG_MAX_GAP_MB:=128}"
 : "${BG_REPAIR_FLAG:=/run/fusionpbx-ha/repair-start.flag}"
+# 0.3.36: the ROOT-START RESCUE waits (see ar_rescue)
+: "${BG_RESCUE_ANSWER_TRIES:=60}" "${BG_RESCUE_ANSWER_SLEEP:=1}"
+: "${BG_RESCUE_ATTACH_TRIES:=15}" "${BG_RESCUE_ATTACH_SLEEP:=2}"
 
 log()    { echo "fusionpbx-ha auto-rejoin: $*" >&2; }
 refuse() {
@@ -79,6 +82,15 @@ ar_peer_psql() {
 # local psql over the unix socket (peer auth as postgres, no password)
 ar_local_psql() {
     runuser -u postgres -- psql -tAc "$1" 2>/dev/null | tr -d ' \r'
+}
+
+# 0.3.36: an UP/DOWN probe that returns psql's OWN exit code. ar_local_psql
+# pipes through tr - the pipeline's exit code is tr's (ALWAYS 0), so a
+# DOWN server answers 'up' through it (the rescue's start branch would
+# never fire, the triage would call a stopped server 'up'). psql without
+# the pipe: connection refused = non-zero = honestly DOWN.
+ar_local_pg_up() {
+    runuser -u postgres -- psql -tAc "SELECT 1" >/dev/null 2>&1
 }
 
 # ---------------------------------------------------------------------------
@@ -171,6 +183,43 @@ log "gates passed: timelines $_ar_tl_local -> $_ar_tl_peer (fork $_ar_fork), gap
 systemctl stop "$BG_PG_SERVICE" >/dev/null 2>&1 || true
 systemctl reset-failed "$BG_PG_SERVICE" >/dev/null 2>&1 || true
 
+# 0.3.36: the sudo self-heal, INLINED from ha_sudo_heal (this unit is a
+# standalone POSIX sh script - it cannot source ha-lib). The 27.10
+# forensics: on BOTH data nodes the postgres user could not EXECUTE sudo
+# at all ('runuser: невозможно выполнить sudo: Отказано в доступе' =
+# EACCES - the ALT 'control sudo' restriction or a mode drift on the
+# binary), which made the rejoin's inner 'sudo systemctl start
+# postgresql' die with ONLY 'unable to start server' (repmgr swallows
+# the reason). Heal it BEFORE the rejoin pays for it:
+#   - the ALT 'control' facility to 'public' (survives package updates),
+#   - chmod 4755 (setuid root, executable by every user) on every sudo
+#     binary found - WHAT postgres may run stays bounded by the sudoers
+#     NOPASSWD verbs.
+ar_sudo_ok() { runuser -u postgres -- sudo -n -l >/dev/null 2>&1; }
+if command -v sudo >/dev/null 2>&1 && command -v id >/dev/null 2>&1 \
+        && id postgres >/dev/null 2>&1 && ! ar_sudo_ok; then
+    log "sudo AS THE POSTGRES USER FAILED - repmgr's inner 'sudo systemctl start postgresql' dies 'unable to start server' (the reason is swallowed by repmgr); healing"
+    if command -v control >/dev/null 2>&1 && control sudo >/dev/null 2>&1; then
+        control sudo public >/dev/null 2>&1 \
+            && log "ALT control: the sudo facility set to 'public' (was: $(control sudo 2>/dev/null))"
+    fi
+    for _ar_sbin in $(command -v sudo) /usr/bin/sudo /usr/sbin/sudo /sbin/sudo /bin/sudo /usr/local/bin/sudo; do
+        [ -n "$_ar_sbin" ] && [ -f "$_ar_sbin" ] || continue
+        _ar_smode="$(stat -c %a "$_ar_sbin" 2>/dev/null || true)"
+        [ -n "$_ar_smode" ] || continue
+        if [ "$_ar_smode" != "4755" ]; then
+            chown root:root "$_ar_sbin" 2>/dev/null || true
+            chmod 4755 "$_ar_sbin" 2>/dev/null || true
+            log "healed: $_ar_sbin mode $_ar_smode -> 4755 (setuid root; sudoers still bounds what postgres may run)"
+        fi
+    done
+    if ar_sudo_ok; then
+        log "sudo as the postgres user: HEALED"
+    else
+        log "WARNING: the heal did not help - the ROOT-START RESCUE below is the fallback; run 'fusionpbx-ha.sh --repair'"
+    fi
+fi
+
 ar_rejoin() {
     # TMPDIR=/tmp (0.3.30): the unit's systemd context has no PAM, but a
     # MANUAL run of this script from a root SSH session inherits
@@ -199,10 +248,72 @@ ar_rejoin() {
     return "$_arrc"
 }
 
+# 0.3.36: the ROOT-START RESCUE (inlined from ha_rejoin_rescue). A
+# 'node rejoin' can die AFTER its data work is complete - the 27.10
+# 14:0x bench: pg_rewind done, standby.signal + primary_conninfo
+# written, then the inner 'sudo systemctl start' failed (the exec-level
+# sudo breakage) and the NODE REJOIN failed with the record unrefreshed
+# -> the zombie standby (repmgr.service's Wants=postgresql pulled a
+# start 8s later, the WAL receiver never attached, repmgrd crash-looped
+# on the stale 'primary' record). THIS UNIT RUNS AS ROOT: finish the
+# start ourselves and prove the result by the WAL receiver.
+#   rc 0 = the server answers AND its WAL receiver is attached to the
+#          peer (the caller then refreshes the record - ar_register)
+ar_rescue() {
+    if ! ar_local_pg_up; then
+        # no standby.signal = the rejoin died before its data work - a
+        # root start would boot the STALE PRIMARY the boot guard exists
+        # to stop (never rescue without the marker)
+        [ -f "$BG_PGDATA/standby.signal" ] || return 1
+        log "rescue: the rejoin's data work is done (standby.signal present) but its inner"
+        log "rescue: start failed - starting PostgreSQL as root (this unit)"
+        systemctl reset-failed "$BG_PG_SERVICE" >/dev/null 2>&1 || true
+        systemctl start "$BG_PG_SERVICE" \
+            || { log "rescue: PostgreSQL did not start"; return 1; }
+        _i=0
+        while [ "$_i" -lt "$BG_RESCUE_ANSWER_TRIES" ]; do
+            ar_local_pg_up && break
+            sleep "$BG_RESCUE_ANSWER_SLEEP"
+            _i=$((_i + 1))
+        done
+        ar_local_pg_up \
+            || { log "rescue: PostgreSQL is not answering"; return 1; }
+    fi
+    _i=0
+    while [ "$_i" -lt "$BG_RESCUE_ATTACH_TRIES" ]; do
+        [ "$(ar_local_psql "SELECT sender_host FROM pg_stat_wal_receiver")" = "$BG_PEER_IP" ] && return 0
+        sleep "$BG_RESCUE_ATTACH_SLEEP"
+        _i=$((_i + 1))
+    done
+    log "rescue: the WAL receiver never attached to $BG_PEER_IP (the zombie-standby shape)"
+    return 1
+}
+
+# 0.3.36: a rescued rejoin never reached repmgr's own registration -
+# the peer's record still says 'primary' and repmgrd would crash-loop
+# on it ('node is registered as a primary but running as a standby').
+# 'standby register --force' on an ATTACHED standby is a metadata write
+# on the peer - it does not interrupt the replication (exactly the
+# manual repair's 'attached' path).
+ar_register() {
+    _ar_upid="$(ar_peer_psql "SELECT node_id FROM repmgr.nodes WHERE type='primary'")"
+    if [ -n "$_ar_upid" ]; then
+        TMPDIR=/tmp runuser -u postgres -- repmgr -f "$BG_REPMGR_CONF_PATH" \
+            standby register --upstream-node-id="$_ar_upid" --force 2>&1 \
+            || { log "RESCUED, BUT THE REGISTER FAILED - run 'fusionpbx-ha.sh --repair' (the attached path finishes it)"; exit 1; }
+    else
+        TMPDIR=/tmp runuser -u postgres -- repmgr -f "$BG_REPMGR_CONF_PATH" \
+            standby register --force 2>&1 \
+            || { log "RESCUED, BUT THE REGISTER FAILED - run 'fusionpbx-ha.sh --repair' (the attached path finishes it)"; exit 1; }
+    fi
+    log "record refreshed: this node is a standby of $BG_PEER_IP (standby register --force)"
+}
+
 log "rejoining as a standby of $BG_PEER_IP (pg_rewind; this can take minutes)"
 _ar_out="$(ar_rejoin)"
 _ar_rc=$?
 echo "$_ar_out" >&2
+_ar_rescued=0
 if [ "$_ar_rc" -ne 0 ]; then
     # 0.3.30 closed the "unable to open temporary file" case (that was
     # repmgr's own local_command mkstemp inside a pam_mktemp-poisoned
@@ -217,51 +328,79 @@ if [ "$_ar_rc" -ne 0 ]; then
     runuser -u postgres -- pg_rewind -D "$BG_PGDATA" \
         --source-server="host=$BG_PEER_IP port=$BG_PG_PORT user=$BG_REPMGR_USER dbname=$BG_REPMGR_DB" \
         --debug 2>&1 || true
-    log "retrying the rejoin once (pg_rewind is re-runnable)"
-    # 0.3.33: the first attempt may have crash-looped PostgreSQL against
-    # a poisoned data dir and tripped systemd's start-rate limiter - clear
-    # it, or the retry's inner 'systemctl start' is refused with
-    # "Start request repeated too quickly" before postgres even runs
-    systemctl reset-failed "$BG_PG_SERVICE" >/dev/null 2>&1 || true
-    _ar_out="$(ar_rejoin)"
-    _ar_rc=$?
-    echo "$_ar_out" >&2
-    if [ "$_ar_rc" -ne 0 ]; then
-        log "REJOIN FAILED"
-        # 0.3.33: repmgr swallows the failed start's output (only "unable
-        # to start server"); the journal holds the real reason - keep the
-        # last 40 lines next to the pg_rewind --debug capture above
-        journalctl -u "$BG_PG_SERVICE" --no-pager -n 40 2>/dev/null \
-            | sed -e 's/^/  /' -e 's/password=[^ ]*/password=***/g' >&2 || true
-        # 0.3.35: the rejoin may have failed AFTER repmgr had already
-        # started the server (the 27.10 14:0x boot: pg_rewind done,
-        # PostgreSQL up as a standby on the new timeline - but the WAL
-        # receiver never attached, the metadata record still said
-        # 'primary', repmgrd crash-looped 'node is registered as a primary
-        # but running as a standby', and the startup process kept
-        # replaying the node's OWN divergent WAL tail onto the rewound
-        # files). "PostgreSQL stays down" was a lie for this path. Tell
-        # the two leftovers apart by the WAL receiver:
-        if ar_local_psql "SELECT 1" >/dev/null 2>&1; then
-            if [ "$(ar_local_psql "SELECT sender_host FROM pg_stat_wal_receiver")" = "$BG_PEER_IP" ]; then
-                log "PostgreSQL IS up and streaming from the peer (catchup) - the rejoin"
-                log "failed at a later stage (the metadata record may be stale). Do NOT"
-                log "reboot it: run 'fusionpbx-ha.sh --repair' - the attached path"
-                log "refreshes the record without interrupting the replication."
+    # 0.3.36: THE ROOT-START RESCUE comes BEFORE the retry - the 27.10
+    # shape was a start-step failure (sudo) over COMPLETE data work, and
+    # re-running pg_rewind over a finished rewind only deepened the
+    # WAL-limbo (the second pass ran over the already-rewound pg_control
+    # and the node ended up requesting a timeline-6 WAL position that
+    # never existed). Rescue first; the rejoin retry stays for REAL
+    # rewind failures (pg_rewind is re-runnable).
+    if ar_rescue; then
+        _ar_rescued=1
+        log "rescue: PostgreSQL is up and attached to the peer - the rejoin's data work is complete"
+    else
+        log "retrying the rejoin once (pg_rewind is re-runnable)"
+        # 0.3.33: the first attempt may have crash-looped PostgreSQL against
+        # a poisoned data dir and tripped systemd's start-rate limiter - clear
+        # it, or the retry's inner 'systemctl start' is refused with
+        # "Start request repeated too quickly" before postgres even runs
+        systemctl reset-failed "$BG_PG_SERVICE" >/dev/null 2>&1 || true
+        _ar_out="$(ar_rejoin)"
+        _ar_rc=$?
+        echo "$_ar_out" >&2
+        if [ "$_ar_rc" -ne 0 ]; then
+            if ar_rescue; then
+                _ar_rescued=1
+                log "rescue: PostgreSQL is up and attached to the peer - the rejoin's data work is complete"
             else
-                log "PostgreSQL is up but NOT attached to the peer (the zombie standby:"
-                log "stale 'primary' record, no streaming, own-divergent-WAL replay) -"
-                log "stopping it: the SAFE state (the applications work via the peer)"
-                systemctl stop "$BG_PG_SERVICE" >/dev/null 2>&1 || true
-                systemctl stop "$BG_REPMGRD_SERVICE" >/dev/null 2>&1 || true
-                log "PostgreSQL and repmgrd stopped; run 'fusionpbx-ha.sh --repair'"
-                log "(the next boot retries the rejoin automatically)"
+                log "REJOIN FAILED"
+                # 0.3.33: repmgr swallows the failed start's output (only "unable
+                # to start server"); the journal holds the real reason - keep the
+                # last 40 lines next to the pg_rewind --debug capture above
+                journalctl -u "$BG_PG_SERVICE" --no-pager -n 40 2>/dev/null \
+                    | sed -e 's/^/  /' -e 's/password=[^ ]*/password=***/g' >&2 || true
+                # 0.3.35: the rejoin may have failed AFTER repmgr had already
+                # started the server (the 27.10 14:0x boot: pg_rewind done,
+                # PostgreSQL up as a standby on the new timeline - but the WAL
+                # receiver never attached, the metadata record still said
+                # 'primary', repmgrd crash-looped 'node is registered as a primary
+                # but running as a standby', and the startup process kept
+                # replaying the node's OWN divergent WAL tail onto the rewound
+                # files). "PostgreSQL stays down" was a lie for this path. Tell
+                # the two leftovers apart by the WAL receiver (0.3.36: the
+                # up/down verdict now uses ar_local_pg_up - psql's own exit
+                # code, not the tr-masked pipeline that called every server
+                # 'up'):
+                if ar_local_pg_up; then
+                    if [ "$(ar_local_psql "SELECT sender_host FROM pg_stat_wal_receiver")" = "$BG_PEER_IP" ]; then
+                        log "PostgreSQL IS up and streaming from the peer (catchup) - the rejoin"
+                        log "failed at a later stage (the metadata record may be stale). Do NOT"
+                        log "reboot it: run 'fusionpbx-ha.sh --repair' - the attached path"
+                        log "refreshes the record without interrupting the replication."
+                    else
+                        log "PostgreSQL is up but NOT attached to the peer (the zombie standby:"
+                        log "stale 'primary' record, no streaming, own-divergent-WAL replay) -"
+                        log "stopping it: the SAFE state (the applications work via the peer)"
+                        systemctl stop "$BG_PG_SERVICE" >/dev/null 2>&1 || true
+                        systemctl stop "$BG_REPMGRD_SERVICE" >/dev/null 2>&1 || true
+                        log "PostgreSQL and repmgrd stopped; run 'fusionpbx-ha.sh --repair'"
+                        log "(the next boot retries the rejoin automatically)"
+                    fi
+                else
+                    log "PostgreSQL stays down (the SAFE state); run 'fusionpbx-ha.sh --repair'"
+                fi
+                exit 1
             fi
-        else
-            log "PostgreSQL stays down (the SAFE state); run 'fusionpbx-ha.sh --repair'"
         fi
-        exit 1
     fi
+fi
+
+# 0.3.36: refresh the record after ANY rescued path - a failed rejoin
+# never reaches repmgr's own registration, and repmgrd refuses to start
+# on the stale 'primary' record ('node is registered as a primary but
+# running as a standby'). A successful rejoin (rc=0) registered itself.
+if [ "$_ar_rescued" = "1" ]; then
+    ar_register
 fi
 
 # ---------------------------------------------------------------------------
