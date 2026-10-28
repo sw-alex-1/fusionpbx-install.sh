@@ -83,7 +83,31 @@ HA_BLOCK_END="# END fusionpbx-ha (managed)"
 # HA_RES_DIR: this script's resources/ directory (templates). Derived from
 # the calling script location; tests override it explicitly.
 HA_RES_DIR="${HA_RES_DIR:-$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd)/resources}"
-HA_LAYER1_PROXY_SH="${HA_LAYER1_PROXY_SH:-$HA_RES_DIR/../resources/proxy.sh}"
+# Layer-1 proxy.sh location: PROBED, not guessed. The legacy formula
+# ($HA_RES_DIR/../resources/proxy.sh, pre-0.3.37) resolved INSIDE the HA
+# resource dir in every layout that ever existed - ha_apply_proxy always fell
+# back to environment variables only, and apt-get does NOT read env vars:
+# behind a proxy the package steps of --init/--join would have failed.
+# Candidates:
+#   - ${SCRIPT_DIR}/resources/proxy.sh    repo layout since 0.3.34 (the script
+#                                         lives in Alt/, next to the layer-1
+#                                         installer) and the flat deployed copy
+#   - $HA_RES_DIR/../../resources/proxy.sh  the pre-0.3.34 repo layout
+#                                         (Alt/ha/fusionpbx-ha.sh)
+#   - $HA_RES_DIR/../resources/proxy.sh   the legacy formula (kept: harmless,
+#                                         a probe, not a guess)
+HA_LAYER1_PROXY_SH="${HA_LAYER1_PROXY_SH:-}"
+if [ -z "$HA_LAYER1_PROXY_SH" ]; then
+    for _hl1p_cand in "${SCRIPT_DIR:-/nonexistent}/resources/proxy.sh" \
+                      "$HA_RES_DIR/../../resources/proxy.sh" \
+                      "$HA_RES_DIR/../resources/proxy.sh"; do
+        if [ -f "$_hl1p_cand" ]; then
+            HA_LAYER1_PROXY_SH="$_hl1p_cand"
+            break
+        fi
+    done
+    unset _hl1p_cand
+fi
 
 # =============================================================================
 # Output helpers (pattern: layer-1 colors.sh; --no-color supported)
@@ -2496,11 +2520,19 @@ proxy_server_valid() {
 
 ha_apply_proxy() {
     [ -n "$PROXY_SERVER" ] || return 0
-    if [ -f "$HA_LAYER1_PROXY_SH" ]; then
+    # The layer-1 proxy.sh writes REAL system configs (/etc/apt/apt.conf,
+    # /root/.gitconfig, /etc/wgetrc, /root/.curlrc) - NEVER source it inside
+    # the sandbox (the test-suite contract: nothing outside $WORK). The
+    # sandbox takes the env-only fallback; tests of the sourcing path run
+    # ha-lib without HA_SANDBOX and a fixture in HA_LAYER1_PROXY_SH.
+    if [ "${HA_SANDBOX:-0}" != "1" ] && [ -n "$HA_LAYER1_PROXY_SH" ] \
+        && [ -f "$HA_LAYER1_PROXY_SH" ]; then
         # shellcheck disable=SC1090
         . "$HA_LAYER1_PROXY_SH"
     else
-        warn "layer-1 proxy.sh not found ($HA_LAYER1_PROXY_SH) - using environment variables only"
+        if [ "${HA_SANDBOX:-0}" != "1" ]; then
+            warn "layer-1 proxy.sh not found - using environment variables only"
+        fi
         _hap_url="http://$PROXY_SERVER"
         export http_proxy="$_hap_url" https_proxy="$_hap_url" HTTP_PROXY="$_hap_url" HTTPS_PROXY="$_hap_url"
     fi

@@ -270,12 +270,20 @@ _CURLRC="/root/.curlrc"
 # Remove any existing proxy setting we added (idempotent)
 if [ -f "$_CURLRC" ]; then
     sed -i '/^--proxy/d' "$_CURLRC" 2>/dev/null
+    sed -i '/^--noproxy/d' "$_CURLRC" 2>/dev/null
 fi
 
 # Append proxy setting
 echo "--proxy $PROXY_URL" >> "$_CURLRC"
 
-verbose "  Curl proxy configured: $_CURLRC"
+# Local addresses must NEVER go through the proxy: root on this system will
+# later curl LOCAL endpoints (the HA layer's role agents on 127.0.0.1,
+# haproxy stats, health checks) and a bare 'curl http://127.0.0.1:...' would
+# be routed to the proxy without this line (the HA layer's own probes pass
+# --noproxy '*' explicitly - this protects every OTHER curl root runs).
+echo "--noproxy localhost,127.0.0.1,::1,.local" >> "$_CURLRC"
+
+verbose "  Curl proxy configured: $_CURLRC (local addresses bypass it)"
 
 # =============================================================================
 # 6. Composer proxy configuration (if composer is installed)

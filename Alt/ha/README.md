@@ -36,6 +36,14 @@ direct (DESIGN.md §5.1, RUNBOOK.md §8).
 | 3 | VM2, VM3 | `./fusionpbx-ha.sh --join TOKEN` | joins the cluster; role picked automatically by own IP (VM2 → standby — its local DB is replaced by a clone from VM1; VM3 → witness) |
 | 4 | any node | `./fusionpbx-ha.sh --doctor` | full health check, non-zero exit for monitoring; strictly read-only — it reports drift and names the fix command, it never modifies configs or services (0.3.16) |
 
+**Interactive mode (0.3.37):** on a terminal you can skip the flags entirely —
+a bare `./fusionpbx-ha.sh` asks the node role (primary / standby / witness),
+the role's arguments (node IPs or the join token) and the outbound proxy;
+the layer-1 `install.sh` asks the same way (proxy, domain, admin password).
+Every question has a safe default, CLI flags are never re-asked, and without
+a terminal on stdin (piped / ssh / CI) zero questions are asked — both
+installers stay fully automatable.
+
 Day-2 operations — node failure, repair of a rebuilt node, cluster freeze
 after a double failure, branch upgrade, proxy-only networks — step by step
 in **RUNBOOK.md** (written for "it's been months, nobody remembers anything").

@@ -137,8 +137,13 @@ PROXYEOF
         sed -i 's/^use_proxy.*=.*off/use_proxy = on/' /etc/wgetrc 2>/dev/null
     fi
 
-    # ~/.curlrc — set proxy
+    # ~/.curlrc — set proxy + keep local addresses out of it (the HA layer's
+    # role agents live on 127.0.0.1; a bare root curl to them must not be
+    # routed through the proxy)
+    sed -i '/^--proxy/d' /root/.curlrc 2>/dev/null
+    sed -i '/^--noproxy/d' /root/.curlrc 2>/dev/null
     echo "--proxy $PROXY_URL" >> /root/.curlrc 2>/dev/null
+    echo "--noproxy localhost,127.0.0.1,::1,.local" >> /root/.curlrc 2>/dev/null
 
     echo "  Proxy configured (env vars + APT config + wget/curl)"
 fi

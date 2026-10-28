@@ -1,17 +1,37 @@
 
 # FusionPBX Settings
-domain_name=ip_address                      # hostname, ip_address or a custom value
-system_username=admin                       # default username admin
-system_password=random                      # random or a custom value
-system_branch=5.6                           # master, 5.6, 5.5
-                                             # 5.6: single point of entry (public/index.php)
-                                             # requires the SPE web server config (angie/fusionpbx)
+#
+# The ${var:-default} form respects a value inherited from the environment:
+# install.sh asks its interactive questions (resources/interactive.sh) AFTER
+# sourcing this file and exports the answers, and arguments.sh applies the
+# --with-* flags the same way - so the step scripts (run as CHILD processes
+# by run_step) keep the values when they source this file again. Without it
+# every child would reset the answers back to the defaults.
+
+domain_name="${domain_name:-ip_address}"             # hostname, ip_address or a custom value
+system_username="${system_username:-admin}"          # default username admin
+system_password="${system_password:-random}"         # random or a custom value
+system_branch="${system_branch:-5.6}"                # master, 5.6, 5.5
+                                                     # 5.6: single point of entry (public/index.php)
+                                                     # requires the SPE web server config (angie/fusionpbx)
+
+# ionCube Loader: a CLOSED-SOURCE PHP zend_extension required ONLY by
+# commercial FusionPBX add-ons distributed in encoded form. The stock
+# FusionPBX tree is plain open PHP and does not need it. Default OFF:
+# its download source is unreliable, the binary must match the exact PHP
+# minor version (breaks on every PHP update) and it is a third-party blob
+# in the php-fpm critical path. Enable with: --with-ioncube
+install_ioncube="${install_ioncube:-false}"           # true or false (default false)
 
 # FreeSWITCH Settings
-switch_branch=stable                        # master, stable
-switch_source=false                         # false — main FreeSWITCH from RPM; mod_pgsql built from source separately
-switch_package=true                         # Always true — use RPM packages from Alt Linux repository
-switch_tls=true                             # true or false
+# Same ${var:-default} inheritance as the FusionPBX settings above (the
+# --use-switch-* flags are applied by arguments.sh in the parent shell and
+# must survive into the child step scripts).
+switch_branch="${switch_branch:-stable}"             # master, stable
+switch_source="${switch_source:-false}"              # false — main FreeSWITCH from RPM; mod_pgsql built from source separately
+switch_package="${switch_package:-true}"            # Always true — use RPM packages from Alt Linux repository
+switch_package_all="${switch_package_all:-false}"   # install all FreeSWITCH modules (meta-package)
+switch_tls="${switch_tls:-true}"                     # true or false
 
 # Database Settings
 database_name=fusionpbx                     # Database name (safe characters A-Z, a-z, 0-9)

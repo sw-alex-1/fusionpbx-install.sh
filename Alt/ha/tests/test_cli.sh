@@ -354,6 +354,8 @@ echo "== help / argument handling =="
 ha_cli --help > "$WORK/out.log"
 grep -q "Usage:" "$WORK/out.log" && grep -q -- "--print-token" "$WORK/out.log"
 report "--help prints usage (exit $? )" $?
+grep -q "Interactive mode:" "$WORK/out.log"
+report "--help documents the interactive mode" "$?"
 
 ha_cli > "$WORK/out.log"; _rc=$?
 [ "$_rc" = "0" ] && grep -q "Usage:" "$WORK/out.log"
@@ -412,6 +414,57 @@ report "--init without node args refuses early" "$?"
 ha_cli --init --node2 not-an-ip --node3 10.0.0.13 > "$WORK/out.log" 2>&1; _rc=$?
 [ "$_rc" != "0" ] && grep -q "not a valid IPv4" "$WORK/out.log"
 report "--init with bad IPv4 refuses" "$?"
+
+# ---------------------------------------------------------------------------
+echo "== interactive picker: gates + join role cross-check =="
+# The picker asks ONLY with a terminal on stdin; piped/CI runs keep the
+# documented behavior ('no arguments -> help, exit 0') even WITHOUT the
+# sandbox gate - [ -t 0 ] is the first line of defense, HA_SANDBOX the second
+(
+    export HA_NO_COLOR=1 HA_ETC_DIR="$WORK/etc-empty" HA_RES_DIR="$REPO/Alt/ha/resources"
+    "$SCRIPT" </dev/null > "$WORK/out.log" 2>&1; echo $? > "$WORK/rc"
+)
+[ "$(cat "$WORK/rc")" = "0" ] && grep -q "Usage:" "$WORK/out.log"
+report "no args + piped stdin + NO sandbox: help, exit 0 (tty gate)" "$?"
+
+# join role cross-check: the picker's answer is verified against the
+# AUTHORITATIVE IP match from the token - a wrong human answer dies with a
+# clear reason instead of failing deep inside the join flow
+rm -rf "$WORK/etc-joinx"; mkdir -p "$WORK/etc-joinx"
+JOINX_TOKEN="$(gzip -c "$WORK/etc/cluster.conf" | base64 -w0 | tr -d '\n')"
+ha_joinx() {   # ha_joinx <pick-role> <fake-ip> - join with a real token fixture
+    (
+        export HA_SANDBOX=1 HA_NO_COLOR=1
+        export HA_ETC_DIR="$WORK/etc-joinx" HA_RES_DIR="$REPO/Alt/ha/resources"
+        export HA_L1_CONF="$WORK/l1-absent.conf"   # missing -> dies at the layer-1 preflight
+        export HA_PGDATA_DEFAULT="$WORK/pgdata"
+        export HA_SYSTEMD_DIR="$WORK/systemd"
+        export HA_LSYNCD_CONF="$WORK/lsyncd.conf.lua"
+        export HA_HOSTS_FILE="$WORK/hosts-cli"
+        export HA_SYNC_SSH_DIR="$WORK/sshdir"
+        export HA_RRSYNC_INSTALL_DIR="$WORK/bin"
+        export HA_IPTABLES_CONF="$WORK/iptables.rules"
+        export PATH="$FB:$PATH"
+        HA_PICK_ROLE="$1" FAKE_IP="$2" "$SCRIPT" --join "$JOINX_TOKEN"
+    )
+}
+
+ha_joinx witness 10.0.0.12 > "$WORK/out.log" 2>&1; _rc=$?
+[ "$_rc" != "0" ] && grep -q "not the witness" "$WORK/out.log"
+report "role cross-check: 'witness' answer + data-node token dies" "$?" "$(grep -m1 'token identifies' "$WORK/out.log")"
+
+ha_joinx data 10.0.0.13 > "$WORK/out.log" 2>&1; _rc=$?
+[ "$_rc" != "0" ] && grep -q "not a data node" "$WORK/out.log"
+report "role cross-check: 'data' answer + witness token dies" "$?" "$(grep -m1 'token identifies' "$WORK/out.log")"
+
+ha_joinx data 10.0.0.12 > "$WORK/out.log" 2>&1; _rc=$?
+[ "$_rc" != "0" ] && grep -q "layer 1 is not installed" "$WORK/out.log" \
+  && ! grep -q "token identifies" "$WORK/out.log"
+report "role cross-check: matching answer proceeds into the join flow" "$?" "$(grep -m1 -E 'layer 1 is not|token identifies' "$WORK/out.log")"
+
+ha_joinx "" 10.0.0.99 > "$WORK/out.log" 2>&1; _rc=$?
+[ "$_rc" != "0" ] && grep -q "IP is not in the cluster node list" "$WORK/out.log"
+report "join with a foreign IP still refuses (token stays authoritative)" "$?"
 
 # ---------------------------------------------------------------------------
 echo "== --init preflight: layer 1 required =="

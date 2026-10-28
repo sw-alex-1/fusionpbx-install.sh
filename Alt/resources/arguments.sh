@@ -11,7 +11,7 @@ if [ -z "$ARGUMENTS_PROCESSED" ]; then
     # Parse options using getopt
     # Fixed bug from original: used single quotes around $script_name preventing expansion
     # --proxy requires an argument (the colon after proxy means "takes a value")
-    ARGS=$(getopt -n "$script_name" -o h -l help,use-switch-source,use-switch-package-all,use-switch-master,use-system-master,no-cpu-check,force,proxy: -- "$@")
+    ARGS=$(getopt -n "$script_name" -o h -l help,use-switch-source,use-switch-package-all,use-switch-master,use-system-master,with-ioncube,no-cpu-check,force,proxy: -- "$@")
 
     if [ $? -ne 0 ]; then
         error "Failed parsing command line options."
@@ -23,6 +23,7 @@ if [ -z "$ARGUMENTS_PROCESSED" ]; then
     export USE_SWITCH_PACKAGE_ALL=false
     export USE_SWITCH_MASTER=false
     export USE_SYSTEM_MASTER=false
+    export USE_IONCUBE=false
     export CPU_CHECK=true
     export FORCE_INSTALL=false
     export ARGUMENTS_PROCESSED=true
@@ -30,7 +31,12 @@ if [ -z "$ARGUMENTS_PROCESSED" ]; then
     HELP=false
 
     # Process parsed options
+    # NOTE: the loop walks the RAW "$@" (getopt's ARGS is validation only);
+    # the guard makes it set -u safe - after the last shift "$@" is empty
+    # and a bare 'case "$1"' would die under 'set -u' (it silently hit the
+    # '*)' break without it). Same behavior, now POSIX-strict.
     while true; do
+        [ $# -gt 0 ] || break
         case "$1" in
             --use-switch-source )
                 export USE_SWITCH_SOURCE=true
@@ -46,6 +52,10 @@ if [ -z "$ARGUMENTS_PROCESSED" ]; then
                 ;;
             --use-system-master )
                 export USE_SYSTEM_MASTER=true
+                shift
+                ;;
+            --with-ioncube )
+                export USE_IONCUBE=true
                 shift
                 ;;
             --no-cpu-check )
@@ -85,6 +95,10 @@ if [ -z "$ARGUMENTS_PROCESSED" ]; then
         warning "  --use-switch-package-all Install all FreeSWITCH modules (meta-package)"
         warning "  --use-switch-master      Use FreeSWITCH master branch instead of ${green}(default: stable)"
         warning "  --use-system-master      Use FusionPBX master branch instead of ${green}(default: $system_branch)"
+        warning "  --with-ioncube           Also install the ionCube Loader (a closed-source"
+        warning "                           PHP extension needed ONLY by commercial encoded"
+        warning "                           FusionPBX add-ons; its download source is"
+        warning "                           unreliable and it breaks on PHP updates) ${green}(default: not installed)"
         warning "  --no-cpu-check           Skip CPU architecture validation ${green}(default: check enabled)"
         warning "  --force                  Bypass the installed-system protection"
         warning "                           DANGER: re-running on an installed system"
@@ -96,7 +110,10 @@ if [ -z "$ARGUMENTS_PROCESSED" ]; then
     fi
 
     # Apply argument overrides to config variables
-    # These override the defaults set in config.sh
+    # These override the defaults set in config.sh. The results are EXPORTED:
+    # the step scripts run as child processes (run_step) and source config.sh
+    # again - only the environment carries the applied values into them
+    # (config.sh keeps a pre-set value via its ${var:-default} defaults).
     if [ "$USE_SWITCH_SOURCE" = "true" ]; then
         switch_source=true
         switch_package=false
@@ -110,6 +127,11 @@ if [ -z "$ARGUMENTS_PROCESSED" ]; then
     if [ "$USE_SYSTEM_MASTER" = "true" ]; then
         system_branch=master
     fi
+    if [ "$USE_IONCUBE" = "true" ]; then
+        install_ioncube=true
+    fi
+    export switch_source switch_package switch_package_all switch_branch
+    export system_branch install_ioncube
 
     # Validate proxy format if specified
     if [ -n "$PROXY_SERVER" ]; then

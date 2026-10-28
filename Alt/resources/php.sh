@@ -245,94 +245,105 @@ else
 fi
 
 # =============================================================================
-# Install ionCube Loader (x86_64 only)
-# Alt Linux has no conf.d directory, so we add the zend_extension
-# directly to php.ini files.
+# ionCube Loader (OPTIONAL, off by default)
+#
+# A closed-source PHP zend_extension required ONLY by commercial FusionPBX
+# add-ons distributed in encoded form - the stock FusionPBX tree is plain
+# open PHP and does not need it. Disabled by default (config.sh):
+# its download source is unreliable, the loader binary must match the exact
+# PHP minor version (it breaks on every PHP update) and it is a third-party
+# blob in the php-fpm critical path. Enable with: --with-ioncube
+#
+# Alt Linux has no conf.d directory, so the zend_extension line goes
+# directly into the php.ini files.
 # =============================================================================
 
-if [ "$cpu_architecture" = 'x86' ]; then
-    verbose "Installing ionCube Loader for x86_64..."
+_ioncube_so=""
 
-    _ioncube_dir="/usr/src/ioncube"
-    _ioncube_loader="ioncube_loader_lin_${php_version}.so"
-    _ioncube_so=""
+if [ "${install_ioncube:-false}" != "true" ]; then
+    verbose "ionCube Loader: not requested - skipping (enable with --with-ioncube)"
+else
+    if [ "$cpu_architecture" = 'x86' ]; then
+        verbose "Installing ionCube Loader for x86_64 (--with-ioncube)..."
 
-    # Download ionCube if not already present
-    if [ ! -f "${_ioncube_dir}/${_ioncube_loader}" ]; then
-        verbose "Downloading ionCube Loader..."
-        pkg_install unzip
+        _ioncube_dir="/usr/src/ioncube"
+        _ioncube_loader="ioncube_loader_lin_${php_version}.so"
 
-        _ioncube_tmp="/usr/src/ioncube_tmp"
-        rm -rf "$_ioncube_tmp"
-        mkdir -p "$_ioncube_tmp"
+        # Download ionCube if not already present
+        if [ ! -f "${_ioncube_dir}/${_ioncube_loader}" ]; then
+            verbose "Downloading ionCube Loader..."
+            pkg_install unzip
 
-#            "https://downloads.ioncube.com/loader_downloads/ioncube_loaders_lin_x86-64.zip" \
-        wget --no-check-certificate -q \
-            "https://swgs.ru/files/ioncube_loaders_lin_x86-64.zip" \
-            -O "${_ioncube_tmp}/ioncube.zip" || {
-            warn "Failed to download ionCube Loader (non-critical, continuing)"
+            _ioncube_tmp="/usr/src/ioncube_tmp"
             rm -rf "$_ioncube_tmp"
-        }
+            mkdir -p "$_ioncube_tmp"
 
-        if [ -f "${_ioncube_tmp}/ioncube.zip" ]; then
-            cd "$_ioncube_tmp"
-            unzip -q -o ioncube.zip
-            # ioncube zip extracts to an "ioncube" subdirectory
-            if [ -d "ioncube" ]; then
-                mkdir -p "$_ioncube_dir"
-                cp -r ioncube/* "$_ioncube_dir/"
-            fi
-            cd "$SCRIPT_DIR"
-            rm -rf "$_ioncube_tmp"
-        fi
-    fi
+            wget --no-check-certificate -q \
+                "https://swgs.ru/files/ioncube_loaders_lin_x86-64.zip" \
+                -O "${_ioncube_tmp}/ioncube.zip" || {
+                warn "Failed to download ionCube Loader (non-critical, continuing)"
+                rm -rf "$_ioncube_tmp"
+            }
 
-    # Install the loader if we have it
-    if [ -f "${_ioncube_dir}/${_ioncube_loader}" ]; then
-        # Copy the .so to PHP extension directory (detected dynamically)
-        if [ -d "$_php_extension_dir" ]; then
-            cp "${_ioncube_dir}/${_ioncube_loader}" "${_php_extension_dir}/" 2>/dev/null
-            _ioncube_so="${_php_extension_dir}/${_ioncube_loader}"
-            verbose "ionCube loader copied to: $_ioncube_so"
-        fi
-
-        # Add zend_extension to php.ini files
-        # Since Alt Linux has no conf.d, we add it directly to php.ini
-        # Must be the FIRST zend_extension (before any others)
-        if [ -n "$_ioncube_so" ] && [ -f "$_ioncube_so" ]; then
-            _ioncube_line="zend_extension = ${_ioncube_so}"
-
-            for _ini in "$_php_fpm_ini" "$_php_cli_ini"; do
-                if [ -f "$_ini" ]; then
-                    # Remove any existing ioncube line first (idempotent)
-                    sed -i '/ioncube_loader_lin/d' "$_ini"
-
-                    # Add as the first line before any other zend_extension
-                    # Using sed to insert before the first zend_extension line
-                    if grep -q '^zend_extension' "$_ini"; then
-                        sed -i "0,/^zend_extension/{s|^zend_extension|${_ioncube_line}\nzend_extension|}" "$_ini"
-                    else
-                        # No existing zend_extension — append to Dynamic Extensions section
-                        if grep -q '^; Dynamic Extensions' "$_ini"; then
-                            sed -i "/^; Dynamic Extensions/a ${_ioncube_line}" "$_ini"
-                        else
-                            # Last resort: append to end of file
-                            echo "$_ioncube_line" >> "$_ini"
-                        fi
-                    fi
-                    verbose "ionCube configured in: $_ini"
+            if [ -f "${_ioncube_tmp}/ioncube.zip" ]; then
+                cd "$_ioncube_tmp"
+                unzip -q -o ioncube.zip
+                # ioncube zip extracts to an "ioncube" subdirectory
+                if [ -d "ioncube" ]; then
+                    mkdir -p "$_ioncube_dir"
+                    cp -r ioncube/* "$_ioncube_dir/"
                 fi
-            done
+                cd "$SCRIPT_DIR"
+                rm -rf "$_ioncube_tmp"
+            fi
+        fi
+
+        # Install the loader if we have it
+        if [ -f "${_ioncube_dir}/${_ioncube_loader}" ]; then
+            # Copy the .so to PHP extension directory (detected dynamically)
+            if [ -d "$_php_extension_dir" ]; then
+                cp "${_ioncube_dir}/${_ioncube_loader}" "${_php_extension_dir}/" 2>/dev/null
+                _ioncube_so="${_php_extension_dir}/${_ioncube_loader}"
+                verbose "ionCube loader copied to: $_ioncube_so"
+            fi
+
+            # Add zend_extension to php.ini files
+            # Since Alt Linux has no conf.d, we add it directly to php.ini
+            # Must be the FIRST zend_extension (before any others)
+            if [ -n "$_ioncube_so" ] && [ -f "$_ioncube_so" ]; then
+                _ioncube_line="zend_extension = ${_ioncube_so}"
+
+                for _ini in "$_php_fpm_ini" "$_php_cli_ini"; do
+                    if [ -f "$_ini" ]; then
+                        # Remove any existing ioncube line first (idempotent)
+                        sed -i '/ioncube_loader_lin/d' "$_ini"
+
+                        # Add as the first line before any other zend_extension
+                        if grep -q '^zend_extension' "$_ini"; then
+                            sed -i "0,/^zend_extension/{s|^zend_extension|${_ioncube_line}\nzend_extension|}" "$_ini"
+                        else
+                            # No existing zend_extension — append to Dynamic Extensions section
+                            if grep -q '^; Dynamic Extensions' "$_ini"; then
+                                sed -i "/^; Dynamic Extensions/a ${_ioncube_line}" "$_ini"
+                            else
+                                # Last resort: append to end of file
+                                echo "$_ioncube_line" >> "$_ini"
+                            fi
+                        fi
+                        verbose "ionCube configured in: $_ini"
+                    fi
+                done
+            else
+                warn "ionCube loader .so not found at: ${_php_extension_dir}/${_ioncube_loader}"
+                warn "ionCube will not be available (non-critical for basic FusionPBX)"
+            fi
         else
-            warn "ionCube loader .so not found at: ${_php_extension_dir}/${_ioncube_loader}"
+            warn "ionCube loader for PHP ${php_version} not found in $_ioncube_dir"
             warn "ionCube will not be available (non-critical for basic FusionPBX)"
         fi
     else
-        warn "ionCube loader for PHP ${php_version} not found in $_ioncube_dir"
-        warn "ionCube will not be available (non-critical for basic FusionPBX)"
+        verbose "ionCube requested (--with-ioncube) but not available for $cpu_architecture architecture (skipping)"
     fi
-else
-    verbose "ionCube not available for $cpu_architecture architecture (skipping)"
 fi
 
 # =============================================================================

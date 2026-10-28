@@ -31,8 +31,15 @@
 #
 # Usage:
 #   ./install.sh                              # Default installation
+#                                             # On a terminal the installer first asks a
+#                                             # few questions (interactive mode; Enter
+#                                             # accepts each default): proxy, domain,
+#                                             # admin password. Without a terminal on
+#                                             # stdin it runs fully unattended.
 #   ./install.sh --use-switch-source          # Build FreeSWITCH from source
 #   ./install.sh --use-switch-master          # Use FreeSWITCH master branch
+#   ./install.sh --with-ioncube               # Also install the ionCube Loader
+#                                             # (only for commercial encoded add-ons)
 #   ./install.sh --no-cpu-check               # Skip CPU validation
 #   ./install.sh --proxy 192.168.0.1:8080     # Use HTTP proxy
 #   ./install.sh --force                      # DANGER: run even if FusionPBX
@@ -153,6 +160,21 @@ run_step() {
 guard_check_installed
 
 # =============================================================================
+# Interactive questions (terminal only)
+#
+# resources/interactive.sh - asked BEFORE the proxy configuration (a answered
+# proxy must reach every network operation) and AFTER the installed-system
+# guard (no questions on a system where the installer will refuse anyway).
+# Rules: every question has a safe default; CLI flags are never re-asked;
+# without a terminal on stdin (piped / ssh / CI) zero questions are asked.
+# The answers are exported - the step scripts run as child processes and
+# re-source config.sh, whose ${var:-default} defaults keep them.
+# =============================================================================
+
+. "$SCRIPT_DIR/resources/interactive.sh"
+interactive_install_questions
+
+# =============================================================================
 # Skip CPU check if requested
 # =============================================================================
 
@@ -181,6 +203,17 @@ verbose "  FreeSWITCH:    $switch_branch ($([ "$switch_package" = "true" ] && ec
 verbose "  PostgreSQL:    $database_version ($pg_package)"
 verbose "  Web user:      $web_user:$web_group"
 verbose "  FS user:       $fs_user:$fs_group"
+if [ "$domain_name" != "ip_address" ] && [ "$domain_name" != "hostname" ]; then
+    verbose "  Domain:        $domain_name"
+else
+    verbose "  Domain:        this node's IP address (the default)"
+fi
+if [ "$system_password" != "random" ]; then
+    verbose "  Admin user:    $system_username (password: set interactively)"
+else
+    verbose "  Admin user:    $system_username (password: random, shown at the end)"
+fi
+verbose "  ionCube:       $install_ioncube"
 if [ -n "$PROXY_SERVER" ]; then
     verbose "  Proxy:         $PROXY_SERVER"
 fi

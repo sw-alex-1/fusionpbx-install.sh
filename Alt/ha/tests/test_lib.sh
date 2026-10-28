@@ -2661,6 +2661,70 @@ echo "$_dc36" | grep -qF 'sudo works for the postgres user' \
 report "doctor: the postgres->sudo exec check with the heal commands (0.3.36)" $?
 
 # ---------------------------------------------------------------------------
+echo "== layer-1 proxy.sh probe + ha_apply_proxy sandbox gate (0.3.37) =="
+
+# probe: the repo layout (script in Alt/, resources in Alt/ha/resources)
+# resolves the layer-1 proxy.sh next to the layer-1 installer - the legacy
+# $HA_RES_DIR/../resources formula pointed INSIDE the HA resource dir in
+# every layout, and --proxy silently never configured APT
+lib_run '_hl1p_norm=$(cd "$(dirname -- "$HA_LAYER1_PROXY_SH")" && pwd)/$(basename -- "$HA_LAYER1_PROXY_SH"); echo "L1=$_hl1p_norm"'
+[ "$OUT" = "L1=$REPO/Alt/resources/proxy.sh" ]
+report "layer-1 proxy.sh probed: repo layout finds Alt/resources/proxy.sh" "$?" "$OUT"
+
+# probe: an exported HA_LAYER1_PROXY_SH is never overwritten
+(
+    export HA_SANDBOX=1 HA_RES_DIR="$RES" HA_NO_COLOR=1 HA_LAYER1_PROXY_SH=/custom/override.sh
+    # shellcheck disable=SC1090
+    . "$LIB" >/dev/null 2>&1
+    [ "$HA_LAYER1_PROXY_SH" = "/custom/override.sh" ]
+)
+report "layer-1 proxy.sh probe: an explicit value is never overwritten" "$?"
+
+# probe: a layout with no layer-1 next to it -> empty (env-only fallback)
+mkdir -p "$WORK/res-only"
+(
+    export HA_SANDBOX=1 HA_RES_DIR="$WORK/res-only" HA_NO_COLOR=1
+    # shellcheck disable=SC1090
+    . "$LIB" >/dev/null 2>&1
+    [ -z "$HA_LAYER1_PROXY_SH" ]
+)
+report "layer-1 proxy.sh probe: nothing found -> empty (env-only fallback)" "$?"
+
+# ha_apply_proxy: OUTSIDE the sandbox the layer-1 proxy.sh IS sourced (the
+# real fix - APT gets its /etc/apt/apt.conf proxy lines); inside the sandbox
+# it is NEVER sourced (it writes REAL system configs - the suite contract:
+# nothing outside $WORK), the env-only fallback still sets the env vars
+mkdir -p "$WORK/l1proxy"
+cat > "$WORK/l1proxy/proxy.sh" <<'PSEOF'
+#!/bin/sh
+# fixture of the layer-1 proxy.sh: writes the marker AND sets the env vars
+# (like the real one does - the sourcing branch does not set them itself)
+echo "FIXTURE-PROXY-SOURCED" > "$HA_L1PROXY_MARKER"
+export http_proxy="http://$PROXY_SERVER" https_proxy="http://$PROXY_SERVER"
+PSEOF
+(
+    export HA_RES_DIR="$RES" HA_NO_COLOR=1 HA_L1PROXY_MARKER="$WORK/l1proxy/applied"
+    export HA_LAYER1_PROXY_SH="$WORK/l1proxy/proxy.sh" PROXY_SERVER="10.0.0.9:3128"
+    unset HA_SANDBOX
+    # shellcheck disable=SC1090
+    . "$LIB"
+    ha_apply_proxy >/dev/null 2>&1
+    [ -f "$WORK/l1proxy/applied" ] && [ "${http_proxy:-}" = "http://10.0.0.9:3128" ]
+)
+report "ha_apply_proxy: outside the sandbox the layer-1 proxy.sh IS sourced" "$?"
+
+rm -f "$WORK/l1proxy/applied"
+(
+    export HA_RES_DIR="$RES" HA_NO_COLOR=1 HA_SANDBOX=1 HA_L1PROXY_MARKER="$WORK/l1proxy/applied"
+    export HA_LAYER1_PROXY_SH="$WORK/l1proxy/proxy.sh" PROXY_SERVER="10.0.0.9:3128"
+    # shellcheck disable=SC1090
+    . "$LIB"
+    ha_apply_proxy >/dev/null 2>&1
+    [ ! -f "$WORK/l1proxy/applied" ] && [ "${http_proxy:-}" = "http://10.0.0.9:3128" ]
+)
+report "ha_apply_proxy: inside the sandbox NEVER sourced (env-only), env still set" "$?"
+
+# ---------------------------------------------------------------------------
 echo
 echo "RESULT: PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]

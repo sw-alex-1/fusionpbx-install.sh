@@ -11,6 +11,10 @@
 # Full design: Alt/ha/DESIGN.md. Operations manual: Alt/ha/RUNBOOK.md.
 #
 # Commands:
+#   fusionpbx-ha.sh                            # interactive (terminal only):
+#                                             # asks the node role (primary /
+#                                             # standby / witness), the role's
+#                                             # arguments and the proxy
 #   fusionpbx-ha.sh --init --node2 IP --node3 IP [--cluster-name NAME]
 #   fusionpbx-ha.sh --join TOKEN            # TOKEN = string or @file
 #   fusionpbx-ha.sh --repair [--force-clone]
@@ -19,7 +23,8 @@
 #   fusionpbx-ha.sh --print-token           # re-print the join token (node 1)
 #
 # Common flags:
-#   --yes        non-interactive (answers all confirmations with yes)
+#   --yes        non-interactive (answers all confirmations with yes;
+#                also disables the interactive questions)
 #   --force      ignore the step state file (full pass over installed state)
 #   --no-color   no ANSI colors
 #   --verbose    shell trace (set -x)
@@ -69,6 +74,10 @@ HA_CLUSTER_NAME="fpbx-ha"
 HA_FORCE_CLONE=false
 HA_FORCE_RUN=0
 HA_VERBOSE=0
+HA_PICK_ROLE="${HA_PICK_ROLE:-}"             # set by the interactive picker (or
+                                    # the environment - automation); the join
+                                    # flow cross-checks it against the
+                                    # authoritative IP match from the token
 PROXY_SERVER=""
 
 ARGS=$(getopt -n "fusionpbx-ha.sh" \
@@ -110,6 +119,111 @@ done
 proxy_server_valid \
     || die "--proxy expects host:port (e.g. 192.168.0.1:8080), got: '$PROXY_SERVER'"
 
+# =============================================================================
+# Interactive questions (a human behind a terminal)
+#
+# The UX rule: instead of memorizing flags, a human runs the script bare and
+# answers a few questions. Every question has a safe default or re-asks until
+# valid; anything already given on the command line is NEVER asked for again
+# (CLI wins). Never asks when: stdin is not a terminal (piped / ssh without
+# -t / CI - takes the documented defaults and dies on missing arguments,
+# exactly as before), --yes (automation), or HA_SANDBOX=1 (the test suite
+# depends on 'no arguments -> help, exit 0' with piped stdin).
+# =============================================================================
+
+ha_ask() {          # ha_ask "question" [default] - prints the answer
+    _haq_q="$1"
+    _haq_def="${2:-}"
+    # the prompt goes to STDERR: the answer is consumed via command
+    # substitution and a prompt on stdout would glue itself to the answer
+    if [ -n "$_haq_def" ]; then
+        printf '%s [%s]: ' "$_haq_q" "$_haq_def" >&2
+    else
+        printf '%s: ' "$_haq_q" >&2
+    fi
+    read -r _haq_ans || { printf '\n' >&2; printf '%s\n' "$_haq_def"; return 0; }
+    [ -z "$_haq_ans" ] && _haq_ans="$_haq_def"
+    printf '%s\n' "$_haq_ans"
+}
+
+ha_interactive_pick() {
+    [ -t 0 ] || return 0
+    [ "${HA_SANDBOX:-0}" = "1" ] && return 0
+    [ "${HA_AUTO_YES:-0}" = "1" ] && return 0
+
+    # a bare run on an already-joined node: the picker would only lead into
+    # a refusal - answer the likely intent right away
+    if [ -z "$HA_COMMAND" ] && [ -f "$HA_MARKER_FILE" ]; then
+        info ""
+        info "This node is already part of an HA cluster ($HA_MARKER_FILE)."
+        info "Maintenance: --status, --doctor; node problems: --repair;"
+        info "the full usage: fusionpbx-ha.sh --help"
+        exit 0
+    fi
+
+    if [ -z "$HA_COMMAND" ]; then
+        info ""
+        info "No command given - answer a few questions to set this node up"
+        info "(Ctrl-C to abort and see the full usage with --help)."
+        info ""
+        info "  1) primary - the FIRST data node: --init (asks the node 2 and"
+        info "     witness IPs, prints the join token at the end)"
+        info "  2) standby - the SECOND data node: --join (asks the token)"
+        info "  3) witness - the witness node: --join (asks the same token)"
+        info ""
+        case "$(ha_ask "This node's role in the cluster (1/2/3)" "1")" in
+            1|primary) HA_COMMAND="init" ;;
+            2|standby) HA_COMMAND="join"; HA_PICK_ROLE="data" ;;
+            3|witness) HA_COMMAND="join"; HA_PICK_ROLE="witness" ;;
+            *) die "unrecognized role answer (expected 1, 2 or 3) - run with --help for the usage" ;;
+        esac
+    fi
+
+    # fill the arguments the chosen (or given) command is missing
+    case "$HA_COMMAND" in
+        init)
+            while [ -z "$HA_INIT_NODE2_IP" ] || ! valid_ip "$HA_INIT_NODE2_IP"; do
+                [ -n "$HA_INIT_NODE2_IP" ] && info "  '$HA_INIT_NODE2_IP' is not a valid IPv4 address"
+                HA_INIT_NODE2_IP="$(ha_ask "IP of the SECOND data node (--node2)" "")"
+                [ -z "$HA_INIT_NODE2_IP" ] && info "  (required - Ctrl-C to abort)"
+            done
+            while [ -z "$HA_INIT_NODE3_IP" ] || ! valid_ip "$HA_INIT_NODE3_IP"; do
+                [ -n "$HA_INIT_NODE3_IP" ] && info "  '$HA_INIT_NODE3_IP' is not a valid IPv4 address"
+                HA_INIT_NODE3_IP="$(ha_ask "IP of the WITNESS node (--node3)" "")"
+                [ -z "$HA_INIT_NODE3_IP" ] && info "  (required - Ctrl-C to abort)"
+            done
+            [ "$HA_INIT_NODE2_IP" != "$HA_INIT_NODE3_IP" ] \
+                || die "node 2 and the witness must be different hosts (got: $HA_INIT_NODE2_IP)"
+            ;;
+        join)
+            if [ -z "$HA_JOIN_TOKEN" ] && [ -z "$HA_CONFIG_FILE" ]; then
+                HA_JOIN_TOKEN="$(ha_ask "Join token printed by --init on node 1 (string or @file)" "")"
+                [ -n "$HA_JOIN_TOKEN" ] || die "a join token is required (--join TOKEN)"
+            fi
+            ;;
+    esac
+
+    # proxy for the commands that install packages; cluster traffic always
+    # goes direct (ha_apply_no_proxy, DESIGN.md 5.1)
+    case "$HA_COMMAND" in
+        init|join|repair)
+            if [ -z "$PROXY_SERVER" ]; then
+                while :; do
+                    _hip_p="$(ha_ask "HTTP proxy for outbound internet, host:port (empty = direct connection)" "")"
+                    [ -z "$_hip_p" ] && break
+                    PROXY_SERVER="$_hip_p"
+                    proxy_server_valid && break
+                    info "  not a host:port proxy format: $_hip_p"
+                    PROXY_SERVER=""
+                done
+                [ -n "$PROXY_SERVER" ] \
+                    && info "  proxy: $PROXY_SERVER (cluster traffic always goes direct)"
+            fi
+            ;;
+    esac
+}
+ha_interactive_pick
+
 ha_print_help() {
     cat <<'HELP'
 fusionpbx-ha.sh - FusionPBX HA cluster add-on for ALT Linux
@@ -139,6 +253,17 @@ Usage:
 
   fusionpbx-ha.sh --print-token
       Re-print the join token (only on node 1, where --init was run).
+
+Interactive mode:
+  Run the script with NO command on a terminal and it asks:
+    - this node's role in the cluster (primary / standby / witness)
+    - the arguments the role needs (--node2/--node3 IPs or the join token)
+    - an HTTP proxy for outbound internet (empty = direct; cluster traffic
+      always goes direct)
+  A bare Enter takes the shown default; anything already passed on the
+  command line is never asked for again. Without a terminal on stdin
+  (piped / ssh / CI), with --yes, or with an already-joined node nothing
+  is asked - the bare run prints this help instead.
 
 Common flags:
   --yes            non-interactive; all confirmations answered with yes
@@ -1935,6 +2060,19 @@ Maintenance of a joined node is done with: fusionpbx-ha.sh --repair"
     HA_CLUSTER_CONF="$HA_JOIN_TMP_CONF"
     ha_load_cluster_conf
     ha_detect_role || die "this host's IP is not in the cluster node list - the token belongs to another cluster/network"
+
+    # Interactive picker cross-check: the human's role answer (if any) is
+    # verified against the authoritative IP match from the token - a wrong
+    # answer dies HERE with a clear reason instead of confusing failures
+    # somewhere deep in the join flow.
+    if [ -n "${HA_PICK_ROLE:-}" ]; then
+        if [ "$HA_PICK_ROLE" = "witness" ] && [ "$HA_NODE_ID" != "3" ]; then
+            die "the token identifies this host as a DATA node (node $HA_NODE_ID), not the witness - check the token or the role answer"
+        fi
+        if [ "$HA_PICK_ROLE" = "data" ] && [ "$HA_NODE_ID" = "3" ]; then
+            die "the token identifies this host as the WITNESS (node 3), not a data node - check the token or the role answer"
+        fi
+    fi
     HA_CLUSTER_CONF="$HA_ETC_DIR/cluster.conf"   # from here on: the real path
     HA_JOIN_ROLE="standby"
     [ "$HA_NODE_ID" = "3" ] && HA_JOIN_ROLE="witness"

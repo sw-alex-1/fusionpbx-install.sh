@@ -38,7 +38,7 @@ else
 fi
 [ "$_fail" = "0" ]
 
-for t in test_lib.sh test_render.sh test_cli.sh test_agent.sh; do
+for t in test_lib.sh test_render.sh test_cli.sh test_agent.sh test_layer1.sh; do
     echo
     echo "--- $t ---"
     _out=$(bash "$HERE/$t" 2>&1)
