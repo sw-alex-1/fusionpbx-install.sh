@@ -1306,7 +1306,7 @@ cmd_status() {
         1)
             verbose "  standby (in recovery); receiving:"
             pg_runuser_psql -d postgres -tAc \
-                "SELECT '  upstream: '||COALESCE(sender_host,'?')||'  lag bytes: '||COALESCE(pg_wal_lsn_diff(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn()),0)" \
+                "SELECT '  upstream: '||COALESCE(sender_host,'?')||'  lag bytes: '||COALESCE(pg_wal_lsn_diff(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn()),0) FROM pg_stat_wal_receiver" \
                 2>/dev/null | sed 's/^/  /'
             ;;
         *) warn "local PostgreSQL is not reachable" ;;
