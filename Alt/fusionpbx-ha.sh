@@ -16,9 +16,11 @@
 #                                             # standby / witness), the role's
 #                                             # arguments and the proxy
 #   fusionpbx-ha.sh --init --node2 IP --node3 IP [--cluster-name NAME]
-#   fusionpbx-ha.sh --join TOKEN            # TOKEN = string or @file
+#   fusionpbx-ha.sh --join TOKEN            # TOKEN = string or @file; a data
+#                                             # node's DB-wipe consent: UP FRONT (0.3.40)
 #   fusionpbx-ha.sh --repair [--force-clone]
-#   fusionpbx-ha.sh --status
+#   fusionpbx-ha.sh --status [--json]       # --json: the web-status snapshot
+#                                             # (schema v1, DESIGN.md section 19)
 #   fusionpbx-ha.sh --doctor
 #   fusionpbx-ha.sh --print-token           # re-print the join token (node 1)
 #
@@ -27,6 +29,7 @@
 #                also disables the interactive questions)
 #   --force      ignore the step state file (full pass over installed state)
 #   --no-color   no ANSI colors
+#   --json       with --status: machine-readable JSON on stdout
 #   --verbose    shell trace (set -x)
 #   --proxy H:P  outbound internet through an HTTP(S) proxy (same semantics
 #                as the layer-1 install.sh; cluster traffic goes direct)
@@ -78,11 +81,12 @@ HA_PICK_ROLE="${HA_PICK_ROLE:-}"             # set by the interactive picker (or
                                     # the environment - automation); the join
                                     # flow cross-checks it against the
                                     # authoritative IP match from the token
+HA_JSON=0
 PROXY_SERVER=""
 
 ARGS=$(getopt -n "fusionpbx-ha.sh" \
     -o h \
-    -l help,init,join:,config:,repair,status,doctor,print-token,yes,force,no-color,verbose,force-clone,proxy:,node2:,node3:,cluster-name: \
+    -l help,init,join:,config:,repair,status,doctor,print-token,yes,force,no-color,verbose,force-clone,json,proxy:,node2:,node3:,cluster-name: \
     -- "$@") || { error "failed parsing command line options"; exit 1; }
 
 eval set -- "$ARGS"
@@ -99,6 +103,7 @@ while true; do
         --force)         HA_FORCE_RUN=1; shift ;;
         --force-clone)   HA_FORCE_CLONE=true; shift ;;
         --no-color)      HA_NO_COLOR=1; shift ;;
+        --json)          HA_JSON=1; shift ;;
         --verbose)       HA_VERBOSE=1; shift ;;
         --proxy)         PROXY_SERVER="$2"; shift 2 ;;
         --node2)         HA_INIT_NODE2_IP="$2"; shift 2 ;;
@@ -241,6 +246,9 @@ Usage:
       On VM2/VM3 (or a rebuilt node): join the cluster. The role is picked
       automatically by matching the local IP with the node list inside the
       token. TOKEN is the printed string or @/path/to/file.
+      A DATA node's local database is WIPED and cloned from the primary:
+      the confirmation is asked UP FRONT, before any step runs (the
+      witness join touches no local database; --yes skips the question).
 
   fusionpbx-ha.sh --repair [--force-clone]
       Return a node to the cluster after a failure/rebuild/replacement.
@@ -248,8 +256,10 @@ Usage:
       --force-clone: wipe the local PGDATA and re-clone from the primary
       (use when the local data directory is damaged or brand new).
 
-  fusionpbx-ha.sh --status
-      Compact live summary (read-only).
+  fusionpbx-ha.sh --status [--json]
+      Compact live summary (read-only). --json prints the same facts as one
+      machine-readable JSON object on stdout (schema v1; used by the Status
+      -> Cluster web page and its dashboard widget via the status cron).
 
   fusionpbx-ha.sh --doctor
       Deep health check with an exit code for monitoring (0 = healthy).
@@ -691,6 +701,17 @@ init_step_15_finalize() {
     fi
 }
 
+init_step_16_webapp() {
+    # 0.3.40: the web status add-on on the PRIMARY: app files + the
+    # registration rows + the status cron + the first snapshot. Runs LAST:
+    # the standby's clone (its join step 5) must already carry the rows.
+    # The rows also reach an ALREADY-joined standby by replication when
+    # --init --force re-runs this step (idempotent, fixed UUIDs).
+    ha_install_web_app primary
+    verbose "  web status ready: Status -> Cluster + the dashboard widget"
+    verbose "  (menu and widget appear after the next web login)"
+}
+
 # =============================================================================
 # --join : step functions - DESIGN.md sections 8.2 (standby) / 8.3 (witness)
 # The role is picked by matching the local IP with the node list in the token
@@ -796,22 +817,12 @@ join_step_3_packages() {
     fi
 }
 
-join_step_4_confirm_and_stop_pg() {
-    [ "$HA_NODE_ID" != "3" ] || die "internal error: join_step_4_confirm_and_stop_pg called on the witness"
+join_step_4_stop_pg() {
+    [ "$HA_NODE_ID" != "3" ] || die "internal error: join_step_4_stop_pg called on the witness"
 
-    echo "" >&2
-    echo "${red:-}=========================================================================${normal:-}" >&2
-    echo "${red:-} THE LOCAL DATABASE WILL BE REPLACED BY A CLONE OF $(ha_peer_name) ${normal:-}" >&2
-    echo "${red:-}=========================================================================${normal:-}" >&2
-    echo "" >&2
-    echo "The local standalone FusionPBX database and everything configured on THIS" >&2
-    echo "node will be WIPED and replaced with a physical copy of $(ha_peer_ip)." >&2
-    echo "Media files stay; the cluster configuration comes from the token." >&2
-    echo "" >&2
-    if ! confirm "Type YES (or run with --yes) to wipe and clone:"; then
-        die "aborted by the operator - nothing was changed"
-    fi
-
+    # 0.3.40: the destructive consent moved UP into cmd_join (before ANY
+    # step runs) - see join_ask_wipe_consent. This step only stops the
+    # local services so the clone can replace the data directory.
     svc_stop "$HA_LSYNCD_SERVICE"
     svc_stop "$HA_REPMGRD_SERVICE"
     svc_stop "$HA_PG_SERVICE"
@@ -910,6 +921,15 @@ join_step_11_finalize() {
     verbose ""
     verbose "  the primary now runs synchronous replication to this node (RPO = 0)"
     verbose "Next: 'fusionpbx-ha.sh --doctor' on this node."
+}
+
+join_step_12_webapp() {
+    # 0.3.40: the web status add-on on the STANDBY: files + cron only. The
+    # registration rows (menu/permission/widget) were written by the
+    # primary's --init and arrived with the CLONE (step 5) - a standby's
+    # database is read-only, ha_install_web_app verifies instead of writing
+    ha_install_web_app standby
+    verbose "  web status ready: Status -> Cluster + the dashboard widget"
 }
 
 # -----------------------------------------------------------------------------
@@ -1532,6 +1552,229 @@ cmd_status() {
 }
 
 # =============================================================================
+# --status --json (0.3.40): machine-readable status for the web UI.
+#
+# One collector, two renderers: the probes live in the shared helpers
+# (ha_local_role_code, ha_agent_code, ha_quorum_ok, pg_runuser_psql,
+# pg_psql_app) exactly like cmd_status and cmd_doctor - the JSON below is
+# only another PROJECTION of the same facts, not a second implementation.
+#
+# Consumers: 'fusionpbx-ha.sh --status --json' on stdout; the status cron
+# materializes it into /var/lib/fusionpbx-ha/status.json (atomic tmp+mv);
+# the FusionPBX app (Status -> Cluster + the dashboard widget) reads that
+# file server-side and never runs a probe itself.
+#
+# Schema v1 (see Alt/ha/web/cluster/cluster.php):
+#   schema, generated_at(_epoch), cluster, node{id,name,ip,role},
+#   local_pg (primary|standby|up|down - 'up' = the witness metadata db),
+#   nodes[ all three: kind data|witness, state
+#         primary|standby|down|agent-down | reachable|unreachable|up|down ],
+#   replication{mode,state,lag_bytes,peer} (null on the witness),
+#   entry_point (true|false|null), services[{name,active}],
+#   health (ok|degraded|fail), health_reasons[...]
+#
+# The verdict is deliberately COARSER than --doctor (the deep diagnostic
+# stays the CLI tool); it answers "what does an administrator need to see
+# on a wall display refreshed every few minutes". Rules:
+#   fail:     local PG down; repmgrd inactive; frozen sync writes; a
+#             standby not receiving; entry point not reaching the primary
+#   degraded: async mode; witness/peer unreachable; non-critical services
+#   ok:       everything else
+# =============================================================================
+
+ha_status_json() {
+    ha_detect_role || die "this host's IP is not in the cluster node list"
+
+    _sj_now_iso="$(date '+%Y-%m-%dT%H:%M:%S%z')"
+    _sj_now_epoch="$(date '+%s')"
+    _sj_health="ok"
+    _sj_reasons_json=""
+
+    # a note upgrades the verdict: fail is sticky, anything lifts ok
+    _sj_note() {
+        # _sj_note <ok|degraded|fail> <reason text>
+        [ "$_sj_health" = "fail" ] || _sj_health="$1"
+        _sj_reasons_json="$_sj_reasons_json\"$(ha_json_str "$2")\","
+    }
+
+    # --- local PostgreSQL ---
+    _sj_lrc=0; ha_local_role_code || _sj_lrc=$?
+    if [ "$HA_NODE_ID" = "3" ]; then
+        case "$_sj_lrc" in 0) _sj_localpg="up" ;; *) _sj_localpg="down" ;; esac
+    else
+        case "$_sj_lrc" in 0) _sj_localpg="primary" ;; 1) _sj_localpg="standby" ;; *) _sj_localpg="down" ;; esac
+    fi
+
+    # --- replication facts (data nodes; the witness streams nothing) ---
+    _sj_rep_mode=""; _sj_rep_state=""; _sj_rep_lag=0; _sj_rep_peer=""
+    _sj_syncnames=""
+    if [ "$HA_NODE_ID" != "3" ]; then
+        if [ "$_sj_localpg" = "primary" ]; then
+            _sj_syncnames="$(pg_runuser_psql -tAc "SHOW synchronous_standby_names" 2>/dev/null | tr -d ' \r')"
+            _sj_row="$(pg_runuser_psql -d postgres -tAc "SELECT application_name||'|'||state||'|'||sync_state||'|'||COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), write_lsn),0) FROM pg_stat_replication WHERE application_name='$(ha_node_name 2)'" 2>/dev/null | tr -d ' \r')"
+            if [ -n "$_sj_row" ]; then
+                _sj_rep_peer="$(printf '%s' "$_sj_row" | cut -d'|' -f1)"
+                _sj_rep_state="$(printf '%s' "$_sj_row" | cut -d'|' -f2)"
+                _sj_rep_lag="$(printf '%s' "$_sj_row" | cut -d'|' -f4)"
+                case "$(printf '%s' "$_sj_row" | cut -d'|' -f3)" in
+                    sync|quorum) _sj_rep_mode="sync" ;;
+                    *)           _sj_rep_mode="async" ;;
+                esac
+            else
+                _sj_rep_mode="none"
+            fi
+        elif [ "$_sj_localpg" = "standby" ]; then
+            _sj_rep_peer="$(ha_peer_name)"
+            _sj_rep_lag="$(pg_runuser_psql -d postgres -tAc "SELECT COALESCE(pg_wal_lsn_diff(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn()),0) FROM pg_stat_wal_receiver" 2>/dev/null | tr -d ' \r')"
+            if [ -n "$_sj_rep_lag" ]; then
+                _sj_rep_mode="streaming"
+                _sj_rep_state="streaming"
+                # the sync/async verdict lives on the PRIMARY; the peer IS
+                # the upstream in this two-data-node design - ask it as the
+                # postgres user (the data-role .pgpass carries the line).
+                # A failed ask is not a health problem: mode stays plain
+                # "streaming" and the primary's own page tells the rest.
+                if [ "$(ha_agent_code "$(ha_peer_ip)")" = "200" ]; then
+                    _sj_ss="$(pg_psql_superuser "$(ha_peer_ip)" -tAc "SELECT sync_state FROM pg_stat_replication WHERE application_name='$(ha_node_name "$HA_NODE_ID")'" 2>/dev/null | tr -d ' \r')"
+                    case "$_sj_ss" in
+                        sync|quorum) _sj_rep_mode="sync" ;;
+                        async)       _sj_rep_mode="async" ;;
+                    esac
+                fi
+            else
+                _sj_rep_mode="none"
+                _sj_rep_lag=0
+            fi
+        else
+            _sj_rep_mode="unknown"
+        fi
+        case "$_sj_rep_lag" in ''|*[!0-9]*) _sj_rep_lag=0 ;; esac
+    fi
+
+    # --- per-node states as seen from THIS node ---
+    # data node: primary | standby | down | agent-down (up but role-agent dead)
+    _sj_data_node_state() {
+        _sjds_id="$1"
+        if [ "$_sjds_id" = "$HA_NODE_ID" ]; then
+            printf '%s\n' "$_sj_localpg"
+            return
+        fi
+        _sjds_ip="$(ha_node_ip "$_sjds_id")"
+        _sjds_code="$(ha_agent_code "$_sjds_ip")"
+        case "$_sjds_code" in
+            200) printf 'primary\n' ;;
+            503) if ha_quorum_ok "$_sjds_ip"; then printf 'standby\n'; else printf 'down\n'; fi ;;
+            *)   if ha_quorum_ok "$_sjds_ip"; then printf 'agent-down\n'; else printf 'down\n'; fi ;;
+        esac
+    }
+    _sj_n1="$(_sj_data_node_state 1)"
+    _sj_n2="$(_sj_data_node_state 2)"
+
+    # witness state: reachable|unreachable (remote view) / up|down (own view)
+    if [ "$HA_NODE_ID" = "3" ]; then
+        case "$_sj_localpg" in up) _sj_wstate="up" ;; *) _sj_wstate="down" ;; esac
+    else
+        if ha_quorum_ok "$(ha_node_ip 3)"; then _sj_wstate="reachable"; else _sj_wstate="unreachable"; fi
+    fi
+
+    # --- entry point (data nodes) ---
+    _sj_ep_json="null"
+    if [ "$HA_NODE_ID" != "3" ]; then
+        _sj_probe="$(pg_psql_app 127.0.0.1 -p "$HA_HAPROXY_PORT" -tAc "SELECT pg_is_in_recovery()" 2>/dev/null | tr -d ' \r')"
+        if [ "$_sj_probe" = "f" ]; then
+            _sj_ep_json="true"
+        else
+            _sj_ep_json="false"
+            _sj_note fail "entry point 127.0.0.1:$HA_HAPROXY_PORT does not reach the primary (haproxy down / no primary?)"
+        fi
+    fi
+
+    # --- services ---
+    _sj_svcs_json=""
+    if [ "$HA_NODE_ID" = "3" ]; then
+        _sj_svcset="$HA_PG_SERVICE $HA_REPMGRD_SERVICE"
+    else
+        _sj_svcset="$HA_PG_SERVICE $HA_REPMGRD_SERVICE $HA_HAPROXY_SERVICE $HA_AGENT_UNIT_NAME $HA_LSYNCD_SERVICE angie freeswitch sshd"
+    fi
+    for _sj_svc in $_sj_svcset; do
+        if svc_active "$_sj_svc" 2>/dev/null; then _sj_act="true"; else _sj_act="false"; fi
+        _sj_svcs_json="$_sj_svcs_json{\"name\":\"$(ha_json_str "$_sj_svc")\",\"active\":$_sj_act},"
+    done
+    _sj_svcs_json="${_sj_svcs_json%,}"
+
+    # --- health verdict ---
+    if [ "$HA_NODE_ID" = "3" ]; then
+        [ "$_sj_localpg" != "down" ] || _sj_note fail "local metadata database is down"
+        svc_active "$HA_REPMGRD_SERVICE" 2>/dev/null \
+            || _sj_note fail "repmgrd is not active - this witness cannot vote"
+        [ "$_sj_n1" != "down" ] || _sj_note degraded "quorum link to $(ha_node_name 1) is down - election majority at risk"
+        [ "$_sj_n2" != "down" ] || _sj_note degraded "quorum link to $(ha_node_name 2) is down - election majority at risk"
+    else
+        [ "$_sj_localpg" != "down" ] || _sj_note fail "local PostgreSQL is down"
+        svc_active "$HA_REPMGRD_SERVICE" 2>/dev/null \
+            || _sj_note fail "repmgrd is not active - automatic failover will not happen"
+        if [ "$_sj_localpg" = "primary" ]; then
+            if [ -z "$_sj_rep_state" ]; then
+                if [ -n "$_sj_syncnames" ] && [ "$_sj_syncnames" != "(disabled)" ]; then
+                    _sj_note fail "writes are frozen: synchronous_standby_names is set but no standby is streaming"
+                else
+                    _sj_note degraded "async mode: no standby is streaming (no failover protection)"
+                fi
+            else
+                [ "$_sj_rep_mode" = "sync" ] \
+                    || _sj_note degraded "replication is async (sync_state is not sync)"
+            fi
+        elif [ "$_sj_localpg" = "standby" ]; then
+            [ "$_sj_rep_mode" != "none" ] \
+                || _sj_note fail "this standby is not receiving from its upstream"
+        fi
+        if [ "$HA_NODE_ID" = "1" ]; then _sj_peer_state="$_sj_n2"; else _sj_peer_state="$_sj_n1"; fi
+        case "$_sj_peer_state" in
+            down)       _sj_note degraded "$(ha_peer_name) is down" ;;
+            agent-down) _sj_note degraded "$(ha_peer_name) is up but its role-agent is dead (haproxy routing is blind)" ;;
+        esac
+        [ "$_sj_wstate" != "unreachable" ] \
+            || _sj_note degraded "witness $(ha_node_ip 3) unreachable - automatic failover is disabled"
+        for _sj_svc in "$HA_HAPROXY_SERVICE" "$HA_AGENT_UNIT_NAME" "$HA_LSYNCD_SERVICE" angie freeswitch sshd; do
+            svc_active "$_sj_svc" 2>/dev/null \
+                || _sj_note degraded "service $_sj_svc is not active"
+        done
+    fi
+
+    # --- assemble ---
+    _sj_nodes_json=""
+    for _sj_id in 1 2 3; do
+        case "$_sj_id" in
+            1) _sj_nstate="$_sj_n1" ;;
+            2) _sj_nstate="$_sj_n2" ;;
+            *) _sj_nstate="$_sj_wstate" ;;
+        esac
+        if [ "$_sj_id" = "3" ]; then _sj_kind="witness"; else _sj_kind="data"; fi
+        _sj_nodes_json="$_sj_nodes_json{\"id\":$_sj_id,\"name\":\"$(ha_json_str "$(ha_node_name "$_sj_id")")\",\"ip\":\"$(ha_node_ip "$_sj_id")\",\"kind\":\"$_sj_kind\",\"state\":\"$_sj_nstate\"},"
+    done
+    _sj_nodes_json="${_sj_nodes_json%,}"
+
+    if [ "$HA_NODE_ID" = "3" ]; then
+        _sj_rep_json="null"
+    else
+        _sj_rep_json="$(printf '{"mode":"%s","state":"%s","lag_bytes":%s,"peer":"%s"}' \
+            "$_sj_rep_mode" "$_sj_rep_state" "$_sj_rep_lag" "$(ha_json_str "$_sj_rep_peer")")"
+    fi
+    if [ -n "$_sj_reasons_json" ]; then
+        _sj_reasons_json="${_sj_reasons_json%,}"
+    else
+        _sj_reasons_json=""
+    fi
+
+    printf '{"schema":1,"generated_at":"%s","generated_at_epoch":%s,"cluster":"%s","node":{"id":%s,"name":"%s","ip":"%s","role":"%s"},"local_pg":"%s","nodes":[%s],"replication":%s,"entry_point":%s,"services":[%s],"health":"%s","health_reasons":[%s]}\n' \
+        "$_sj_now_iso" "$_sj_now_epoch" "$(ha_json_str "${HA_CLUSTER_NAME:-unknown}")" \
+        "$HA_NODE_ID" "$(ha_json_str "$(ha_node_name "$HA_NODE_ID")")" \
+        "$(ha_node_ip "$HA_NODE_ID")" "$(ha_json_str "${HA_ROLE:-unknown}")" \
+        "$_sj_localpg" "$_sj_nodes_json" "$_sj_rep_json" "$_sj_ep_json" \
+        "$_sj_svcs_json" "$_sj_health" "$_sj_reasons_json"
+}
+
+# =============================================================================
 # --doctor : deep check list; exit 0 = healthy, 1 = failures (for monitoring)
 # =============================================================================
 
@@ -2082,7 +2325,8 @@ cmd_init() {
         init_step_12_standby_status \
         init_step_13_sync_on \
         init_step_14_sync_setup \
-        init_step_15_finalize
+        init_step_15_finalize \
+        init_step_16_webapp
     verbose ""
     # 0.3.39: with no peer waits the command can complete while the peers
     # are not joined yet - say which of the two endings this was
@@ -2090,6 +2334,46 @@ cmd_init() {
         verbose "=== Cluster initialization completed successfully ==="
     else
         verbose "=== Node bootstrap completed - join the peers next (see the summary above) ==="
+    fi
+}
+
+# =============================================================================
+# Join consent (0.3.40): the destructive question asked BEFORE any step runs.
+#
+# The operator's complaint (28.10): the "local database will be replaced"
+# confirmation used to live in join step 4 - AFTER preflight, unpack and the
+# package downloads, i.e. after many minutes of waiting. An operator who
+# answers NO at that point has watched the whole preparation for nothing.
+# The consent is now asked in cmd_join right after the token is unpacked,
+# the role is detected and the resume state is settled: at that point
+# nothing has been modified on this host yet (the state freshen above only
+# discards a stale state file), and a NO costs one second, not ten minutes.
+#
+# Resume semantics: a state file whose step 4 is already marked means the
+# earlier run got this exact consent (and very likely already wiped and
+# re-cloned the data directory) - it is not asked again, exactly like the
+# old step-4 behavior. --force re-asks (--force re-runs every step).
+# The witness join never touches a local database: no consent there.
+# =============================================================================
+join_ask_wipe_consent() {
+    [ "$HA_NODE_ID" != "3" ] || return 0
+    if [ "${HA_FORCE:-0}" != "1" ] && ha_state_step_is_done 4; then
+        verbose "  data-wipe consent: already given by the earlier run (resume past step 4)"
+        return 0
+    fi
+
+    echo "" >&2
+    echo "${red:-}=========================================================================${normal:-}" >&2
+    echo "${red:-} THE LOCAL DATABASE WILL BE REPLACED BY A CLONE OF $(ha_peer_name) ${normal:-}" >&2
+    echo "${red:-}=========================================================================${normal:-}" >&2
+    echo "" >&2
+    echo "The local standalone FusionPBX database and everything configured on THIS" >&2
+    echo "node will be WIPED and replaced with a physical copy of $(ha_peer_ip)." >&2
+    echo "Media files stay; the cluster configuration comes from the token." >&2
+    echo "" >&2
+    if ! confirm "Type YES (or run with --yes) to wipe and clone:"; then
+        die "aborted - the local database will NOT be touched, nothing was changed
+(non-interactive / automated joins must pass --yes)"
     fi
 }
 
@@ -2140,6 +2424,13 @@ Maintenance of a joined node is done with: fusionpbx-ha.sh --repair"
     # mismatched state file is discarded and the join re-runs from step 1.
     ha_join_state_freshen "$HA_JOIN_TMP_CONF"
 
+    # 0.3.40: the destructive consent BEFORE anything touches this host -
+    # the token is unpacked, the role is authoritative and a resume past
+    # step 4 is detected; steps 1-3 (probes, unpack, package downloads)
+    # must not cost the operator minutes just to learn the join wipes the
+    # local database.
+    join_ask_wipe_consent
+
     # Resume convergence (0.3.13): a join-standby state file means an
     # earlier attempt ran - possibly with an older script whose sync-key
     # line sshd now refuses to parse ('invalid key option string' in the
@@ -2178,14 +2469,15 @@ Maintenance of a joined node is done with: fusionpbx-ha.sh --repair"
             join_step_1_preflight \
             join_step_2_unpack \
             join_step_3_packages \
-            join_step_4_confirm_and_stop_pg \
+            join_step_4_stop_pg \
             join_step_5_clone \
             join_step_6_start_register \
             join_step_7_agent_haproxy \
             join_step_8_repoint_dsn \
             join_step_9_seed_media \
             join_step_10_lsyncd_start \
-            join_step_11_finalize
+            join_step_11_finalize \
+            join_step_12_webapp
     fi
     rm -f "$HA_JOIN_TMP_CONF"
     trap - INT TERM EXIT
@@ -2213,6 +2505,22 @@ A rebuilt node joins with: fusionpbx-ha.sh --join TOKEN
     # exactly what a boot-race kill relies on to come back.
     ha_install_repmgr_dropin
     [ "$HA_NODE_ID" != "3" ] && ha_install_lsyncd_dropin
+
+    # 0.3.40: converge the web status add-on (files + cron +, on the
+    # primary, the registration rows). WARN-only (subshell - die() inside
+    # is exit, not a catchable rc): the cluster's health does not depend
+    # on the monitoring cosmetics, and a repaired node must not fail
+    # because of a web-tree hiccup - the next install command converges
+    # it fully.
+    if [ "$HA_NODE_ID" != "3" ]; then
+        if ha_local_is_primary; then
+            ( ha_install_web_app primary ) \
+                || warn "web status add-on not converged on this primary (non-fatal) - re-run this node's install command"
+        else
+            ( ha_install_web_app standby ) \
+                || warn "web status add-on not converged on this standby (non-fatal) - re-run this node's install command"
+        fi
+    fi
 
     if [ "$HA_NODE_ID" = "3" ]; then
         ha_run_sequence "repair-witness" \
@@ -2262,7 +2570,8 @@ case "$HA_COMMAND" in
     init)    cmd_init ;;
     join)    cmd_join ;;
     repair)  cmd_repair ;;
-    status)  ha_load_cluster_conf; cmd_status ;;
+    status)  ha_load_cluster_conf
+              if [ "$HA_JSON" = "1" ]; then ha_status_json; else cmd_status; fi ;;
     doctor)  ha_load_cluster_conf; cmd_doctor ;;
     print-token) ha_load_cluster_conf; cmd_print_token ;;
     *)       ha_print_help; [ -z "$HA_COMMAND" ] && exit 0 || exit 1 ;;

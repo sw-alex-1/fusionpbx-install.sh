@@ -92,8 +92,28 @@ if [ -n "${PGPASSFILE:-}" ] && [ -n "${PSQL_QUORUM_FAIL:-}" ] \
     echo "psql: error: connection to server at \"$_h\", port 5432 failed: fe_sendauth: no password supplied" >&2
     exit 2
 fi
+# 0.3.40: every executed statement is appended to PSQL_SQL_LOG (the webapp
+# install tests assert the registration INSERTs and the standby's NON-writes)
+printf '%s\n' "$_sql" >>"${PSQL_SQL_LOG:-/dev/null}" 2>/dev/null
 case "$_sql" in
-    *pg_is_in_recovery*) echo "${PSQL_RECOVERY:-f}" ;;
+    # 0.3.40: the webapp registration lookups (fixed fixture uuids) and the
+    # standby's read-only row verify (PSQL_MENU_ROWS=0 simulates the rows
+    # not having replicated yet)
+    *"SELECT menu_uuid FROM v_menus"*) echo "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee" ;;
+    *"SELECT group_uuid FROM v_groups"*) echo "11111111-2222-4333-8444-555555555555" ;;
+    *"count(*) FROM v_menu_items"*) echo "${PSQL_MENU_ROWS-1}" ;;
+    # 0.3.40: the entry-point probe goes through 127.0.0.1:5433 (haproxy)
+    # and reaches the PRIMARY - on a standby fixture it must answer 'f',
+    # not the local PSQL_RECOVERY. PSQL_ENTRYPOINT simulates a broken
+    # routing when set to something else.
+    *pg_is_in_recovery*)
+        if [ "$_h" = "127.0.0.1" ]; then echo "${PSQL_ENTRYPOINT:-f}"; else echo "${PSQL_RECOVERY:-f}"; fi ;;
+    # 0.3.40: the JSON status collector's primary replication row
+    # (application_name|state|sync_state|lag). Must sit BEFORE *sync_state*
+    # and *pg_wal_lsn_diff* - the query contains both words. Empty value =
+    # standby not streaming (mode none). The cmd_status display query hits
+    # this too (cosmetic, unasserted).
+    *pg_current_wal_lsn*) echo "${PSQL_REPROW-fpbx-ha-2|streaming|sync|0}" ;;
     *"count(*) FROM pg_stat_replication"*) echo "${PSQL_STREAMING:-1}" ;;
     *sync_state*) echo "${PSQL_SYNCSTATE:-sync}" ;;
     *synchronous_standby_names*) echo "${PSQL_SYNCNAMES:-}" ;;
@@ -110,8 +130,13 @@ case "$_sql" in
     *"SELECT 1 FROM pg_database"*) echo 1 ;;
     *"SELECT 1 FROM repmgr.nodes WHERE node_id=3"*) echo "${PSQL_NODE3:-1}" ;;
     *"SELECT 1 FROM pg_stat_replication WHERE application_name"*) echo "${PSQL_APPNAME:-1}" ;;
-    *"pg_wal_lsn_diff"*) echo "0" ;;
+    # 0.3.40: sender_host FIRST (the cmd_status standby display query also
+    # contains pg_last_wal_receive_lsn and must keep its own answer), then
+    # the JSON collector's standby lag probe (a bare number; empty = the
+    # standby receives nothing)
     *"sender_host"*) echo "  upstream: 10.0.0.11  lag bytes: 0" ;;
+    *"pg_last_wal_receive_lsn"*) echo "${PSQL_RECVROW-0}" ;;
+    *"pg_wal_lsn_diff"*) echo "0" ;;
     *) : ;;
 esac
 exit "${PSQL_RC:-0}"
@@ -457,10 +482,28 @@ ha_joinx data 10.0.0.13 > "$WORK/out.log" 2>&1; _rc=$?
 [ "$_rc" != "0" ] && grep -q "not a data node" "$WORK/out.log"
 report "role cross-check: 'data' answer + witness token dies" "$?" "$(grep -m1 'token identifies' "$WORK/out.log")"
 
-ha_joinx data 10.0.0.12 > "$WORK/out.log" 2>&1; _rc=$?
+ha_joinx data 10.0.0.12 < /dev/null > "$WORK/out.log" 2>&1; _rc=$?
+# 0.3.40: the destructive consent now runs BEFORE any step - with no
+# terminal (EOF) and no --yes it must refuse IMMEDIATELY, before the
+# layer-1 preflight, and leave nothing behind
+[ "$_rc" != "0" ] && grep -q "REPLACED BY A CLONE" "$WORK/out.log" \
+  && grep -q "aborted - the local database will NOT be touched" "$WORK/out.log" \
+  && ! grep -q "step 1/" "$WORK/out.log" \
+  && [ ! -f "$WORK/etc-joinx/cluster.conf" ]
+report "join consent: EOF without --yes refuses BEFORE any step (nothing written)" "$?" "$(grep -m1 'aborted' "$WORK/out.log")"
+
+echo YES | ha_joinx data 10.0.0.12 > "$WORK/out.log" 2>&1; _rc=$?
 [ "$_rc" != "0" ] && grep -q "layer 1 is not installed" "$WORK/out.log" \
   && ! grep -q "token identifies" "$WORK/out.log"
 report "role cross-check: matching answer proceeds into the join flow" "$?" "$(grep -m1 -E 'layer 1 is not|token identifies' "$WORK/out.log")"
+
+echo NO | ha_joinx data 10.0.0.12 > "$WORK/out.log" 2>&1; _rc=$?
+[ "$_rc" != "0" ] && grep -q "REPLACED BY A CLONE" "$WORK/out.log" \
+  && grep -q "aborted" "$WORK/out.log" \
+  && ! grep -q "step 1/" "$WORK/out.log" \
+  && [ ! -f "$WORK/etc-joinx/cluster.conf" ] \
+  && [ ! -f "$WORK/etc-joinx/.installer-state" ]
+report "join consent: explicit NO refuses before any step or state file" "$?"
 
 ha_joinx "" 10.0.0.99 > "$WORK/out.log" 2>&1; _rc=$?
 [ "$_rc" != "0" ] && grep -q "IP is not in the cluster node list" "$WORK/out.log"
@@ -469,7 +512,7 @@ report "join with a foreign IP still refuses (token stays authoritative)" "$?"
 # ---------------------------------------------------------------------------
 echo "== --init preflight: layer 1 required =="
 ha_cli --init --node2 10.0.0.12 --node3 10.0.0.13 > "$WORK/out.log" 2>&1; _rc=$?
-[ "$_rc" != "0" ] && grep -q "STEP 1/15 (init_step_1_preflight) FAILED" "$WORK/out.log" \
+[ "$_rc" != "0" ] && grep -q "STEP 1/16 (init_step_1_preflight) FAILED" "$WORK/out.log" \
   && grep -q "layer 1 is not installed" "$WORK/out.log" \
   && grep -q "resume from step 1" "$WORK/out.log"
 report "--init without layer 1: banner + resume hint" "$?" "$(grep -m1 'layer 1' "$WORK/out.log")"
@@ -511,7 +554,7 @@ ha_init_fresh() {
 ha_init_fresh > "$WORK/out.log" 2>&1
 # step 3 (packages) is EXPECTED to fail in the sandbox (stubbed apt-get);
 # the regression under test is that steps 1-2 complete cleanly before it
-grep -q "STEP 3/15 (init_step_3_packages) FAILED" "$WORK/out.log" \
+grep -q "STEP 3/16 (init_step_3_packages) FAILED" "$WORK/out.log" \
   && ! grep -Eqi 'unbound|не заданы' "$WORK/out.log"
 report "fresh --init: steps 1-2 pass, no unbound variable" "$?" "$(grep -m1 -Ei 'unbound|не заданы' "$WORK/out.log")"
 
@@ -539,9 +582,9 @@ echo "== --init resume: completed steps are skipped =="
 ha_init_fresh > "$WORK/out.log" 2>&1
 grep -q "resuming from the state file" "$WORK/out.log" \
   && [ "$(grep -c "already done, skipping" "$WORK/out.log")" = "2" ] \
-  && grep -q "STEP 3/15 (init_step_3_packages) FAILED" "$WORK/out.log" \
-  && ! grep -q "STEP 1/15" "$WORK/out.log" \
-  && ! grep -q "STEP 2/15" "$WORK/out.log"
+  && grep -q "STEP 3/16 (init_step_3_packages) FAILED" "$WORK/out.log" \
+  && ! grep -q "STEP 1/16" "$WORK/out.log" \
+  && ! grep -q "STEP 2/16" "$WORK/out.log"
 report "resume: steps 1-2 skipped, fails at 3 only" "$?"
 
 echo "== --init resume with different --node2: cluster.conf wins =="
@@ -549,7 +592,7 @@ rm -f "$WORK/etc-fresh/.installer-state"
 ha_init_fresh 10.0.0.99 > "$WORK/out.log" 2>&1
 grep -q "the cluster.conf values win" "$WORK/out.log" \
   && grep -q "existing $WORK/etc-fresh/cluster.conf kept" "$WORK/out.log" \
-  && ! grep -q "STEP 1/15" "$WORK/out.log" && ! grep -q "STEP 2/15" "$WORK/out.log"
+  && ! grep -q "STEP 1/16" "$WORK/out.log" && ! grep -q "STEP 2/16" "$WORK/out.log"
 report "--node2 mismatch: warning + existing conf kept, steps 1-2 fine" "$?"
 _tok2="$(grep -E '^[A-Za-z0-9+/=]{100,}$' "$WORK/out.log" | head -1)"
 [ "$_tok1" = "$_tok2" ]
@@ -579,6 +622,94 @@ echo "== --status when PostgreSQL is down =="
 PSQL_RC=2 ha_cli --status > "$WORK/out.log" 2>&1; _rc=$?
 [ "$_rc" = "0" ] && grep -q "local PostgreSQL is not reachable" "$WORK/out.log"
 report "--status tolerates a down database (read-only)" "$?"
+
+# ---------------------------------------------------------------------------
+echo "== --status --json (0.3.40: the web status collector) =="
+# the healthy primary fixture: one JSON object on stdout, valid (python
+# json.loads), schema 1, health ok, all three nodes classified
+ha_cli --status --json > "$WORK/status.json" 2>"$WORK/status.err"; _rc=$?
+[ "$_rc" = "0" ] && [ -s "$WORK/status.json" ] \
+  && python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$WORK/status.json" 2>/dev/null
+report "--status --json: exit 0, one VALID json document" "$?"
+grep -q '"schema":1' "$WORK/status.json" \
+  && grep -q '"name":"fpbx-ha-1"' "$WORK/status.json" \
+  && grep -q '"role":"primary"' "$WORK/status.json" \
+  && grep -q '"local_pg":"primary"' "$WORK/status.json"
+report "--status --json: schema + node identity" "$?"
+grep -q '"mode":"sync"' "$WORK/status.json" \
+  && grep -q '"peer":"fpbx-ha-2"' "$WORK/status.json" \
+  && grep -q '"entry_point":true' "$WORK/status.json"
+report "--status --json: replication sync + entry point ok" "$?"
+grep -q '"state":"primary"' "$WORK/status.json" \
+  && grep -q '"state":"standby"' "$WORK/status.json" \
+  && grep -q '"kind":"witness"' "$WORK/status.json" \
+  && grep -q '"state":"reachable"' "$WORK/status.json"
+report "--status --json: all three nodes classified" "$?"
+grep -q '"health":"ok"' "$WORK/status.json" \
+  && grep -q '"health_reasons":\[\]' "$WORK/status.json"
+report "--status --json: healthy fixture -> health ok, no reasons" "$?"
+grep -q '"name":"postgresql","active":true' "$WORK/status.json" \
+  && grep -q '"name":"repmgr","active":true' "$WORK/status.json"
+report "--status --json: services list" "$?"
+
+echo "== --status --json: the standby view =="
+# node 2: local standby receiving, peer primary says sync - the collector
+# must ask the PEER for the sync_state of this node's stream
+FAKE_IP=10.0.0.12 PSQL_RECOVERY=t CURL_CODES="10.0.0.11=200,10.0.0.12=503" \
+    ha_cli --status --json > "$WORK/status.json" 2>/dev/null; _rc=$?
+[ "$_rc" = "0" ] \
+  && grep -q '"local_pg":"standby"' "$WORK/status.json" \
+  && grep -q '"mode":"sync"' "$WORK/status.json" \
+  && grep -q '"peer":"fpbx-ha-1"' "$WORK/status.json" \
+  && grep -q '"health":"ok"' "$WORK/status.json"
+report "--status --json: standby view (mode from the primary's answer)" "$?"
+
+echo "== --status --json: standby NOT receiving =="
+FAKE_IP=10.0.0.12 PSQL_RECOVERY=t PSQL_RECVROW="" \
+    ha_cli --status --json > "$WORK/status.json" 2>/dev/null; _rc=$?
+[ "$_rc" = "0" ] && grep -q '"mode":"none"' "$WORK/status.json" \
+  && grep -q '"health":"fail"' "$WORK/status.json" \
+  && grep -q "not receiving from its upstream" "$WORK/status.json"
+report "--status --json: standby not receiving -> fail + reason" "$?"
+
+echo "== --status --json: frozen writes on the primary =="
+# sync names armed but the standby stream gone - the writer-freeze shape
+PSQL_REPROW="" PSQL_SYNCNAMES="fpbx-ha-2" ha_cli --status --json > "$WORK/status.json" 2>/dev/null; _rc=$?
+[ "$_rc" = "0" ] && grep -q '"mode":"none"' "$WORK/status.json" \
+  && grep -q '"health":"fail"' "$WORK/status.json" \
+  && grep -q "writes are frozen" "$WORK/status.json"
+report "--status --json: frozen sync writes -> fail + reason" "$?"
+
+echo "== --status --json: async replication =="
+PSQL_REPROW="fpbx-ha-2|streaming|async|512" ha_cli --status --json > "$WORK/status.json" 2>/dev/null; _rc=$?
+[ "$_rc" = "0" ] && grep -q '"mode":"async"' "$WORK/status.json" \
+  && grep -q '"lag_bytes":512' "$WORK/status.json" \
+  && grep -q '"health":"degraded"' "$WORK/status.json" \
+  && grep -q "replication is async" "$WORK/status.json"
+report "--status --json: async mode -> degraded + lag passed through" "$?"
+
+echo "== --status --json: witness unreachable =="
+PSQL_QUORUM_FAIL="10.0.0.13" ha_cli --status --json > "$WORK/status.json" 2>/dev/null; _rc=$?
+[ "$_rc" = "0" ] && grep -q '"state":"unreachable"' "$WORK/status.json" \
+  && grep -q '"health":"degraded"' "$WORK/status.json" \
+  && grep -q "automatic failover is disabled" "$WORK/status.json"
+report "--status --json: witness unreachable -> degraded (auth probe, not TCP)" "$?"
+
+echo "== --status --json: the witness node view =="
+FAKE_IP=10.0.0.13 ha_cli --status --json > "$WORK/status.json" 2>/dev/null; _rc=$?
+[ "$_rc" = "0" ] && grep -q '"local_pg":"up"' "$WORK/status.json" \
+  && grep -q '"replication":null' "$WORK/status.json" \
+  && grep -q '"entry_point":null' "$WORK/status.json" \
+  && grep -q '"health":"ok"' "$WORK/status.json"
+report "--status --json: witness view (no replication, no entry point)" "$?"
+
+echo "== --status --json: local PostgreSQL down =="
+PSQL_RC=2 ha_cli --status --json > "$WORK/status.json" 2>/dev/null; _rc=$?
+[ "$_rc" = "0" ] && grep -q '"local_pg":"down"' "$WORK/status.json" \
+  && grep -q '"health":"fail"' "$WORK/status.json" \
+  && grep -q "local PostgreSQL is down" "$WORK/status.json" \
+  && python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$WORK/status.json" 2>/dev/null
+report "--status --json: everything down still yields VALID fail json" "$?"
 
 # ---------------------------------------------------------------------------
 echo "== --doctor =="
@@ -818,6 +949,188 @@ report "token unpacks to the exact cluster.conf" $?
 FAKE_IP=10.0.0.12 ha_cli --print-token > "$WORK/out.log" 2>&1; _rc=$?
 [ "$_rc" != "0" ] && grep -q "node 1 only" "$WORK/out.log"
 report "--print-token refused on other nodes" "$?"
+
+# ---------------------------------------------------------------------------
+echo "== web status add-on: --init resume into step 16 (0.3.40) =="
+# the real step wiring: a state file with steps 1-15 done makes --init
+# resume STRAIGHT into init_step_16_webapp (primary: files + registration
+# SQL + cron + the first snapshot)
+rm -rf "$WORK/etc-web" "$WORK/www" "$WORK/crond" "$WORK/var-ha"
+mkdir -p "$WORK/etc-web" "$WORK/crond"
+cp "$WORK/etc/cluster.conf" "$WORK/etc-web/cluster.conf"
+{
+    echo "command=init"
+    echo "started=now"
+    _ws_i=0
+    for _ws_n in preflight config_gen packages pg_prep wal_log_hints repmgr_conf \
+                 primary_register agent haproxy repoint_dsn witness_status \
+                 standby_status sync_on sync_setup finalize; do
+        _ws_i=$((_ws_i + 1))
+        echo "step_ok=$_ws_i init_step_${_ws_i}_${_ws_n}"
+    done
+} > "$WORK/etc-web/.installer-state"
+: > "$WORK/webapp-sql.log"
+
+ha_init_web() {
+    (
+        export HA_SANDBOX=1 HA_NO_COLOR=1
+        export HA_ETC_DIR="$WORK/etc-web" HA_RES_DIR="$REPO/Alt/ha/resources"
+        export HA_L1_CONF="$WORK/l1.conf" HA_HOSTS_FILE="$WORK/hosts-cli"
+        export HA_PGDATA_DEFAULT="$WORK/pgdata"
+        export HA_WEB_DIR="$WORK/www" HA_CRON_FILE="$WORK/crond/fusionpbx-ha-status"
+        export HA_VAR_DIR="$WORK/var-ha" HA_STATUS_FILE="$WORK/var-ha/status.json"
+        export HA_SYSTEMD_DIR="$WORK/systemd"
+        export HA_HAPROXY_CONF_D="$WORK/haproxy.d" HA_LSYNCD_CONF="$WORK/lsyncd.conf.lua"
+        export HA_SYNC_SSH_DIR="$WORK/sshdir" HA_RRSYNC_INSTALL_DIR="$WORK/bin"
+        export HA_IPTABLES_CONF="$WORK/iptables.rules"
+        export HA_WEB_USER="$(id -un)" HA_WEB_GROUP="$(id -gn)"
+        export PSQL_SQL_LOG="$WORK/webapp-sql.log"
+        export PATH="$FB:$PATH"
+        "$SCRIPT" --init --node2 10.0.0.12 --node3 10.0.0.13 --yes
+    )
+}
+ha_init_web > "$WORK/out.log" 2>&1; _rc=$?
+[ "$_rc" = "0" ] && grep -q "step 16/16: init_step_16_webapp" "$WORK/out.log" \
+  && [ "$(grep -c "already done, skipping" "$WORK/out.log")" = "15" ]
+report "--init resume: skips 1-15, runs step 16/16 (webapp)" "$?"
+
+[ -f "$WORK/www/app/cluster/cluster.php" ] \
+  && [ -f "$WORK/www/app/cluster/app_config.php" ] \
+  && [ -f "$WORK/www/app/cluster/app_menu.php" ] \
+  && [ -f "$WORK/www/app/cluster/app_languages.php" ] \
+  && [ -f "$WORK/www/app/cluster/resources/status_reader.php" ] \
+  && [ -f "$WORK/www/app/cluster/resources/dashboard/config.php" ] \
+  && [ -f "$WORK/www/app/cluster/resources/dashboard/cluster.php" ]
+report "web app files installed into the web tree (7 files)" "$?"
+
+grep -q "INSERT INTO v_menu_items" "$WORK/webapp-sql.log" \
+  && grep -q "ON CONFLICT (menu_item_uuid) DO NOTHING" "$WORK/webapp-sql.log" \
+  && grep -q "INSERT INTO v_menu_languages" "$WORK/webapp-sql.log" \
+  && grep -q "INSERT INTO v_group_permissions" "$WORK/webapp-sql.log" \
+  && grep -q "cluster_view" "$WORK/webapp-sql.log" \
+  && grep -q "INSERT INTO v_dashboard_widgets" "$WORK/webapp-sql.log" \
+  && grep -q "INSERT INTO v_dashboard_widget_groups" "$WORK/webapp-sql.log"
+report "registration SQL: menu + languages + permission + widget (idempotent)" "$?"
+
+grep -q -- "--status --json --no-color" "$WORK/crond/fusionpbx-ha-status" \
+  && grep -q "flock -n /run/fusionpbx-ha-status.lock" "$WORK/crond/fusionpbx-ha-status" \
+  && grep -q "status.json.new" "$WORK/crond/fusionpbx-ha-status"
+report "status cron installed (atomic tmp+mv, flock guard)" "$?"
+
+[ -s "$WORK/var-ha/status.json" ] \
+  && python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert d['node']['name']=='fpbx-ha-1'" "$WORK/var-ha/status.json" 2>/dev/null
+report "first status snapshot written by the step (valid json, this node)" "$?"
+
+# re-run: idempotent (SQL ON CONFLICT, content-aware cron, cp-over files).
+# run 1 wrote the completion marker and consumed the state file - rebuild
+# the resume state (the real 're-run after a later manual --force' shape)
+rm -f "$WORK/etc-web/.installed"
+{
+    echo "command=init"
+    echo "started=now"
+    _ws_i=0
+    for _ws_n in preflight config_gen packages pg_prep wal_log_hints repmgr_conf \
+                 primary_register agent haproxy repoint_dsn witness_status \
+                 standby_status sync_on sync_setup finalize; do
+        _ws_i=$((_ws_i + 1))
+        echo "step_ok=$_ws_i init_step_${_ws_i}_${_ws_n}"
+    done
+} > "$WORK/etc-web/.installer-state"
+ha_init_web > "$WORK/out.log" 2>&1; _rc=$?
+[ "$_rc" = "0" ] && grep -q "already done, skipping" "$WORK/out.log" \
+  && [ "$(grep -c "INSERT INTO v_menu_items" "$WORK/webapp-sql.log")" -ge 2 ]
+report "--init webapp re-run stays idempotent (skip + SQL re-issued)" "$?"
+
+echo "== web status add-on: --join standby resume into step 12 (0.3.40) =="
+# the standby wiring: steps 1-11 done -> step 12 copies files + cron and
+# VERIFIES the rows (read-only standby: no INSERTs). The resume past step 4
+# also proves the wipe consent is NOT re-asked.
+rm -rf "$WORK/etc-joinw" "$WORK/crond2"; mkdir -p "$WORK/etc-joinw" "$WORK/crond2"
+cp "$WORK/etc/cluster.conf" "$WORK/etc-joinw/cluster.conf"
+{
+    echo "command=join-standby"
+    echo "started=now"
+    _ws_i=0
+    for _ws_n in preflight unpack packages stop_pg clone start_register \
+                 agent_haproxy repoint_dsn seed_media lsyncd_start finalize; do
+        _ws_i=$((_ws_i + 1))
+        echo "step_ok=$_ws_i join_step_${_ws_n}"
+    done
+} > "$WORK/etc-joinw/.installer-state"
+: > "$WORK/webapp-sql2.log"
+# a REAL token for the joinw conf (the --join option takes an argument, so
+# the file is passed as a token, not via --config)
+JOINW_TOKEN="$(gzip -c "$WORK/etc-joinw/cluster.conf" | base64 -w0 | tr -d '\n')"
+
+(
+    export HA_SANDBOX=1 HA_NO_COLOR=1
+    export HA_ETC_DIR="$WORK/etc-joinw" HA_RES_DIR="$REPO/Alt/ha/resources"
+    export HA_PGDATA_DEFAULT="$WORK/pgdata"
+    export HA_WEB_DIR="$WORK/www" HA_CRON_FILE="$WORK/crond2/fusionpbx-ha-status"
+    export HA_VAR_DIR="$WORK/var-ha" HA_STATUS_FILE="$WORK/var-ha/status.json"
+    export HA_SYSTEMD_DIR="$WORK/systemd"
+    export HA_HAPROXY_CONF_D="$WORK/haproxy.d" HA_LSYNCD_CONF="$WORK/lsyncd.conf.lua"
+    export HA_SYNC_SSH_DIR="$WORK/sshdir" HA_RRSYNC_INSTALL_DIR="$WORK/bin"
+    export HA_HOSTS_FILE="$WORK/hosts-cli" HA_IPTABLES_CONF="$WORK/iptables.rules"
+    export HA_WEB_USER="$(id -un)" HA_WEB_GROUP="$(id -gn)"
+    export PSQL_SQL_LOG="$WORK/webapp-sql2.log"
+    export PATH="$FB:$PATH"
+    FAKE_IP=10.0.0.12 "$SCRIPT" --join "$JOINW_TOKEN" --yes
+) > "$WORK/out.log" 2>&1; _rc=$?
+[ "$_rc" = "0" ] && grep -q "step 12/12: join_step_12_webapp" "$WORK/out.log" \
+  && [ "$(grep -c "already done, skipping" "$WORK/out.log")" = "11" ]
+report "--join standby resume: skips 1-11, runs step 12/12 (webapp)" "$?"
+
+[ "$_rc" = "0" ] && ! grep -q "REPLACED BY A CLONE" "$WORK/out.log" \
+  && grep -q "consent: already given by the earlier run" "$WORK/out.log"
+report "--join resume past step 4: the wipe consent is NOT re-asked" "$?"
+
+[ -f "$WORK/crond2/fusionpbx-ha-status" ] \
+  && ! grep -q "INSERT INTO v_menu_items" "$WORK/webapp-sql2.log" \
+  && ! grep -q "INSERT INTO v_dashboard_widgets" "$WORK/webapp-sql2.log" \
+  && grep -q "registration rows replicated from the primary (verified)" "$WORK/out.log"
+report "standby: files + cron only, rows VERIFIED not written (read-only)" "$?"
+
+echo "== web status add-on: standby without the replicated rows =="
+# a rebuilt/re-paired standby whose primary predates the add-on: the rows
+# are absent -> a clear WARNING, not a failure
+rm -f "$WORK/etc-joinw/.installer-state"
+: > "$WORK/webapp-sql2.log"
+(
+    export HA_SANDBOX=1 HA_NO_COLOR=1
+    export HA_ETC_DIR="$WORK/etc-joinw" HA_RES_DIR="$REPO/Alt/ha/resources"
+    export HA_PGDATA_DEFAULT="$WORK/pgdata"
+    export HA_WEB_DIR="$WORK/www" HA_CRON_FILE="$WORK/crond2/fusionpbx-ha-status"
+    export HA_VAR_DIR="$WORK/var-ha" HA_STATUS_FILE="$WORK/var-ha/status.json"
+    export HA_SYSTEMD_DIR="$WORK/systemd"
+    export HA_HAPROXY_CONF_D="$WORK/haproxy.d" HA_LSYNCD_CONF="$WORK/lsyncd.conf.lua"
+    export HA_SYNC_SSH_DIR="$WORK/sshdir" HA_RRSYNC_INSTALL_DIR="$WORK/bin"
+    export HA_HOSTS_FILE="$WORK/hosts-cli" HA_IPTABLES_CONF="$WORK/iptables.rules"
+    export HA_WEB_USER="$(id -un)" HA_WEB_GROUP="$(id -gn)"
+    export PSQL_SQL_LOG="$WORK/webapp-sql2.log"
+    export PSQL_MENU_ROWS=0
+    export PATH="$FB:$PATH"
+    echo YES | FAKE_IP=10.0.0.12 "$SCRIPT" --join "$JOINW_TOKEN"
+) > "$WORK/out.log" 2>&1; _rc=$?
+# step 1 (layer 1) is expected to fail in the sandbox before the webapp
+# step - the assertion is only about the message being reachable: run the
+# helper directly instead
+(
+    export HA_SANDBOX=1 HA_NO_COLOR=1 HA_ETC_DIR="$WORK/etc-joinw"
+    export HA_RES_DIR="$REPO/Alt/ha/resources" HA_PGDATA_DEFAULT="$WORK/pgdata"
+    export HA_WEB_DIR="$WORK/www" HA_CRON_FILE="$WORK/crond2/fusionpbx-ha-status"
+    export HA_VAR_DIR="$WORK/var-ha" HA_STATUS_FILE="$WORK/var-ha/status.json"
+    export HA_WEB_USER="$(id -un)" HA_WEB_GROUP="$(id -gn)"
+    export HA_STATUS_SCRIPT="$SCRIPT"
+    export PSQL_SQL_LOG="$WORK/webapp-sql2.log" PSQL_MENU_ROWS=0
+    export PATH="$FB:$PATH"
+    # shellcheck disable=SC1091
+    . "$REPO/Alt/ha/resources/ha-lib.sh"
+    HA_DB_NAME=fusionpbx HA_NODE_ID=2 ha_install_web_app standby
+) > "$WORK/out2.log" 2>&1
+grep -q "rows are not in this standby's database yet" "$WORK/out2.log" \
+  && ! grep -q "INSERT INTO v_menu_items" "$WORK/webapp-sql2.log"
+report "standby without rows: warns with the fix hint, writes nothing" "$?"
 
 # ---------------------------------------------------------------------------
 echo "== proxy flag plumbing (no proxy in sandbox) =="

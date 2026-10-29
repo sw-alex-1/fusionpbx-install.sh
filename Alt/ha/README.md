@@ -2,7 +2,7 @@
 
 **Status: implemented (v1), pending lab validation.** `fusionpbx-ha.sh`
 is complete and covered by a sandbox test suite (`tests/run-all.sh`,
-120 checks). The next gate is the 3-node ALT stand (DESIGN.md section 15.3)
+515 checks). The next gate is the 3-node ALT stand (DESIGN.md section 15.3)
 before production use.
 
 ## What this is
@@ -37,8 +37,17 @@ cluster" (0.3.39): prepare every VM before the HA bootstrap starts —
 |---|-------|---------|--------------|
 | 1 | VM1, VM2 | layer 1: `./pre-install.sh && ./install.sh` | installs a standalone FusionPBX node on BOTH data nodes (VM3/witness needs only the OS, no layer 1) |
 | 2 | VM1 | `./fusionpbx-ha.sh --init --node2 IP --node3 IP` | declares VM1's database the cluster primary, repoints apps to `127.0.0.1:5433`, prints the join **token** and COMPLETES (no waiting; sync replication and media sync arm themselves automatically when VM2 joins) |
-| 3 | VM2, VM3 | `./fusionpbx-ha.sh --join TOKEN` | joins the cluster; role picked automatically by own IP (VM2 → standby — its local DB is replaced by a clone from VM1; VM3 → witness) |
+| 3 | VM2, VM3 | `./fusionpbx-ha.sh --join TOKEN` | joins the cluster; role picked automatically by own IP (VM2 → standby — its local DB is replaced by a clone from VM1; the destructive confirmation is asked UP FRONT, before any step runs; VM3 → witness, no local data touched) |
 | 4 | any node | `./fusionpbx-ha.sh --doctor` | full health check, non-zero exit for monitoring; strictly read-only — it reports drift and names the fix command, it never modifies configs or services (0.3.16). Run it AFTER both peers joined: before that, doctor on the primary honestly reports the missing nodes (expected during bootstrap) |
+
+After step 2/3 the data nodes also get the **web status add-on** (0.3.40,
+DESIGN.md §19): a read-only **Status → Cluster** page and a dashboard
+widget in the FusionPBX UI. A cron job snapshots
+`fusionpbx-ha.sh --status --json` into `/var/lib/fusionpbx-ha/status.json`
+every 5 minutes; the page/widget render that file and run no probes —
+when the collector dies the data ages out and the UI turns red (visible
+by design). Repairs stay in the CLI (`--doctor` / `--repair`). The menu
+item and the widget appear after the next web login.
 
 **Interactive mode (0.3.37):** on a terminal you can skip the flags entirely —
 a bare `./fusionpbx-ha.sh` asks the node role (primary / standby / witness),
@@ -62,17 +71,18 @@ The script resolves both layouts itself, and a deployed flat copy
 
 | File | Purpose |
 |------|---------|
-| `../fusionpbx-ha.sh` | Layer-2 installer (`Alt/fusionpbx-ha.sh`): `--init`, `--join`, `--repair`, `--status`, `--doctor`, `--print-token` |
-| `resources/ha-lib.sh` | Core library: state machine, token, cluster.conf, rendering, PG/sync helpers (sourced; also used by tests) |
+| `../fusionpbx-ha.sh` | Layer-2 installer (`Alt/fusionpbx-ha.sh`): `--init`, `--join`, `--repair`, `--status [--json]`, `--doctor`, `--print-token` |
+| `resources/ha-lib.sh` | Core library: state machine, token, cluster.conf, rendering, PG/sync helpers, the web status add-on installer (sourced; also used by tests) |
 | `resources/` | Templates & units: `repmgr.conf.tpl`, `haproxy.cfg.tpl`, `lsyncd.conf.lua.tpl`, `promote.sh.tpl`, `role-agent.py`, `fusionpbx-ha-agent.service` |
+| `web/cluster/` | The FusionPBX app installed onto the data nodes (0.3.40): Status → Cluster page + dashboard widget, both reading the cron-maintained status snapshot |
 | `tests/` | Sandbox test suite (`run-all.sh`): lib/render/CLI/agent, layer-1 `test_guard.sh` style |
-| `DESIGN.md` | Design document — architecture, CLI, step sequences, failover/repair analysis. **v0.3** |
+| `DESIGN.md` | Design document — architecture, CLI, step sequences, failover/repair analysis, §19 web status. **v0.3** |
 | `RUNBOOK.md` | Operational manual (RU) — deploy, health checks, single/double failure, repair, upgrade, proxy. Self-sufficient per scenario |
 
 ## Русский раздел
 
 **Статус: реализовано (v1), ожидает стендовой проверки.** `fusionpbx-ha.sh`
-готов и покрыт песочным тестовым набором (`tests/run-all.sh`, 120 проверок);
+готов и покрыт песочным тестовым набором (`tests/run-all.sh`, 515 проверок);
 следующие ворота — стенд 3×ALT (DESIGN.md §15.3) перед продуктивом.
 
 Это надстройка (слой 2) над установщиком: слой 1 (`Alt/`) не изменяется и
@@ -83,10 +93,11 @@ The script resolves both layouts itself, and a deployed flat copy
 медиа-файлов. Все пакеты — из штатных репозиториев ALT p10/p11.
 
 Краткий план команд — в таблице Quick start выше; детали реализации и
-обоснования — в [DESIGN.md](DESIGN.md) (v0.3), рабочая инструкция на все
-остальные случаи (упала нода, кластер заморожен, ремонт пересобранной ноды,
-обновление ветки) — в [RUNBOOK.md](RUNBOOK.md): каждый сценарий самодостаточен
-и написан для ситуации «прошло много времени, никто ничего не помнит». Работа
-за корпоративным HTTP(S)-прокси — тем же флагом `--proxy host:port`, что и в
-слое 1; межнодовый трафик идёт напрямую (DESIGN.md §5.1). Тесты:
-`Alt/ha/tests/run-all.sh` (без root, ничего не трогает в системе).
+обоснования — в [DESIGN.md](DESIGN.md) (v0.3, веб-статус — §19), рабочая
+инструкция на все остальные случаи (упала нода, кластер заморожен, ремонт
+пересобранной ноды, обновление ветки) — в [RUNBOOK.md](RUNBOOK.md): каждый
+сценарий самодостаточен и написан для ситуации «прошло много времени, никто
+ничего не помнит». Работа за корпоративным HTTP(S)-прокси — тем же флагом
+`--proxy host:port`, что и в слое 1; межнодовый трафик идёт напрямую
+(DESIGN.md §5.1). Тесты: `Alt/ha/tests/run-all.sh` (без root, ничего не
+трогает в системе).

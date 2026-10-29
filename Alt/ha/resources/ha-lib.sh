@@ -72,6 +72,20 @@ HA_HOSTS_FILE="${HA_HOSTS_FILE:-/etc/hosts}"
 # file on boot); HA_IPTABLES_CONF is overridable for the test sandbox
 HA_IPTABLES_CONF="${HA_IPTABLES_CONF:-/etc/sysconfig/iptables}"
 
+# 0.3.40: the web status add-on (Status -> Cluster). The collector is
+# 'fusionpbx-ha.sh --status --json'; cron materializes it into HA_STATUS_FILE
+# (atomic tmp+mv) and the FusionPBX app reads that file server-side. All
+# paths are overridable for the test sandbox.
+HA_VAR_DIR="${HA_VAR_DIR:-/var/lib/fusionpbx-ha}"
+HA_STATUS_FILE="${HA_STATUS_FILE:-$HA_VAR_DIR/status.json}"
+HA_WEB_DIR="${HA_WEB_DIR:-/var/www/fusionpbx}"
+HA_WEB_APP="${HA_WEB_APP:-cluster}"
+HA_CRON_FILE="${HA_CRON_FILE:-/etc/cron.d/fusionpbx-ha-status}"
+# how often the cron collects (minutes) and how old the file may get before
+# the web UI calls it stale (seconds; 2 missed runs + collector runtime)
+HA_STATUS_CRON_MIN="${HA_STATUS_CRON_MIN:-5}"
+HA_STATUS_STALE_SEC="${HA_STATUS_STALE_SEC:-600}"
+
 # managed-block markers (see ha_block_* below)
 HA_BLOCK_BEGIN="# BEGIN fusionpbx-ha (managed)"
 HA_BLOCK_END="# END fusionpbx-ha (managed)"
@@ -130,6 +144,15 @@ verbose() { echo "${green}$1${normal}"; }
 info()    { echo "$1"; }
 warn()    { echo "${yellow}WARNING: $1${normal}" >&2; }
 error()   { echo "${red}ERROR: $1${normal}" >&2; }
+
+# 0.3.40: JSON string escaper for the --status --json collector. The values
+# come from a controlled vocabulary (probe verdicts, IPs, numbers) plus node
+# names from cluster.conf - a hand-edited name with a quote or backslash
+# must not break the document the web UI parses. Control characters cannot
+# occur in the sources; newlines are stripped defensively.
+ha_json_str() {
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr -d '\r\n'
+}
 
 die() {
     error ""
@@ -1939,6 +1962,18 @@ ha_agent_code() {
     echo "$_hac_code"
 }
 
+# 0.3.40: authenticated reachability probe for the status collector - the
+# same shape the doctor's quorum check (4b) uses: psql as the repmgr user
+# through the postgres system user's .pgpass. TCP-only pg_isready kept
+# saying "reachable" while the login was broken (the 27.10 outage), so the
+# honest probe authenticates. rc 0 = link works, 1 = anything else.
+ha_quorum_ok() {
+    _hqi_ip="$1"
+    PGCONNECT_TIMEOUT=5 PGPASSFILE="$(ha_pgpass_file)" psql -w \
+        -h "$_hqi_ip" -p "$HA_PG_PORT" -U "$HA_REPMGR_USER" -d "$HA_REPMGR_DB" \
+        -tAc "SELECT 1" >/dev/null 2>&1
+}
+
 # =============================================================================
 # Rendered config writers (thin wrappers used by the step functions)
 # =============================================================================
@@ -2134,6 +2169,203 @@ ha_install_agent() {
 inspect the unit:  systemctl status $HA_AGENT_UNIT_NAME -n 30 --no-pager"
     fi
     verbose "  role-agent is answering (HTTP $(ha_agent_code 127.0.0.1))"
+}
+
+# =============================================================================
+# 0.3.40: the web status add-on (Status -> Cluster + the dashboard widget).
+#
+# Architecture (the owner's design, DESIGN.md section 19):
+#   - ONE collector: 'fusionpbx-ha.sh --status --json' (this script, the
+#     same probe helpers as --status/--doctor - no second implementation)
+#   - cron materializes it into $HA_STATUS_FILE (atomic tmp+mv, root-owned)
+#   - the FusionPBX app (app/cluster) READS the file server-side and never
+#     runs a probe - a dashboard that hangs on a dead peer is what this
+#     design avoids
+#   - stale file (dead collector) renders RED - visible by design
+#   - the web side is READ-ONLY; repairs stay in the CLI (RUNBOOK.md)
+#
+# Modes:
+#   ha_install_web_app primary   node 1 (--init, repair-primary): copies the
+#                                files, writes the registration rows (menu,
+#                                menu languages, menu group, group permission,
+#                                dashboard widget + widget group - fixed UUIDs,
+#                                ON CONFLICT DO NOTHING), installs the cron
+#                                and takes the first snapshot
+#   ha_install_web_app standby   node 2 (--join, repair): files + cron + a
+#                                read-only VERIFY of the rows. A standby's
+#                                database is a physical replica - WRITING the
+#                                rows here is impossible and unnecessary:
+#                                they replicate from the primary (the standby
+#                                clones the primary AFTER its --init wrote
+#                                them, so they are present from the clone on)
+# The witness runs no layer 1 (no FusionPBX) - the caller never gets here.
+# =============================================================================
+
+# the fixed registration UUIDs - MUST mirror the app's own files
+# (app_config.php, app_menu.php, resources/dashboard/config.php)
+HA_WEB_MENU_ITEM_UUID="3f02bc6a-8e9d-472b-82e6-fd61f7fce3ee"
+HA_WEB_MENU_GROUP_UUID="13bb350a-dd85-4582-aaa4-c9981e511b8a"
+HA_WEB_MENU_LANG_EN_UUID="cfa9d5d8-d5eb-4088-835c-445111eda940"
+HA_WEB_MENU_LANG_RU_UUID="bdabb66d-b817-4a93-8cb7-127c869bd319"
+HA_WEB_PERM_UUID="28035765-a1ed-4a0a-a1d3-f9495d73caac"
+HA_WEB_WIDGET_UUID="0ad5d5d8-79c7-452d-b3ac-e9c8f3454bd4"
+HA_WEB_WIDGET_GROUP_UUID="3319ef28-bd18-4c3f-adc6-ab526ac8898d"
+# upstream constants: the default dashboard and the "Status" menu item of
+# the default menu (the same uuids every upstream app_menu.php references)
+HA_WEB_DASHBOARD_UUID="3e2cbaa4-2bec-41b2-a626-999a59b8b19c"
+HA_WEB_STATUS_PARENT_UUID="0438b504-8613-7887-c420-c837ffb20cb1"
+
+# the web server identity (layer-1 config.sh: angie on ALT Linux; the
+# env override covers exotic setups and the test sandbox)
+HA_WEB_USER="${HA_WEB_USER:-angie}"
+HA_WEB_GROUP="${HA_WEB_GROUP:-angie}"
+
+# web app registration on the PRIMARY (idempotent, fixed UUIDs). Fails the
+# caller's step on SQL errors; a missing 'default' menu or superadmin group
+# only WARNs (custom menu setups still get the page itself, reachable by URL).
+ha_web_app_register_sql() {
+    _hwr_menu_uuid="$(pg_runuser_psql -d "$HA_DB_NAME" -tAc \
+        "SELECT menu_uuid FROM v_menus WHERE menu_name='default' LIMIT 1" 2>/dev/null | tr -d ' \r')"
+    _hwr_group_uuid="$(pg_runuser_psql -d "$HA_DB_NAME" -tAc \
+        "SELECT group_uuid FROM v_groups WHERE group_name='superadmin' AND domain_uuid IS NULL LIMIT 1" 2>/dev/null | tr -d ' \r')"
+
+    # the group permission does not depend on the menu - always writable
+    if [ -n "$_hwr_group_uuid" ]; then
+        pg_runuser_psql -d "$HA_DB_NAME" -c \
+            "INSERT INTO v_group_permissions (group_permission_uuid, domain_uuid, permission_name, permission_protected, permission_assigned, group_name, group_uuid)
+             VALUES ('$HA_WEB_PERM_UUID', NULL, 'cluster_view', 'false', 'true', 'superadmin', '$_hwr_group_uuid')
+             ON CONFLICT (group_permission_uuid) DO NOTHING" >/dev/null \
+            || die "cannot register the cluster_view permission (see the postgresql log)"
+        verbose "  permission cluster_view granted to superadmin"
+    else
+        warn "no global 'superadmin' group found - cluster_view is not granted (the page answers 'access denied' until granted by hand)"
+    fi
+
+    if [ -n "$_hwr_menu_uuid" ] && [ -n "$_hwr_group_uuid" ]; then
+        pg_runuser_psql -d "$HA_DB_NAME" -c \
+            "INSERT INTO v_menu_items (menu_item_uuid, menu_uuid, menu_item_parent_uuid, menu_item_title, menu_item_link, menu_item_category, menu_item_order, menu_item_description)
+             VALUES ('$HA_WEB_MENU_ITEM_UUID', '$_hwr_menu_uuid', '$HA_WEB_STATUS_PARENT_UUID', 'Cluster', '/app/cluster/cluster.php', 'internal', 30, 'FusionPBX HA cluster status')
+             ON CONFLICT (menu_item_uuid) DO NOTHING" >/dev/null \
+            || die "cannot insert the Status->Cluster menu item"
+        pg_runuser_psql -d "$HA_DB_NAME" -c \
+            "INSERT INTO v_menu_languages (menu_language_uuid, menu_item_uuid, menu_uuid, menu_language, menu_item_title)
+             VALUES ('$HA_WEB_MENU_LANG_EN_UUID', '$HA_WEB_MENU_ITEM_UUID', '$_hwr_menu_uuid', 'en-us', 'Cluster'),
+                    ('$HA_WEB_MENU_LANG_RU_UUID', '$HA_WEB_MENU_ITEM_UUID', '$_hwr_menu_uuid', 'ru-ru', 'Кластер')
+             ON CONFLICT (menu_language_uuid) DO NOTHING" >/dev/null \
+            || warn "cannot insert the menu item translations"
+        pg_runuser_psql -d "$HA_DB_NAME" -c \
+            "INSERT INTO v_menu_item_groups (menu_item_group_uuid, menu_uuid, menu_item_uuid, group_name, group_uuid)
+             VALUES ('$HA_WEB_MENU_GROUP_UUID', '$_hwr_menu_uuid', '$HA_WEB_MENU_ITEM_UUID', 'superadmin', '$_hwr_group_uuid')
+             ON CONFLICT (menu_item_group_uuid) DO NOTHING" >/dev/null \
+            || warn "cannot grant the menu item to superadmin"
+        verbose "  menu item registered: Status -> Cluster (visible after the next login)"
+    else
+        warn "no 'default' menu found - the Status->Cluster menu item is NOT registered
+  (a custom menu? the page itself is installed and reachable at /app/cluster/cluster.php)"
+    fi
+
+    # the dashboard widget (the default dashboard is an upstream constant)
+    if [ -n "$_hwr_group_uuid" ]; then
+        pg_runuser_psql -d "$HA_DB_NAME" -c \
+            "INSERT INTO v_dashboard_widgets (dashboard_uuid, dashboard_widget_uuid, widget_name, widget_path, widget_chart_type, widget_label_enabled, widget_column_span, widget_row_span, widget_details_state, widget_order, widget_enabled, widget_description)
+             VALUES ('$HA_WEB_DASHBOARD_UUID', '$HA_WEB_WIDGET_UUID', 'Cluster Status', 'cluster/cluster', 'text', 'true', 1, 2, 'hidden', 95, 'true', 'FusionPBX HA cluster status (fusionpbx-ha)')
+             ON CONFLICT (dashboard_widget_uuid) DO NOTHING" >/dev/null \
+            || die "cannot register the dashboard widget"
+        pg_runuser_psql -d "$HA_DB_NAME" -c \
+            "INSERT INTO v_dashboard_widget_groups (dashboard_uuid, dashboard_widget_group_uuid, dashboard_widget_uuid, group_uuid)
+             VALUES ('$HA_WEB_DASHBOARD_UUID', '$HA_WEB_WIDGET_GROUP_UUID', '$HA_WEB_WIDGET_UUID', '$_hwr_group_uuid')
+             ON CONFLICT (dashboard_widget_group_uuid) DO NOTHING" >/dev/null \
+            || warn "cannot grant the widget to superadmin"
+        verbose "  dashboard widget registered: Cluster Status (superadmin)"
+    fi
+}
+
+# the status cron + the first snapshot (both data nodes)
+ha_install_status_cron() {
+    # the collector path: HA_STATUS_SCRIPT wins (tests pin it explicitly);
+    # the default is the script CURRENTLY RUNNING, resolved absolute - if
+    # the operator later moves the repo the cron dies, the file ages out
+    # and the widget turns red: visible, honest, fixable by re-running the
+    # install command
+    _hic_script="${HA_STATUS_SCRIPT:-}"
+    if [ -z "$_hic_script" ]; then
+        _hic_script="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")"
+    fi
+    [ -f "$_hic_script" ] || _hic_script="$(pwd)/$(basename "$0")"
+
+    mkdir -p "$HA_VAR_DIR" 2>/dev/null || die "cannot create $HA_VAR_DIR"
+
+    _hic_tmp="$(mktemp "${TMPDIR:-/tmp}/fpbx-ha-cron.XXXXXX")"
+    cat > "$_hic_tmp" <<CRON
+# fusionpbx-ha: cluster status snapshot for the web UI (Status -> Cluster
+# and the dashboard widget). Managed by fusionpbx-ha.sh - edits are
+# overwritten. The collector is READ-ONLY; when it fails the file ages out
+# and the web UI turns RED - that is the design (DESIGN.md section 19).
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+*/$HA_STATUS_CRON_MIN * * * * root flock -n /run/fusionpbx-ha-status.lock "$_hic_script" --status --json --no-color > $HA_STATUS_FILE.new 2>>$HA_VAR_DIR/status-collector.log && mv -f $HA_STATUS_FILE.new $HA_STATUS_FILE
+CRON
+    if [ -f "$HA_CRON_FILE" ] && cmp -s "$_hic_tmp" "$HA_CRON_FILE"; then
+        rm -f "$_hic_tmp"
+        verbose "  status cron unchanged: $HA_CRON_FILE"
+    else
+        install -m 0644 "$_hic_tmp" "$HA_CRON_FILE" \
+            || { rm -f "$_hic_tmp"; die "cannot write $HA_CRON_FILE"; }
+        rm -f "$_hic_tmp"
+        verbose "  status cron installed: $HA_CRON_FILE (every $HA_STATUS_CRON_MIN min)"
+    fi
+
+    # the first snapshot right now - the page must not be empty for the
+    # first HA_STATUS_CRON_MIN minutes; failure is a WARNING (cron retries)
+    if "$_hic_script" --status --json --no-color > "$HA_STATUS_FILE.new" 2>>"$HA_VAR_DIR/status-collector.log"; then
+        mv -f "$HA_STATUS_FILE.new" "$HA_STATUS_FILE"
+        chmod 0644 "$HA_STATUS_FILE" 2>/dev/null || true
+        verbose "  first status snapshot written: $HA_STATUS_FILE"
+    else
+        rm -f "$HA_STATUS_FILE.new" 2>/dev/null || true
+        warn "the first status snapshot failed - the cron will retry every $HA_STATUS_CRON_MIN min
+  (collector log: $HA_VAR_DIR/status-collector.log)"
+    fi
+}
+
+# install the whole web status add-on; ha_install_web_app primary|standby
+ha_install_web_app() {
+    _hiw_mode="$1"
+    _hiw_src="${HA_WEB_APP_SRC:-$HA_RES_DIR/../web/$HA_WEB_APP}"
+    [ -d "$_hiw_src" ] || die "web app sources not found: $_hiw_src
+(the deployed layout needs <dir>/web/$HA_WEB_APP next to <dir>/resources/)"
+
+    _hiw_dst="$HA_WEB_DIR/app/$HA_WEB_APP"
+    mkdir -p "$_hiw_dst/resources/dashboard" || die "cannot create $_hiw_dst"
+    for _hiw_f in app_config.php app_menu.php app_languages.php cluster.php \
+                  resources/status_reader.php resources/dashboard/config.php \
+                  resources/dashboard/cluster.php; do
+        install -m 0644 "$_hiw_src/$_hiw_f" "$_hiw_dst/$_hiw_f" \
+            || die "cannot install $_hiw_f into $_hiw_dst"
+    done
+    # layer-1 owns the tree as angie:angie (php-fpm reads it; 0644/0755)
+    chown -R "$HA_WEB_USER:$HA_WEB_GROUP" "$_hiw_dst" 2>/dev/null \
+        || warn "could not chown $_hiw_dst to $HA_WEB_USER (check the web user)"
+    verbose "  web app installed: $_hiw_dst"
+
+    if [ "$_hiw_mode" = "primary" ]; then
+        ha_web_app_register_sql
+    else
+        # read-only VERIFY: the rows come by replication from the primary
+        # (the clone happens after the primary's --init wrote them). Absent
+        # rows on a rebuilt/repaired standby = the primary ran an older
+        # installer - named, not fatal (the files still serve the page).
+        _hiw_cnt="$(pg_runuser_psql -d "$HA_DB_NAME" -tAc \
+            "SELECT count(*) FROM v_menu_items WHERE menu_item_uuid='$HA_WEB_MENU_ITEM_UUID'" 2>/dev/null | tr -d ' \r')"
+        case "${_hiw_cnt:-0}" in
+            1) verbose "  registration rows replicated from the primary (verified)" ;;
+            *) warn "the cluster menu/widget rows are not in this standby's database yet
+  (replication lag, or the primary's --init predates the web status add-on).
+  If the menu item never appears: re-run this node's install command AFTER
+  re-running it on the primary." ;;
+        esac
+    fi
+
+    ha_install_status_cron
 }
 
 # 0.3.35: pre-verify the post-promote app-restart sudo path (as user
