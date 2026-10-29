@@ -279,7 +279,7 @@ else
             mkdir -p "$_ioncube_tmp"
 
             wget --no-check-certificate -q \
-                "https://swgs.ru/files/ioncube_loaders_lin_x86-64.zip" \
+				"https://downloads.ioncube.com/loader_downloads/ioncube_loaders_lin_x86-64.zip" \
                 -O "${_ioncube_tmp}/ioncube.zip" || {
                 warn "Failed to download ionCube Loader (non-critical, continuing)"
                 rm -rf "$_ioncube_tmp"
