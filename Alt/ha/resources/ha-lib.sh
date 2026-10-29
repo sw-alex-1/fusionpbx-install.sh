@@ -712,8 +712,12 @@ ha_install_rrsync() {
     for _hir in $_hir_glob; do
         if [ -f "$_hir" ]; then
             mkdir -p "$(dirname "$_hir_dest")" 2>/dev/null
+            # 0.3.38: stdout of this resolver is CAPTURED by the only
+            # production caller (ha_write_authorized_keys) - the install
+            # chatter must ride stderr, or the authorized_keys forced
+            # command renders multi-line and sshd rejects the sync key
             install -m 0755 "$_hir" "$_hir_dest" 2>/dev/null \
-                && { verbose "  rrsync installed: $_hir_dest (from $_hir)"; echo "$_hir_dest"; return 0; }
+                && { verbose "  rrsync installed: $_hir_dest (from $_hir)" >&2; echo "$_hir_dest"; return 0; }
         fi
     done
     return 1
@@ -1425,7 +1429,7 @@ EOSUDO
             return 0
         fi
     fi
-    verbose "  sudoers drop-in installed: $_hisd_file (systemctl paths:$(echo "$_hisd_paths" | tr '\n' ' '))"
+    verbose "  sudoers drop-in installed: $_hisd_file (systemctl paths:${_hisd_paths# })"
     # 0.3.36: the rules are useless while postgres cannot EXECUTE sudo -
     # heal the exec path (ALT 'control sudo' / the binary mode) at every
     # install point; silent when healthy, loud when it heals or fails
@@ -2037,7 +2041,10 @@ ha_write_authorized_keys() {
     _hak_keyblob="$(printf '%s' "$HA_SYNC_PUBLIC_KEY" | awk '{print $2}')"
     [ -n "$_hak_keyblob" ] \
         && sed -i "\|${_hak_keyblob}|d" "$_hak_sshdir/authorized_keys" 2>/dev/null
-    _hak_rrsync="$(ha_install_rrsync)"
+    # 0.3.38: tail -n 1 keeps the forced command single-line by construction -
+    # whatever a future resolver prints above the path never reaches the
+    # render (belt-and-braces over the stderr-only chatter contract)
+    _hak_rrsync="$(ha_install_rrsync | tail -n 1)"
     if [ -n "$_hak_rrsync" ]; then
         _hak_restrict="from=\"$(ha_node_ip 1),$(ha_node_ip 2)\",command=\"$_hak_rrsync $HA_SYNC_DIR\",no-pty,no-agent-forwarding,no-X11-forwarding,no-port-forwarding"
     else

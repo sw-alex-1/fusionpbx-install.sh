@@ -1389,6 +1389,30 @@ lib_run 'ha_install_rrsync'
 [ -n "$OUT" ] && [ "$OUT" != "none" ]
 report "result is stable across calls" $?
 
+# 0.3.38 regression: the doc-glob INSTALL branch used to report through
+# verbose - which rides STDOUT - straight into the ha_write_authorized_keys
+# capture: on the FIRST rrsync install the forced command= rendered
+# multi-line and sshd rejected the sync key (the 29.10 fresh-node join
+# survived only because join step 3 re-rendered the block after rrsync
+# already existed; on a minimal image without preinstalled rsync the broken
+# block would have been the FINAL state and the media seed would die on
+# 'Permission denied (publickey)'). The branch is forced deterministically
+# here: dest removed, cmd_exists stubbed off, stderr discarded - $OUT is
+# then the pure stdout contract.
+rm -f "$WORK/localbin/rrsync"
+lib_run 'cmd_exists() { return 1; }; ha_install_rrsync 2>/dev/null'
+[ "$OUT" = "$WORK/localbin/rrsync" ] && [ -x "$WORK/localbin/rrsync" ]
+report "install branch: stdout is the path ONLY (chatter rides stderr)" $? "$OUT"
+
+# 0.3.38 belt-and-braces: the authorized_keys render must survive a
+# chattering resolver (stub: report line + path) - the forced command
+# stays single-line and the chatter never reaches the file
+lib_run "HA_SYNC_SSH_DIR='$WORK/sshdir2'; HA_SYNC_PUBLIC_KEY='ssh-ed25519 AAAAFAKEPUBLICKEY fusionpbx-ha-sync'; HA_SYNC_DIR='/var/lib/freeswitch/storage'; HA_NODE1_IP='10.0.0.11'; HA_NODE2_IP='10.0.0.12'; ha_install_rrsync() { echo '  rrsync installed: /x/rrsync (from /y/rrsync)'; echo '/x/rrsync'; }; ha_write_authorized_keys && echo written"
+echo "$OUT" | grep -q '^written$' \
+    && grep -q 'command="/x/rrsync /var/lib/freeswitch/storage".*AAAAFAKEPUBLICKEY' "$WORK/sshdir2/authorized_keys" \
+    && ! grep -q 'rrsync installed' "$WORK/sshdir2/authorized_keys"
+report "authorized_keys: forced command stays single-line (tail guard)" $? "$OUT"
+
 # ---------------------------------------------------------------------------
 echo "== layer-1 config.conf reader =="
 cat > "$WORK/l1.conf" <<'EOF'
