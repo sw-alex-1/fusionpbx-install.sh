@@ -356,16 +356,63 @@ echo "$OUT" | grep -q "assumed YES (--yes)"
 report "--yes prints the assumption" $?
 
 # ---------------------------------------------------------------------------
-echo "== init node waits (HA_WAIT_NODES, 0.3.8) =="
-# source contract: both node waits honor the env override instead of a
-# hardcoded 900s (a slow bench exports the variable, not a local edit
-# that would collide with git pull)
-_w11="$(sed -n '/^init_step_11_wait_witness()/,/^}/p' "$CLI")"
-echo "$_w11" | grep -q 'HA_WAIT_NODES:-900'
-report "wait witness: HA_WAIT_NODES overrides the 900s default" $?
-_w12="$(sed -n '/^init_step_12_wait_standby()/,/^}/p' "$CLI")"
-echo "$_w12" | grep -q 'HA_WAIT_NODES:-900'
-report "wait standby: HA_WAIT_NODES overrides the 900s default" $?
+echo "== init peer steps: no waiting (0.3.39) =="
+# source contract: --init completes WITHOUT the peers. The old ha_wait
+# here put a 900s timer (HA_WAIT_NODES, 0.3.8) on the operator's peer
+# installation - impossible to meet when the peers were still being
+# installed, and the timeout killed an otherwise healthy bootstrap. The
+# documented flow is now "install all three servers first, then connect
+# them to the cluster"; the standby's own join step 11 arms sync on the
+# primary, so nothing on the primary depends on WHEN the peers arrive.
+_w11="$(sed -n '/^init_step_11_witness_status()/,/^}/p' "$CLI")"
+echo "$_w11" | grep -q 'ha_wait "'
+[ $? != 0 ] && [ -n "$_w11" ]
+report "step 11: no ha_wait call - the witness joins after --init completes" $?
+_w12="$(sed -n '/^init_step_12_standby_status()/,/^}/p' "$CLI")"
+echo "$_w12" | grep -q 'ha_wait "'
+[ $? != 0 ] && [ -n "$_w12" ]
+report "step 12: no ha_wait call - the standby joins after --init completes" $?
+# the status steps keep their resume self-heals: the firewall (0.3.6),
+# the media dir (0.3.11) and authorized_keys (0.3.9) - the standby's
+# seed relies on them and the join may start any time after the command
+# completes
+echo "$_w11" | grep -q 'ha_ensure_cluster_firewall'
+report "step 11: firewall self-heal kept (resume contract 0.3.6)" $?
+echo "$_w12" | grep -q 'ha_ensure_sync_dir'
+report "step 12: media dir self-heal kept (resume contract 0.3.11)" $?
+echo "$_w12" | grep -q 'ha_write_authorized_keys'
+report "step 12: authorized_keys self-heal kept (resume contract 0.3.9)" $?
+# the not-streaming branch must tell the operator what happens next
+# (the join arms sync - nobody has to come back to this node)
+echo "$_w12" | grep -q 'arms synchronous replication'
+report "step 12: not-streaming branch explains the auto-arming" $?
+# HA_WAIT_NODES existed ONLY for these two waits - retire it fully: the
+# code pattern must be gone from the script (the step comments keep the
+# historical name, hence the ':-' code-pattern match)
+! grep -q 'HA_WAIT_NODES:-' "$CLI"
+report "HA_WAIT_NODES: no code references left (retired with the waits)" $?
+
+# step 14: lsyncd starts even without the standby - the operator must be
+# told the rsync failures until the join are expected bootstrap noise
+_s14w="$(sed -n '/^init_step_14_sync_setup()/,/^}/p' "$CLI")"
+echo "$_s14w" | grep -q 'init_poll_standby_streaming || warn'
+report "step 14: no-standby lsyncd warning (expected bootstrap noise)" $?
+
+# step 15: the summary adapts to the two endings (all peers in / join next)
+_s15="$(sed -n '/^init_step_15_finalize()/,/^}/p' "$CLI")"
+echo "$_s15" | grep -q 'if init_poll_standby_streaming; then'
+report "step 15: summary conditional on the standby state" $?
+echo "$_s15" | grep -q 'arms AUTOMATICALLY when'
+report "step 15: pending-sync summary names the auto-arming join" $?
+echo "$_s15" | grep -q 'fusionpbx-ha.sh --join <TOKEN>'
+report "step 15: pending summary prints the peer join commands" $?
+
+# cmd_init: the final banner distinguishes the two endings
+_ci="$(sed -n '/^cmd_init()/,/^}/p' "$CLI")"
+echo "$_ci" | grep -q 'init_poll_standby_streaming && init_poll_witness_registered'
+report "cmd_init: final banner conditional on both peers" $?
+echo "$_ci" | grep -q 'join the peers next'
+report "cmd_init: bootstrap ending names the next action" $?
 
 # ---------------------------------------------------------------------------
 echo "== synchronous_standby_names write (regression 0.3.9) =="
@@ -535,11 +582,13 @@ report "repmgr_cmd: TMPDIR forced to /tmp (pam_mktemp poison, 0.3.30)" $?
 
 
 # CLI source-order contracts: authorized_keys must not wait for step 14
-_s12="$(sed -n '/^init_step_12_wait_standby()/,/^}/p' "$CLI")"
+_s12="$(sed -n '/^init_step_12_standby_status()/,/^}/p' "$CLI")"
 _ak12="$(echo "$_s12" | grep -n 'ha_write_authorized_keys' | head -1 | cut -d: -f1)"
-_aw12="$(echo "$_s12" | grep -n 'ha_wait ' | head -1 | cut -d: -f1)"
-[ -n "$_ak12" ] && [ -n "$_aw12" ] && [ "$_ak12" -lt "$_aw12" ]
-report "init step 12: authorized_keys before the standby wait" $?
+# since 0.3.39 the standby can join only AFTER --init completes - the
+# self-heals must simply be inside the step, ahead of the status probe
+_sp12="$(echo "$_s12" | grep -n 'init_poll_standby_streaming' | head -1 | cut -d: -f1)"
+[ -n "$_ak12" ] && [ -n "$_sp12" ] && [ "$_ak12" -lt "$_sp12" ]
+report "init step 12: authorized_keys self-heal before the status probe" $?
 
 _s13="$(sed -n '/^init_step_13_sync_on()/,/^}/p' "$CLI")"
 _ak13="$(echo "$_s13" | grep -n 'ha_write_authorized_keys' | head -1 | cut -d: -f1)"
@@ -581,8 +630,8 @@ _s6="$(sed -n '/^init_step_6_repmgr_conf()/,/^}/p' "$CLI")"
 echo "$_s6" | grep -q 'ha_ensure_sync_dir'
 report "init step 6: media dir ensured before the primary register" $?
 _md12="$(echo "$_s12" | grep -n 'ha_ensure_sync_dir' | head -1 | cut -d: -f1)"
-[ -n "$_md12" ] && [ "$_md12" -lt "$_aw12" ]
-report "init step 12: media dir self-heal before the standby wait" $?
+[ -n "$_md12" ] && [ "$_md12" -lt "$_sp12" ]
+report "init step 12: media dir self-heal before the status probe" $?
 _md13="$(echo "$_s13" | grep -n 'ha_ensure_sync_dir' | head -1 | cut -d: -f1)"
 [ -n "$_md13" ] && [ "$_md13" -lt "$_es13" ]
 report "init step 13: media dir self-heal before sync-on" $?

@@ -29,12 +29,16 @@ direct (DESIGN.md §5.1, RUNBOOK.md §8).
 
 ## Quick start (planned CLI)
 
+The flow is "install all three servers first, then connect them to the
+cluster" (0.3.39): prepare every VM before the HA bootstrap starts —
+`--init` completes on its own and never waits for the peers.
+
 | # | Where | Command | What it does |
 |---|-------|---------|--------------|
-| 1 | VM1, VM2 | layer 1: `./pre-install.sh && ./install.sh` | installs a standalone FusionPBX node (layer 1 unchanged) |
-| 2 | VM1 | `./fusionpbx-ha.sh --init --node2 IP --node3 IP` | declares VM1's database the cluster primary, repoints apps to `127.0.0.1:5433`, prints the join **token**, then waits for the other nodes |
+| 1 | VM1, VM2 | layer 1: `./pre-install.sh && ./install.sh` | installs a standalone FusionPBX node on BOTH data nodes (VM3/witness needs only the OS, no layer 1) |
+| 2 | VM1 | `./fusionpbx-ha.sh --init --node2 IP --node3 IP` | declares VM1's database the cluster primary, repoints apps to `127.0.0.1:5433`, prints the join **token** and COMPLETES (no waiting; sync replication and media sync arm themselves automatically when VM2 joins) |
 | 3 | VM2, VM3 | `./fusionpbx-ha.sh --join TOKEN` | joins the cluster; role picked automatically by own IP (VM2 → standby — its local DB is replaced by a clone from VM1; VM3 → witness) |
-| 4 | any node | `./fusionpbx-ha.sh --doctor` | full health check, non-zero exit for monitoring; strictly read-only — it reports drift and names the fix command, it never modifies configs or services (0.3.16) |
+| 4 | any node | `./fusionpbx-ha.sh --doctor` | full health check, non-zero exit for monitoring; strictly read-only — it reports drift and names the fix command, it never modifies configs or services (0.3.16). Run it AFTER both peers joined: before that, doctor on the primary honestly reports the missing nodes (expected during bootstrap) |
 
 **Interactive mode (0.3.37):** on a terminal you can skip the flags entirely —
 a bare `./fusionpbx-ha.sh` asks the node role (primary / standby / witness),

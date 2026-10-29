@@ -167,7 +167,8 @@ ha_interactive_pick() {
         info "(Ctrl-C to abort and see the full usage with --help)."
         info ""
         info "  1) primary - the FIRST data node: --init (asks the node 2 and"
-        info "     witness IPs, prints the join token at the end)"
+        info "     witness IPs, prints the join token; completes without waiting -"
+        info "     the peers join afterwards)"
         info "  2) standby - the SECOND data node: --join (asks the token)"
         info "  3) witness - the witness node: --join (asks the same token)"
         info ""
@@ -231,8 +232,10 @@ fusionpbx-ha.sh - FusionPBX HA cluster add-on for ALT Linux
 Usage:
   fusionpbx-ha.sh --init --node2 IP --node3 IP [--cluster-name NAME]
       On the FIRST data node (VM1): accept the standalone FusionPBX
-      installation as the cluster primary, print the join token, then wait
-      for the witness and the standby to join.
+      installation as the cluster primary and print the join token.
+      The command COMPLETES without waiting for the peers (install all
+      three servers first): join them afterwards with --join. Synchronous
+      replication and media sync arm themselves when node 2 joins.
 
   fusionpbx-ha.sh --join TOKEN
       On VM2/VM3 (or a rebuilt node): join the cluster. The role is picked
@@ -370,8 +373,10 @@ init_step_2_config_gen() {
     ha_write_etc_hosts_block
     ha_apply_no_proxy
 
-    # print the token immediately (DESIGN.md 6.2): the operator walks to
-    # VM2/VM3 while this command keeps waiting for them
+    # print the token immediately (DESIGN.md 6.2): the operator joins
+    # VM2/VM3 with it AFTER this command completes (0.3.39: --init does
+    # not wait for the peers anymore - install them first, then connect
+    # them to the cluster)
     _icg_token="$(ha_token_pack)"
     echo ""
     verbose "========================================================================="
@@ -383,7 +388,8 @@ init_step_2_config_gen() {
     verbose "========================================================================="
     verbose " The token equals root access (it carries database passwords and the"
     verbose " sync private key). Store it safely; clear the shell history/clipboard"
-    verbose " after use. This command now WAITS for the other nodes to join."
+    verbose " after use. This command does NOT wait for the other nodes: join them"
+    verbose " next, each with:  fusionpbx-ha.sh --join <TOKEN>"
     verbose "========================================================================="
     echo ""
 }
@@ -560,7 +566,8 @@ init_step_9_haproxy() {
 init_step_10_repoint_dsn() {
     # The applications are repointed to THIS primary right below - their
     # writes must not freeze on a stale sync-standby wait while the new
-    # standby has not joined yet (steps 11/12) (regression 0.3.17)
+    # standby has not joined yet (it joins AFTER this command completes
+    # since 0.3.39; regression 0.3.17)
     ha_clear_stale_sync_names
     ha_repoint_dsn
 }
@@ -569,17 +576,27 @@ init_poll_witness_registered() {
     pg_runuser_psql -d "$HA_REPMGR_DB" -tAc "SELECT 1 FROM repmgr.nodes WHERE node_id=3" 2>/dev/null | grep -q 1
 }
 
-init_step_11_wait_witness() {
+init_step_11_witness_status() {
     # self-heal for runs resumed from an older state file: the firewall
     # rules were only added to step 5 by 0.3.6, a resume from step 11
     # would never re-run it (regression 0.3.6)
     ha_ensure_cluster_firewall
-    # HA_WAIT_NODES (seconds) overrides both node waits - a slow bench
-    # exports it once instead of editing the script (0.3.8)
-    ha_wait "witness node registration (run --join on $HA_INIT_NODE3_IP)" "${HA_WAIT_NODES:-900}" init_poll_witness_registered \
-        || die "the witness did not join within ${HA_WAIT_NODES:-900}s
-(re-run this SAME command - it resumes from this step;
-export HA_WAIT_NODES=<seconds> to wait longer)"
+    # 0.3.39: --init does NOT wait for the peers anymore. The old ha_wait
+    # here (and in step 12) put a 900s timer on the operator's peer
+    # installation (HA_WAIT_NODES, 0.3.8) - impossible to meet when the
+    # peers were still being installed, and the timeout killed an
+    # otherwise healthy bootstrap. The documented flow is now "install
+    # all three servers first, then connect them to the cluster": this
+    # command completes alone, the peers join afterwards with --join, and
+    # nothing on this node depends on WHEN they do (the witness registers
+    # against this primary whenever it arrives; sync mode is armed by the
+    # standby's own join step 11). A node that is not yet the complete
+    # cluster primary right after the install is the accepted price.
+    if init_poll_witness_registered; then
+        verbose "  witness $(ha_node_name 3) is registered in the cluster"
+    else
+        verbose "  witness not joined yet - run --join on $HA_INIT_NODE3_IP afterwards"
+    fi
 }
 
 init_poll_standby_streaming() {
@@ -588,7 +605,7 @@ init_poll_standby_streaming() {
         2>/dev/null | grep -q 1
 }
 
-init_step_12_wait_standby() {
+init_step_12_standby_status() {
     # same self-heal as step 11 (regression 0.3.6)
     ha_ensure_cluster_firewall
     # resume self-heal (regression 0.3.11): a resume from an old state file
@@ -596,14 +613,21 @@ init_step_12_wait_standby() {
     # streaming (its join step 9 seeds from it immediately)
     ha_ensure_sync_dir
     # the standby's join step 9 (media seed) SSHes into THIS node with the
-    # sync key while we are still waiting here - authorized_keys cannot
-    # wait for step 14: on the real bench step 13 crashed, 14 never ran and
-    # the seed died with 'Permission denied' (regression 0.3.9). Idempotent.
+    # sync key - authorized_keys cannot wait for step 14: on the real bench
+    # step 13 crashed, 14 never ran and the seed died with 'Permission
+    # denied' (regression 0.3.9). Idempotent. With the waits gone (0.3.39)
+    # the standby may join any time AFTER this command completes - both
+    # self-heals must already be in place by then.
     ha_write_authorized_keys
-    ha_wait "streaming standby $(ha_node_name 2) (run --join on $HA_INIT_NODE2_IP)" "${HA_WAIT_NODES:-900}" init_poll_standby_streaming \
-        || die "the standby did not start streaming within ${HA_WAIT_NODES:-900}s
-(re-run this SAME command - it resumes from this step;
-export HA_WAIT_NODES=<seconds> to wait longer)"
+    # 0.3.39: no ha_wait here either - the standby's join itself performs
+    # the convergence that the old wait guarded (join step 11 calls
+    # ha_ensure_sync FOR THIS primary the moment the standby streams).
+    if init_poll_standby_streaming; then
+        verbose "  standby $(ha_node_name 2) is streaming from this primary"
+    else
+        verbose "  standby not streaming yet - run --join on $HA_INIT_NODE2_IP afterwards;"
+        verbose "  its join arms synchronous replication on this primary automatically"
+    fi
 }
 
 init_step_13_sync_on() {
@@ -628,6 +652,14 @@ init_step_14_sync_setup() {
     ha_render_lsyncd_conf "$(ha_node_ip 2)"
     ha_install_lsyncd_dropin
     svc_enable_start "$HA_LSYNCD_SERVICE"
+    # 0.3.39: before the standby joins, lsyncd cannot reach its target and
+    # logs rsync connection failures - expected bootstrap noise, not an
+    # error. The standby's join step 9 seeds the WHOLE media tree (pull
+    # from this node), which closes the gap; lsyncd converges on the next
+    # local change afterwards.
+    init_poll_standby_streaming || warn "lsyncd starts now, but $(ha_node_name 2) is not streaming yet:
+  media sync engages when it joins (rsync failures in the lsyncd log until
+  then are expected; the standby's join seeds the media tree and closes the gap)"
 }
 
 init_step_15_finalize() {
@@ -636,11 +668,27 @@ init_step_15_finalize() {
     repmgr_cmd cluster show | sed 's/^/  /'
     verbose ""
     verbose "  entry point for applications: 127.0.0.1:$HA_HAPROXY_PORT (haproxy)"
-    verbose "  synchronous replication:      on (RPO = 0 for committed data)"
-    verbose "  media sync:                   $HA_SYNC_DIR <-> $(ha_node_ip 2)"
-    verbose ""
-    verbose "Next: 'fusionpbx-ha.sh --doctor' on all three nodes."
-    verbose "Token needed again? 'fusionpbx-ha.sh --print-token' (this node only)."
+    if init_poll_standby_streaming; then
+        verbose "  synchronous replication:      on (RPO = 0 for committed data)"
+        verbose "  media sync:                   $HA_SYNC_DIR <-> $(ha_node_ip 2)"
+        verbose ""
+        verbose "Next: 'fusionpbx-ha.sh --doctor' on all three nodes."
+        verbose "Token needed again? 'fusionpbx-ha.sh --print-token' (this node only)."
+    else
+        # 0.3.39: the peers were not required to be here - the bootstrap is
+        # still a SUCCESS, the cluster completes itself when they join.
+        verbose "  synchronous replication:      pending - arms AUTOMATICALLY when"
+        verbose "                                $(ha_node_name 2) joins (currently async - writes work)"
+        verbose "  media sync:                   pending - engages when $(ha_node_name 2) joins"
+        verbose ""
+        verbose "Bootstrap on this node is DONE - the primary runs alone for now (async,"
+        verbose "no failover protection until the peers join). Next, join the peers:"
+        verbose "  on $HA_INIT_NODE2_IP:  fusionpbx-ha.sh --join <TOKEN>   (standby)"
+        verbose "  on $HA_INIT_NODE3_IP:  fusionpbx-ha.sh --join <TOKEN>   (witness)"
+        verbose "The token was printed above; 'fusionpbx-ha.sh --print-token' re-prints it"
+        verbose "(this node only). Until the peers join, --doctor on THIS node reports"
+        verbose "the missing nodes - that is expected during bootstrap."
+    fi
 }
 
 # =============================================================================
@@ -2030,13 +2078,19 @@ cmd_init() {
         init_step_8_agent \
         init_step_9_haproxy \
         init_step_10_repoint_dsn \
-        init_step_11_wait_witness \
-        init_step_12_wait_standby \
+        init_step_11_witness_status \
+        init_step_12_standby_status \
         init_step_13_sync_on \
         init_step_14_sync_setup \
         init_step_15_finalize
     verbose ""
-    verbose "=== Cluster initialization completed successfully ==="
+    # 0.3.39: with no peer waits the command can complete while the peers
+    # are not joined yet - say which of the two endings this was
+    if init_poll_standby_streaming && init_poll_witness_registered; then
+        verbose "=== Cluster initialization completed successfully ==="
+    else
+        verbose "=== Node bootstrap completed - join the peers next (see the summary above) ==="
+    fi
 }
 
 cmd_join() {
