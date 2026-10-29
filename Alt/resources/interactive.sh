@@ -130,16 +130,16 @@ interactive_collect_answers() {
         # only a DIFFERENT answer overrides - the default (this node's IP)
         # stays as the 'ip_address' sentinel so finish.sh keeps its own
         # fallback chain; answering 'hostname' keeps that sentinel too
+        verbose "  NOTE (if you installing HA cluster): answer the SAME domain on every node."
+        verbose "  Node 2's local database is replaced by the clone from node 1 at"
+        verbose "  join, so only node 1's answer survives - a real domain name here"
+        verbose "  (one DNS name for the whole cluster) is the operationally right way."
         if [ -n "$_ica_d" ] && [ "$_ica_d" != "$_ica_ip" ]; then
             domain_name="$_ica_d"
             # export: the step scripts run as child processes and re-source
             # config.sh - the environment is the only carrier
             export domain_name
         fi
-        verbose "  NOTE (HA cluster): answer the SAME domain on every node."
-        verbose "  Node 2's local database is replaced by the clone from node 1 at"
-        verbose "  join, so only node 1's answer survives - a real domain name here"
-        verbose "  (one DNS name for the whole cluster) is the operationally right way."
     fi
 
     # --- 3. Admin password (a custom system_password in config.sh wins) ---
