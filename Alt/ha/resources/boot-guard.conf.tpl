@@ -35,3 +35,7 @@ BG_RESCUE_ANSWER_TRIES="@@RESCUE_ANSWER_TRIES@@"
 BG_RESCUE_ANSWER_SLEEP="@@RESCUE_ANSWER_SLEEP@@"
 BG_RESCUE_ATTACH_TRIES="@@RESCUE_ATTACH_TRIES@@"
 BG_RESCUE_ATTACH_SLEEP="@@RESCUE_ATTACH_SLEEP@@"
+# 0.3.41: the status collector - after a completed rejoin the snapshot is
+# refreshed at once (the rejoined node's widget flips to standby/streaming
+# immediately; the PEER's snapshot updates at its own next cron tick)
+BG_STATUS_SCRIPT="@@STATUS_SCRIPT@@"

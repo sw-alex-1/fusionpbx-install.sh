@@ -24,12 +24,17 @@
 
 //read the snapshot
         require_once dirname(__DIR__, 2) . "/resources/status_reader.php";
-        $stale_after = 600;
+        $stale_after = 180;
         if (!empty($settings) && method_exists($settings, 'get')) {
-                $stale_after = (int)($settings->get('cluster', 'status_stale_seconds', 600) ?: 600);
+                $stale_after = (int)($settings->get('cluster', 'status_stale_seconds', 180) ?: 180);
         }
         $snap = cluster_status_read($stale_after);
         $d = $snap['data'];
+        // 0.3.41: the instant-refresh control (pinned sudoers verb) - a
+        // stale/failed snapshot is actionable right from the dashboard.
+        // A POST form like the page's own button (FusionPBX 5.6 carries no
+        // global CSRF token framework; the verb is read-only anyway).
+        $widget_collector = cluster_status_collector_cmd();
 
 //the dashboard passes the widget settings; the label follows the widget
 //name exactly like the system widgets do
@@ -57,6 +62,15 @@
         echo "  <div class='hud_content'" . (($widget_details_state ?? 'disabled') == "disabled" ? "" : " onclick=\"$('#hud_cluster_status_details').slideToggle('fast');\"") . ">\n";
         echo "          <span class='hud_title'><a onclick=\"document.location.href='" . PROJECT_PATH . "/app/cluster/cluster.php'\">" . escape($widget_label) . "</a></span>\n";
         echo "          <div class='hud_stat' style='color: " . $hcolor . ";'>" . escape($hlabel) . "</div>\n";
+        // 0.3.41: the instant-refresh control - a stale/failed snapshot is
+        // actionable right from the dashboard (same POST form as the page)
+        if ($widget_collector !== '') {
+                $_url = PROJECT_PATH . '/app/cluster/cluster.php';
+                echo "          <form method='post' action='" . escape($_url) . "' style='text-align: center; margin: 4px 0 2px 0;'>\n";
+                echo "                  <input type='hidden' name='action' value='refresh'>\n";
+                echo "                  <button type='submit' class='btn' style='font-size: 11px; padding: 2px 10px;'>" . escape($text['label-refresh']) . "</button>\n";
+                echo "          </form>\n";
+        }
 
         //rows: this node's role, replication mode + lag, freshness
         $row_style = ['row_style0', 'row_style1'];

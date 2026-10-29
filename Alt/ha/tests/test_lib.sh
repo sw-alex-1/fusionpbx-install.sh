@@ -2494,7 +2494,7 @@ report "doctor: static .pgpass coverage via ha_pgpass_file (0.3.34)" $?
 
 # the layout move (0.3.34): the script resolves Alt/ha/resources from its
 # new Alt/ home AND still honors an exported HA_RES_DIR (sandbox contract)
-_head334="$(sed -n '1,60p' "$CLI")"
+_head334="$(sed -n '1,70p' "$CLI")"
 echo "$_head334" | grep -qF 'if [ -z "${HA_RES_DIR:-}" ]' \
     && echo "$_head334" | grep -qF '$SCRIPT_DIR/ha/resources' \
     && echo "$_head334" | grep -qF '$SCRIPT_DIR/resources/ha-lib.sh'

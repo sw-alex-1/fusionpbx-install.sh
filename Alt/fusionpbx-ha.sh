@@ -21,6 +21,11 @@
 #   fusionpbx-ha.sh --repair [--force-clone]
 #   fusionpbx-ha.sh --status [--json]       # --json: the web-status snapshot
 #                                             # (schema v1, DESIGN.md section 19)
+#   fusionpbx-ha.sh --write-status          # collect the snapshot AND write it
+#                                             # to /var/lib/fusionpbx-ha/status.json
+#                                             # right now (the cron, the web refresh
+#                                             # button and the promote/rejoin hooks
+#                                             # all call this, 0.3.41)
 #   fusionpbx-ha.sh --doctor
 #   fusionpbx-ha.sh --print-token           # re-print the join token (node 1)
 #
@@ -86,7 +91,7 @@ PROXY_SERVER=""
 
 ARGS=$(getopt -n "fusionpbx-ha.sh" \
     -o h \
-    -l help,init,join:,config:,repair,status,doctor,print-token,yes,force,no-color,verbose,force-clone,json,proxy:,node2:,node3:,cluster-name: \
+    -l help,init,join:,config:,repair,status,write-status,doctor,print-token,yes,force,no-color,verbose,force-clone,json,proxy:,node2:,node3:,cluster-name: \
     -- "$@") || { error "failed parsing command line options"; exit 1; }
 
 eval set -- "$ARGS"
@@ -97,6 +102,7 @@ while true; do
         --config)        HA_CONFIG_FILE="$2"; shift 2 ;;
         --repair)        HA_COMMAND="repair"; shift ;;
         --status)        HA_COMMAND="status"; shift ;;
+        --write-status)  HA_COMMAND="write-status"; shift ;;
         --doctor)        HA_COMMAND="doctor"; shift ;;
         --print-token)   HA_COMMAND="print-token"; shift ;;
         --yes)           HA_AUTO_YES=1; shift ;;
@@ -260,6 +266,15 @@ Usage:
       Compact live summary (read-only). --json prints the same facts as one
       machine-readable JSON object on stdout (schema v1; used by the Status
       -> Cluster web page and its dashboard widget via the status cron).
+
+  fusionpbx-ha.sh --write-status
+      Collect the snapshot and materialize it into
+      /var/lib/fusionpbx-ha/status.json ATOMICALLY (tmp + mv, under the
+      status lock). Used by the status cron (every minute), by the
+      "Refresh now" button of the web UI (a pinned sudoers verb) and by
+      the post-promote / post-rejoin hooks - one collector, one file.
+      Exit 0 = a fresh snapshot is on disk; 1 = the lock is busy or the
+      collector failed (the previous snapshot stays - the honest signal).
 
   fusionpbx-ha.sh --doctor
       Deep health check with an exit code for monitoring (0 = healthy).
@@ -1611,7 +1626,15 @@ ha_status_json() {
     if [ "$HA_NODE_ID" != "3" ]; then
         if [ "$_sj_localpg" = "primary" ]; then
             _sj_syncnames="$(pg_runuser_psql -tAc "SHOW synchronous_standby_names" 2>/dev/null | tr -d ' \r')"
-            _sj_row="$(pg_runuser_psql -d postgres -tAc "SELECT application_name||'|'||state||'|'||sync_state||'|'||COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), write_lsn),0) FROM pg_stat_replication WHERE application_name='$(ha_node_name 2)'" 2>/dev/null | tr -d ' \r')"
+            # 0.3.41: the streaming standby of THIS primary is the PEER
+            # (ha_peer_name), never a hardcoded node number. The 29.10
+            # failover bench: node 2 promoted, node 1 rejoined as its
+            # standby (application_name='fpbx-ha-1') - the old
+            # "WHERE application_name='$(ha_node_name 2)'" matched NOTHING
+            # on a node-2 primary, the snapshot said "not connected" +
+            # "writes are frozen" on a perfectly healthy cluster, and the
+            # verdict NEVER self-corrected (every cron run re-produced it).
+            _sj_row="$(pg_runuser_psql -d postgres -tAc "SELECT application_name||'|'||state||'|'||sync_state||'|'||COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), write_lsn),0) FROM pg_stat_replication WHERE application_name='$(ha_peer_name)'" 2>/dev/null | tr -d ' \r')"
             if [ -n "$_sj_row" ]; then
                 _sj_rep_peer="$(printf '%s' "$_sj_row" | cut -d'|' -f1)"
                 _sj_rep_state="$(printf '%s' "$_sj_row" | cut -d'|' -f2)"
@@ -1766,12 +1789,76 @@ ha_status_json() {
         _sj_reasons_json=""
     fi
 
+    # 0.3.41: node.role is the LIVE role (the promoted node must say
+    # "primary" the moment it is one; the static cluster.conf role is the
+    # fallback only while the local database cannot be asked). The 29.10
+    # widget said "fpbx-ha-2 - standby" for hours after node 2 was
+    # promoted, because HA_ROLE is the role the node was INSTALLED with.
+    _sj_role_live="$_sj_localpg"
+    case "$_sj_role_live" in
+        primary|standby) ;;
+        *) _sj_role_live="${HA_ROLE:-unknown}" ;;
+    esac
+
     printf '{"schema":1,"generated_at":"%s","generated_at_epoch":%s,"cluster":"%s","node":{"id":%s,"name":"%s","ip":"%s","role":"%s"},"local_pg":"%s","nodes":[%s],"replication":%s,"entry_point":%s,"services":[%s],"health":"%s","health_reasons":[%s]}\n' \
         "$_sj_now_iso" "$_sj_now_epoch" "$(ha_json_str "${HA_CLUSTER_NAME:-unknown}")" \
         "$HA_NODE_ID" "$(ha_json_str "$(ha_node_name "$HA_NODE_ID")")" \
-        "$(ha_node_ip "$HA_NODE_ID")" "$(ha_json_str "${HA_ROLE:-unknown}")" \
+        "$(ha_node_ip "$HA_NODE_ID")" "$(ha_json_str "$_sj_role_live")" \
         "$_sj_localpg" "$_sj_nodes_json" "$_sj_rep_json" "$_sj_ep_json" \
         "$_sj_svcs_json" "$_sj_health" "$_sj_reasons_json"
+}
+
+# -----------------------------------------------------------------------------
+# 0.3.41: --write-status - materialize the snapshot file ATOMICALLY, as
+# root, under the SAME lock the cron uses. Consumers:
+#   - the status cron (every minute; ha_install_status_cron)
+#   - the "Refresh now" button of the web UI (a pinned sudoers verb for the
+#     web user + postgres, /etc/sudoers.d/fusionpbx-ha-status)
+#   - promote.sh after a failover and pg-auto-rejoin.sh after an automatic
+#     rejoin (the two moments when the dashboard MUST flip at once)
+# One collector, one lock, one file: a concurrent run either waits briefly
+# (flock -w) or reports busy; the previous snapshot is never corrupted.
+# Exit 0 = a fresh snapshot is on disk; 1 = busy or the collector failed
+# (the previous snapshot stays - the honest signal, exactly like cron).
+# -----------------------------------------------------------------------------
+ha_write_status_snapshot() {
+    HA_NO_COLOR=1
+    mkdir -p "$HA_VAR_DIR" 2>/dev/null || die "cannot create $HA_VAR_DIR"
+
+    # a collector that DIES (die/exit inside ha_status_json) never reaches
+    # the cleanup below - the empty .new of that death must not outlive
+    # the run (0.3.41: caught by the sandbox - the file stayed behind).
+    # Entry cleanup + an EXIT trap cover both the stale leftovers of any
+    # previous crash and this run's own death.
+    rm -f "$HA_STATUS_FILE.new" 2>/dev/null || true
+    trap 'rm -f "$HA_STATUS_FILE.new" 2>/dev/null' EXIT
+
+    if cmd_exists flock; then
+        # touch first: a failed 'exec 9>' redirection kills a POSIX shell
+        # (0.3.33), so prove the lock path is writable before opening the fd
+        if mkdir -p "$(dirname "$HA_STATUS_LOCK")" 2>/dev/null \
+            && touch "$HA_STATUS_LOCK" 2>/dev/null; then
+            exec 9>"$HA_STATUS_LOCK"
+            if ! flock -w 15 9; then
+                warn "another status collection is holding $HA_STATUS_LOCK - skipped this run"
+                return 1
+            fi
+        fi
+        # lock path not writable: proceed UNLOCKED (best effort - the
+        # atomic tmp+mv below still protects the file itself)
+    fi
+
+    if ha_status_json > "$HA_STATUS_FILE.new" 2>>"$HA_VAR_DIR/status-collector.log"; then
+        mv -f "$HA_STATUS_FILE.new" "$HA_STATUS_FILE"
+        chmod 0644 "$HA_STATUS_FILE" 2>/dev/null || true
+        trap - EXIT
+        return 0
+    fi
+    rm -f "$HA_STATUS_FILE.new" 2>/dev/null || true
+    trap - EXIT
+    warn "the status collector failed - the previous snapshot stays
+  (collector log: $HA_VAR_DIR/status-collector.log)"
+    return 1
 }
 
 # =============================================================================
@@ -2572,6 +2659,8 @@ case "$HA_COMMAND" in
     repair)  cmd_repair ;;
     status)  ha_load_cluster_conf
               if [ "$HA_JSON" = "1" ]; then ha_status_json; else cmd_status; fi ;;
+    write-status) ha_load_cluster_conf
+              ha_write_status_snapshot || exit 1 ;;
     doctor)  ha_load_cluster_conf; cmd_doctor ;;
     print-token) ha_load_cluster_conf; cmd_print_token ;;
     *)       ha_print_help; [ -z "$HA_COMMAND" ] && exit 0 || exit 1 ;;

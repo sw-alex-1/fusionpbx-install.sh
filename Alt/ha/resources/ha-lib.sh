@@ -81,10 +81,22 @@ HA_STATUS_FILE="${HA_STATUS_FILE:-$HA_VAR_DIR/status.json}"
 HA_WEB_DIR="${HA_WEB_DIR:-/var/www/fusionpbx}"
 HA_WEB_APP="${HA_WEB_APP:-cluster}"
 HA_CRON_FILE="${HA_CRON_FILE:-/etc/cron.d/fusionpbx-ha-status}"
-# how often the cron collects (minutes) and how old the file may get before
-# the web UI calls it stale (seconds; 2 missed runs + collector runtime)
-HA_STATUS_CRON_MIN="${HA_STATUS_CRON_MIN:-5}"
-HA_STATUS_STALE_SEC="${HA_STATUS_STALE_SEC:-600}"
+# 0.3.41: every MINUTE (the 29.10 bench: a 5-minute cadence kept showing
+# a green "Ok" widget for minutes after node 1 died - an administrator
+# walks to a dead cabinet because the dashboard said so). The collector
+# is cheap (local psql + two bounded probes) and flock-guarded, so the
+# fast tick costs nothing; the failover/rejoin moments are additionally
+# covered by instant hooks (promote.sh / pg-auto-rejoin.sh).
+HA_STATUS_CRON_MIN="${HA_STATUS_CRON_MIN:-1}"
+# how old the file may get before the web UI calls it stale (seconds;
+# 3 missed 1-minute runs + the collector runtime)
+HA_STATUS_STALE_SEC="${HA_STATUS_STALE_SEC:-180}"
+# the single lock shared by the cron, the web refresh button and the
+# promote/rejoin hooks (all run 'fusionpbx-ha.sh --write-status')
+HA_STATUS_LOCK="${HA_STATUS_LOCK:-/run/fusionpbx-ha-status.lock}"
+# the pinned sudoers verb for the refresh button (web user) and the
+# post-promote hook (postgres): ONLY '<script> --write-status'
+HA_WEB_SUDOERS_FILE="${HA_WEB_SUDOERS_FILE:-/etc/sudoers.d/fusionpbx-ha-status}"
 
 # managed-block markers (see ha_block_* below)
 HA_BLOCK_BEGIN="# BEGIN fusionpbx-ha (managed)"
@@ -796,9 +808,11 @@ pg_runuser_psql() {
 }
 
 # psql over TCP with the fusionpbx application credentials
+# (0.3.41: PGCONNECT_TIMEOUT - a dead peer or a half-open haproxy must
+# fail in seconds, never hang a collector run for the TCP timeout)
 pg_psql_app() {
     _hpa_host="$1"; shift
-    PGPASSWORD="$HA_DB_PASSWORD" psql -h "$_hpa_host" -U "$HA_DB_USER" -d "$HA_DB_NAME" "$@" 2>/dev/null
+    PGCONNECT_TIMEOUT=5 PGPASSWORD="$HA_DB_PASSWORD" psql -h "$_hpa_host" -U "$HA_DB_USER" -d "$HA_DB_NAME" "$@" 2>/dev/null
 }
 
 # psql over TCP as the postgres superuser (remote ALTER SYSTEM for sync
@@ -808,7 +822,7 @@ pg_psql_superuser() {
     if [ "$_hps_host" = "local" ]; then
         pg_runuser_psql "$@"
     else
-        PGPASSWORD="$HA_DB_PASSWORD" psql -h "$_hps_host" -p "$HA_PG_PORT" -U postgres "$@" 2>/dev/null
+        PGCONNECT_TIMEOUT=5 PGPASSWORD="$HA_DB_PASSWORD" psql -h "$_hps_host" -p "$HA_PG_PORT" -U postgres "$@" 2>/dev/null
     fi
 }
 
@@ -1516,6 +1530,7 @@ ha_install_pg_boot_guard() {
         -e "s|@@RESCUE_ANSWER_SLEEP@@|${HA_RESCUE_ANSWER_SLEEP:-1}|g" \
         -e "s|@@RESCUE_ATTACH_TRIES@@|${HA_RESCUE_ATTACH_TRIES:-15}|g" \
         -e "s|@@RESCUE_ATTACH_SLEEP@@|${HA_RESCUE_ATTACH_SLEEP:-2}|g" \
+        -e "s|@@STATUS_SCRIPT@@|$(ha_status_script_path)|g" \
         "$HA_RES_DIR/boot-guard.conf.tpl" > "$_hibg_tmp" || { rm -f "$_hibg_tmp"; return 1; }
     if ! cmp -s "$_hibg_tmp" "$_hibg_conf" 2>/dev/null; then
         install -m 0644 "$_hibg_tmp" "$_hibg_conf" 2>/dev/null \
@@ -2214,6 +2229,11 @@ HA_WEB_WIDGET_GROUP_UUID="3319ef28-bd18-4c3f-adc6-ab526ac8898d"
 # the default menu (the same uuids every upstream app_menu.php references)
 HA_WEB_DASHBOARD_UUID="3e2cbaa4-2bec-41b2-a626-999a59b8b19c"
 HA_WEB_STATUS_PARENT_UUID="0438b504-8613-7887-c420-c837ffb20cb1"
+# 0.3.41: the cluster.status_stale_seconds default_setting row - MUST
+# mirror app_config.php (same uuid: the installer upserts what app_defaults
+# would insert, so the threshold lands on systems that never ran
+# upgrade.php --defaults, and every --repair factory-refreshes the value)
+HA_WEB_SETTING_UUID="b26c0773-0ecd-45d7-b5a6-eaeba86be86a"
 
 # the web server identity (layer-1 config.sh: angie on ALT Linux; the
 # env override covers exotic setups and the test sandbox)
@@ -2278,20 +2298,42 @@ ha_web_app_register_sql() {
             || warn "cannot grant the widget to superadmin"
         verbose "  dashboard widget registered: Cluster Status (superadmin)"
     fi
+
+    # 0.3.41: the stale threshold as a MANAGED default_setting row. The
+    # 29.10 cluster never ran upgrade.php --defaults, so the app_config.php
+    # declaration alone left the reader on its hardcoded 600s fallback -
+    # with the 1-minute cron that meant 10 missed runs before the widget
+    # turned red. Upsert (not DO NOTHING): a --repair must factory-refresh
+    # the value installed by an older script version (600 -> 180).
+    pg_runuser_psql -d "$HA_DB_NAME" -c \
+        "INSERT INTO v_default_settings (default_setting_uuid, default_setting_category, default_setting_subcategory, default_setting_name, default_setting_value, default_setting_enabled, default_setting_description)
+         VALUES ('$HA_WEB_SETTING_UUID', 'cluster', 'status_stale_seconds', 'numeric', '$HA_STATUS_STALE_SEC', 'true', 'Seconds after which the cluster status snapshot is considered stale (the widget and the Status -> Cluster page turn red). Managed by fusionpbx-ha.sh - re-running the install command resets it to the factory value.')
+         ON CONFLICT (default_setting_uuid) DO UPDATE SET
+             default_setting_value = EXCLUDED.default_setting_value,
+             default_setting_enabled = 'true',
+             default_setting_description = EXCLUDED.default_setting_description" >/dev/null \
+        || warn "cannot upsert the cluster.status_stale_seconds default setting (the reader falls back to its built-in default)"
+    verbose "  stale threshold setting ensured: cluster.status_stale_seconds = $HA_STATUS_STALE_SEC s"
+}
+
+# the collector script path: HA_STATUS_SCRIPT wins (tests pin it
+# explicitly); the default is the script CURRENTLY RUNNING, resolved
+# absolute - if the operator later moves the repo the cron dies, the file
+# ages out and the widget turns red: visible, honest, fixable by re-running
+# the install command. Shared by the cron, the sudoers drop-in and the
+# promote.sh render (one path everywhere, 0.3.41).
+ha_status_script_path() {
+    _hssp="${HA_STATUS_SCRIPT:-}"
+    if [ -z "$_hssp" ]; then
+        _hssp="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")"
+    fi
+    [ -f "$_hssp" ] || _hssp="$(pwd)/$(basename "$0")"
+    printf '%s\n' "$_hssp"
 }
 
 # the status cron + the first snapshot (both data nodes)
 ha_install_status_cron() {
-    # the collector path: HA_STATUS_SCRIPT wins (tests pin it explicitly);
-    # the default is the script CURRENTLY RUNNING, resolved absolute - if
-    # the operator later moves the repo the cron dies, the file ages out
-    # and the widget turns red: visible, honest, fixable by re-running the
-    # install command
-    _hic_script="${HA_STATUS_SCRIPT:-}"
-    if [ -z "$_hic_script" ]; then
-        _hic_script="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")"
-    fi
-    [ -f "$_hic_script" ] || _hic_script="$(pwd)/$(basename "$0")"
+    _hic_script="$(ha_status_script_path)"
 
     mkdir -p "$HA_VAR_DIR" 2>/dev/null || die "cannot create $HA_VAR_DIR"
 
@@ -2301,8 +2343,11 @@ ha_install_status_cron() {
 # and the dashboard widget). Managed by fusionpbx-ha.sh - edits are
 # overwritten. The collector is READ-ONLY; when it fails the file ages out
 # and the web UI turns RED - that is the design (DESIGN.md section 19).
+# 0.3.41: every minute (--write-status takes the lock itself and writes
+# the file atomically; the failover/rejoin moments are additionally
+# covered by instant hooks in promote.sh / pg-auto-rejoin.sh).
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
-*/$HA_STATUS_CRON_MIN * * * * root flock -n /run/fusionpbx-ha-status.lock "$_hic_script" --status --json --no-color > $HA_STATUS_FILE.new 2>>$HA_VAR_DIR/status-collector.log && mv -f $HA_STATUS_FILE.new $HA_STATUS_FILE
+*/$HA_STATUS_CRON_MIN * * * * root "$_hic_script" --write-status >>$HA_VAR_DIR/status-collector.log 2>&1
 CRON
     if [ -f "$HA_CRON_FILE" ] && cmp -s "$_hic_tmp" "$HA_CRON_FILE"; then
         rm -f "$_hic_tmp"
@@ -2316,14 +2361,75 @@ CRON
 
     # the first snapshot right now - the page must not be empty for the
     # first HA_STATUS_CRON_MIN minutes; failure is a WARNING (cron retries)
-    if "$_hic_script" --status --json --no-color > "$HA_STATUS_FILE.new" 2>>"$HA_VAR_DIR/status-collector.log"; then
-        mv -f "$HA_STATUS_FILE.new" "$HA_STATUS_FILE"
-        chmod 0644 "$HA_STATUS_FILE" 2>/dev/null || true
+    if "$_hic_script" --write-status >>"$HA_VAR_DIR/status-collector.log" 2>&1; then
         verbose "  first status snapshot written: $HA_STATUS_FILE"
     else
-        rm -f "$HA_STATUS_FILE.new" 2>/dev/null || true
         warn "the first status snapshot failed - the cron will retry every $HA_STATUS_CRON_MIN min
   (collector log: $HA_VAR_DIR/status-collector.log)"
+    fi
+}
+
+# 0.3.41: the pinned sudoers verb for '<script> --write-status'. Two
+# callers need to run the collector as root without being root:
+#   - the web user (angie; php-fpm workers) - the "Refresh now" button of
+#     the Status -> Cluster page and of the dashboard widget (the owner's
+#     29.10 request: 5 minutes between updates is too long to trust);
+#   - postgres - promote.sh refreshes the snapshot right after a failover
+#     so the dashboard flips within seconds, not at the next cron tick.
+# The command is pinned EXACTLY (path + the one flag): the web user can
+# never reach any other verb of the script through this file.
+ha_install_status_sudoers() {
+    _hiss_script="$(ha_status_script_path)"
+
+    if ! cmd_exists sudo; then
+        verbose "  sudo not found - skipping the status sudoers drop-in (the web refresh button stays dormant)"
+        return 0
+    fi
+    _hiss_dir="$(dirname "$HA_WEB_SUDOERS_FILE")"
+    mkdir -p "$_hiss_dir" 2>/dev/null || { warn "cannot create $_hiss_dir - the web refresh button stays dormant"; return 0; }
+
+    _hiss_users=""
+    # the web user: the refresh button. A missing user (exotic layouts)
+    # only costs the button, never the install
+    if id -u "$HA_WEB_USER" >/dev/null 2>&1; then
+        _hiss_users="$HA_WEB_USER"
+    else
+        warn "the web user '$HA_WEB_USER' does not exist - the web refresh button stays dormant"
+    fi
+    # postgres: the post-promote snapshot refresh (promote.sh runs as
+    # postgres under repmgrd); the data-node postgres always exists here
+    id -u postgres >/dev/null 2>&1 && _hiss_users="$_hiss_users postgres"
+
+    if [ -z "$_hiss_users" ]; then
+        warn "neither '$HA_WEB_USER' nor postgres exists - the status sudoers drop-in is skipped"
+        return 0
+    fi
+
+    _hiss_tmp="$(mktemp "${TMPDIR:-/tmp}/fpbx-ha-sudoers.XXXXXX")"
+    {
+        echo "# fusionpbx-ha: managed file - the ONLY elevation the web status"
+        echo "# add-on needs: running the read-only status collector on demand."
+        echo "# Pinned to the exact path + flag; edits are overwritten by"
+        echo "# fusionpbx-ha.sh (re-run the install command after moving the repo)."
+        for _hiss_u in $_hiss_users; do
+            echo "$_hiss_u ALL=(root) NOPASSWD: $_hiss_script --write-status"
+        done
+    } > "$_hiss_tmp"
+    if cmd_exists visudo; then
+        if ! visudo -c -f "$_hiss_tmp" >/dev/null 2>&1; then
+            rm -f "$_hiss_tmp"
+            warn "status sudoers drop-in failed validation (visudo) - removed; the web refresh button stays dormant"
+            return 0
+        fi
+    fi
+    if [ -f "$HA_WEB_SUDOERS_FILE" ] && cmp -s "$_hiss_tmp" "$HA_WEB_SUDOERS_FILE"; then
+        rm -f "$_hiss_tmp"
+        verbose "  status sudoers unchanged: $HA_WEB_SUDOERS_FILE"
+    else
+        install -m 0440 "$_hiss_tmp" "$HA_WEB_SUDOERS_FILE" \
+            || { rm -f "$_hiss_tmp"; warn "cannot write $HA_WEB_SUDOERS_FILE - the web refresh button stays dormant"; return 0; }
+        rm -f "$_hiss_tmp"
+        verbose "  status sudoers installed: $HA_WEB_SUDOERS_FILE ($_hiss_users may run --write-status)"
     fi
 }
 
@@ -2366,6 +2472,10 @@ ha_install_web_app() {
     fi
 
     ha_install_status_cron
+    # 0.3.41: the pinned --write-status sudoers verb (the web refresh
+    # button + the post-promote hook); both data-node modes - the file is
+    # node-local, no database involved
+    ha_install_status_sudoers
 }
 
 # 0.3.35: pre-verify the post-promote app-restart sudo path (as user
@@ -2419,7 +2529,8 @@ ha_install_promote_sh() {
     [ -n "$_hips_php" ] && _hips_apps="$_hips_php $_hips_apps"
     ha_render "$HA_RES_DIR/promote.sh.tpl" "$HA_PROMOTE_SH" \
         "APP_SERVICES=$_hips_apps" \
-        "SYSTEMCTL_PATH=$(ha_systemctl_path)"
+        "SYSTEMCTL_PATH=$(ha_systemctl_path)" \
+        "STATUS_SCRIPT=$(ha_status_script_path)"
     chmod 0755 "$HA_PROMOTE_SH" 2>/dev/null || true
     # 0.3.35: prove the sudo path while the operator is looking (the
     # 27.10 promote proved the rules can be right and the calls still die)

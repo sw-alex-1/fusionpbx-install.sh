@@ -6,8 +6,8 @@
 $text['title-cluster']['en-us'] = "Cluster Status";
 $text['title-cluster']['ru-ru'] = "Состояние кластера";
 
-$text['description-cluster']['en-us'] = "FusionPBX HA cluster state as collected on this node. Updated automatically every few minutes; read-only.";
-$text['description-cluster']['ru-ru'] = "Состояние HA-кластера FusionPBX по данным сборщика на этой ноде. Обновляется автоматически каждые несколько минут; только для просмотра.";
+$text['description-cluster']['en-us'] = "FusionPBX HA cluster state as collected on this node. Updated automatically every minute; use the Refresh button to collect it instantly; read-only.";
+$text['description-cluster']['ru-ru'] = "Состояние HA-кластера FusionPBX по данным сборщика на этой ноде. Обновляется автоматически каждую минуту; кнопка «Обновить» собирает его немедленно; только для просмотра.";
 
 $text['label-cluster_status']['en-us'] = "Cluster";
 $text['label-cluster_status']['ru-ru'] = "Кластер";
@@ -130,6 +130,19 @@ $text['message-invalid']['ru-ru'] = "Снимок состояния не явл
 
 $text['message-standby-rows']['en-us'] = "The cluster menu/widget registration rows are not visible on this standby yet (replication lag or the primary ran an older installer). Re-run the install command on the primary if this persists.";
 $text['message-standby-rows']['ru-ru'] = "Строки регистрации меню/виджета кластера ещё не видны на этой резервной ноде (лаг репликации или на первичной работал старый установщик). Если не исчезнет - повторите команду установки на первичной ноде.";
+
+// 0.3.41: the instant refresh (the pinned sudoers verb)
+$text['label-refresh']['en-us'] = "Refresh now";
+$text['label-refresh']['ru-ru'] = "Обновить сейчас";
+
+$text['message-refresh-ok']['en-us'] = "The status snapshot has been collected - the data below is current.";
+$text['message-refresh-ok']['ru-ru'] = "Снимок состояния собран - данные ниже актуальны.";
+
+$text['message-refresh-fail']['en-us'] = "The status collector FAILED (a probe is hanging or the lock is busy). The data below may be outdated - check the collector log: /var/lib/fusionpbx-ha/status-collector.log";
+$text['message-refresh-fail']['ru-ru'] = "Сборщик статуса НЕ СПРАВИЛСЯ (зависший пробник или занятая блокировка). Данные ниже могут быть устаревшими - журнал: /var/lib/fusionpbx-ha/status-collector.log";
+
+$text['message-refresh-unavailable']['en-us'] = "Instant refresh is unavailable on this node: the status collector is not deployed (re-run this node's install command to install it).";
+$text['message-refresh-unavailable']['ru-ru'] = "Мгновенное обновление на этой ноде недоступно: сборщик статуса не развёрнут (повторите команду установки этой ноды, чтобы поставить его).";
 
 // the CLI-first policy (footer of the page and the widget)
 $text['hint-cli']['en-us'] = "This view is read-only by design. Diagnostics: fusionpbx-ha.sh --doctor; repair: fusionpbx-ha.sh --repair (see RUNBOOK.md).";

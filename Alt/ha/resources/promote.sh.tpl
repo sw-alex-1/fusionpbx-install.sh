@@ -73,6 +73,16 @@ if /usr/bin/repmgr standby promote -f "$REPMGR_CONF"; then
             echo "fusionpbx-ha promote.sh: WARNING: could not restart $_psh_svc (rc=$_psh_rc: ${_psh_reason:-no output}) - requests caught mid-flight to the dead peer hang until TCP timeout" >&2
         fi
     done
+    # 0.3.41: refresh the web status snapshot RIGHT HERE - the dashboard
+    # must flip within seconds of a failover, not at the next cron tick
+    # (the 29.10 bench kept a green "Ok" widget for minutes after node 1
+    # died). Runs under the pinned status sudoers verb (postgres -> root,
+    # the exact '<script> --write-status'); a failure NEVER affects the
+    # promote result - the cron refreshes the file anyway.
+    if [ -x '@@STATUS_SCRIPT@@' ]; then
+        sudo -n '@@STATUS_SCRIPT@@' --write-status >/dev/null 2>&1 \
+            || echo "fusionpbx-ha promote.sh: could not refresh the web status snapshot (the cron will)" >&2
+    fi
     exit 0
 fi
 exit 1

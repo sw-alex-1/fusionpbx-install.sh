@@ -2,7 +2,7 @@
 
 **Status: implemented (v1), pending lab validation.** `fusionpbx-ha.sh`
 is complete and covered by a sandbox test suite (`tests/run-all.sh`,
-515 checks). The next gate is the 3-node ALT stand (DESIGN.md section 15.3)
+520 checks). The next gate is the 3-node ALT stand (DESIGN.md section 15.3)
 before production use.
 
 ## What this is
@@ -42,10 +42,13 @@ cluster" (0.3.39): prepare every VM before the HA bootstrap starts —
 
 After step 2/3 the data nodes also get the **web status add-on** (0.3.40,
 DESIGN.md §19): a read-only **Status → Cluster** page and a dashboard
-widget in the FusionPBX UI. A cron job snapshots
-`fusionpbx-ha.sh --status --json` into `/var/lib/fusionpbx-ha/status.json`
-every 5 minutes; the page/widget render that file and run no probes —
-when the collector dies the data ages out and the UI turns red (visible
+widget in the FusionPBX UI. A cron job refreshes
+`/var/lib/fusionpbx-ha/status.json` **every minute** (0.3.41 — was 5);
+the collector also fires instantly after a failover / auto-rejoin, and the
+**Refresh now** button on the page/widget re-runs it on demand (a pinned
+sudoers verb, one command — nothing else is exposed to the web user).
+The page/widget render the file and run no probes — when the collector
+dies the data ages out (threshold 180s) and the UI turns red (visible
 by design). Repairs stay in the CLI (`--doctor` / `--repair`). The menu
 item and the widget appear after the next web login.
 
@@ -71,10 +74,10 @@ The script resolves both layouts itself, and a deployed flat copy
 
 | File | Purpose |
 |------|---------|
-| `../fusionpbx-ha.sh` | Layer-2 installer (`Alt/fusionpbx-ha.sh`): `--init`, `--join`, `--repair`, `--status [--json]`, `--doctor`, `--print-token` |
+| `../fusionpbx-ha.sh` | Layer-2 installer (`Alt/fusionpbx-ha.sh`): `--init`, `--join`, `--repair`, `--status [--json]`, `--write-status` (the collector: the cron, the refresh button and the post-failover hooks all call it), `--doctor`, `--print-token` |
 | `resources/ha-lib.sh` | Core library: state machine, token, cluster.conf, rendering, PG/sync helpers, the web status add-on installer (sourced; also used by tests) |
 | `resources/` | Templates & units: `repmgr.conf.tpl`, `haproxy.cfg.tpl`, `lsyncd.conf.lua.tpl`, `promote.sh.tpl`, `role-agent.py`, `fusionpbx-ha-agent.service` |
-| `web/cluster/` | The FusionPBX app installed onto the data nodes (0.3.40): Status → Cluster page + dashboard widget, both reading the cron-maintained status snapshot |
+| `web/cluster/` | The FusionPBX app installed onto the data nodes (0.3.40): Status → Cluster page + dashboard widget, both reading the cron-maintained status snapshot; the Refresh-now button (0.3.41) re-runs the collector via the pinned sudoers verb |
 | `tests/` | Sandbox test suite (`run-all.sh`): lib/render/CLI/agent, layer-1 `test_guard.sh` style |
 | `DESIGN.md` | Design document — architecture, CLI, step sequences, failover/repair analysis, §19 web status. **v0.3** |
 | `RUNBOOK.md` | Operational manual (RU) — deploy, health checks, single/double failure, repair, upgrade, proxy. Self-sufficient per scenario |
@@ -82,7 +85,7 @@ The script resolves both layouts itself, and a deployed flat copy
 ## Русский раздел
 
 **Статус: реализовано (v1), ожидает стендовой проверки.** `fusionpbx-ha.sh`
-готов и покрыт песочным тестовым набором (`tests/run-all.sh`, 515 проверок);
+готов и покрыт песочным тестовым набором (`tests/run-all.sh`, 520 проверок);
 следующие ворота — стенд 3×ALT (DESIGN.md §15.3) перед продуктивом.
 
 Это надстройка (слой 2) над установщиком: слой 1 (`Alt/`) не изменяется и

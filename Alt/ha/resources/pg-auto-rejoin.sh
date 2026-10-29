@@ -480,4 +480,14 @@ else
 fi
 
 log "AUTO-REJOIN COMPLETE: $BG_NODE_NAME is a standby of $BG_PEER_IP (timeline $_ar_tl_peer)"
+
+# 0.3.41: refresh the web status snapshot AT ONCE - the rejoined node's
+# widget must flip to standby/streaming immediately, not at the next cron
+# tick (the PEER's snapshot updates at its own tick - there is no root SSH
+# between the nodes by design, and the sync re-enable above already told
+# the peer everything). Runs as root (this unit) with no sudo needed.
+if [ -n "${BG_STATUS_SCRIPT:-}" ] && [ -x "$BG_STATUS_SCRIPT" ]; then
+    "$BG_STATUS_SCRIPT" --write-status >/dev/null 2>&1 \
+        || log "WARNING: could not refresh the web status snapshot - the cron will"
+fi
 exit 0

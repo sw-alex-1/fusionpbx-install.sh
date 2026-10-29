@@ -113,7 +113,19 @@ case "$_sql" in
     # and *pg_wal_lsn_diff* - the query contains both words. Empty value =
     # standby not streaming (mode none). The cmd_status display query hits
     # this too (cosmetic, unasserted).
-    *pg_current_wal_lsn*) echo "${PSQL_REPROW-fpbx-ha-2|streaming|sync|0}" ;;
+    # 0.3.41: PSQL_REP_APPNAME makes the stub HONEST about which standby
+    # the row belongs to: when set, the answer is returned ONLY if the SQL
+    # asks for that exact application_name (the RED test for the node-2
+    # primary: the old code hardcoded node 2's name and matched nothing).
+    *pg_current_wal_lsn*)
+        if [ -n "${PSQL_REP_APPNAME:-}" ]; then
+            case "$_sql" in
+                *"application_name='$PSQL_REP_APPNAME'") echo "${PSQL_REPROW-fpbx-ha-2|streaming|sync|0}" ;;
+                *) : ;;
+            esac
+        else
+            echo "${PSQL_REPROW-fpbx-ha-2|streaming|sync|0}"
+        fi ;;
     *"count(*) FROM pg_stat_replication"*) echo "${PSQL_STREAMING:-1}" ;;
     *sync_state*) echo "${PSQL_SYNCSTATE:-sync}" ;;
     *synchronous_standby_names*) echo "${PSQL_SYNCNAMES:-}" ;;
@@ -155,7 +167,13 @@ EOF
 # (everything else falls through to the real id); sudo: rc knob.
 cat > "$FB/id" <<'EOF'
 #!/bin/sh
-[ "${1:-}" = "postgres" ] && exit 0
+# 0.3.36: the doctor's postgres probe; 0.3.41: angie too (the status
+# sudoers drop-in checks both identities before writing the pinned verb).
+# Arg-scan, not $1-match: the sudoers installer calls 'id -u NAME' where
+# $1 is the FLAG - a $1 match never fired for that shape.
+for _a in "$@"; do
+    case "$_a" in postgres|angie) exit 0 ;; esac
+done
 exec /usr/bin/id "$@"
 EOF
 cat > "$FB/sudo" <<'EOF'
@@ -369,6 +387,10 @@ ha_cli() {
         export HA_IPTABLES_CONF="$WORK/iptables.rules"
         # default role-agent answers: node1 primary, node2 standby
         export CURL_CODES="${CURL_CODES:-10.0.0.11=200,10.0.0.12=503}"
+        # 0.3.41: the --write-status lock and the pinned sudoers verb stay
+        # in the sandbox (never the real /run or /etc/sudoers.d)
+        export HA_STATUS_LOCK="$WORK/status.lock"
+        export HA_WEB_SUDOERS_FILE="$WORK/sudoersd/fusionpbx-ha-status"
         export PATH="$FB:$PATH"
         "$SCRIPT" "$@" 2>&1
     )
@@ -711,6 +733,66 @@ PSQL_RC=2 ha_cli --status --json > "$WORK/status.json" 2>/dev/null; _rc=$?
   && python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$WORK/status.json" 2>/dev/null
 report "--status --json: everything down still yields VALID fail json" "$?"
 
+echo "== --status --json: node 2 PROMOTED after a failover (0.3.41) =="
+# THE 29.10 bench regression, reproduced deterministically: node 2 is the
+# primary now, node 1 rejoined as ITS standby (application_name='fpbx-ha-1').
+# PSQL_REP_APPNAME makes the psql stub answer ONLY the correct name - the
+# old collector (hardcoded node-2 lookup) matched NOTHING here and the
+# widget said "not connected / writes are frozen" on a healthy cluster.
+# RED on the old code, GREEN on 0.3.41 (ha_peer_name + the live node role).
+(
+    export FAKE_IP=10.0.0.12
+    export CURL_CODES="10.0.0.11=503,10.0.0.12=200"
+    export PSQL_RECOVERY=f
+    export PSQL_REP_APPNAME=fpbx-ha-1
+    export PSQL_REPROW="fpbx-ha-1|streaming|sync|0"
+    ha_cli --status --json > "$WORK/status.json" 2>/dev/null
+); _rc=$?
+[ "$_rc" = "0" ] \
+  && python3 - "$WORK/status.json" <<'PYEOF'
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d['node']['role'] == 'primary', "the promoted node must say primary (live role, not cluster.conf)"
+assert d['node']['id'] == 2
+assert d['local_pg'] == 'primary'
+r = d['replication']
+assert r['mode'] == 'sync', r
+assert r['peer'] == 'fpbx-ha-1', r
+assert r['lag_bytes'] == 0, r
+assert d['entry_point'] is True
+assert d['nodes'][0]['state'] == 'standby', "node 1 = the rejoined standby"
+assert d['nodes'][1]['state'] == 'primary'
+assert d['health'] == 'ok', d.get('health_reasons')
+assert not d['health_reasons'], d['health_reasons']
+PYEOF
+report "--status --json: node-2 primary sees its PEER streaming (sync, ok)" "$?" \
+  "$(python3 -c "import json;d=json.load(open('$WORK/status.json'));print(d.get('health_reasons'))" 2>/dev/null)"
+
+echo "== --write-status (0.3.41: the on-demand materializer) =="
+rm -rf "$WORK/var-status"; mkdir -p "$WORK/var-status"
+(
+    export HA_VAR_DIR="$WORK/var-status" HA_STATUS_FILE="$WORK/var-status/status.json"
+    ha_cli --write-status
+) > "$WORK/out.log" 2>&1; _rc=$?
+[ "$_rc" = "0" ] && [ -s "$WORK/var-status/status.json" ] \
+  && python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert d['node']['name']=='fpbx-ha-1'" "$WORK/var-status/status.json" 2>/dev/null \
+  && ! [ -e "$WORK/var-status/status.json.new" ]
+report "--write-status: exit 0, valid snapshot file, no tmp leftover" "$?"
+
+# the collector DYING (a node whose IP matches nothing in the token - the
+# detect dies) must leave the PREVIOUS snapshot intact: a half-written or
+# deleted status.json is never an acceptable outcome
+_cp_before="$(cat "$WORK/var-status/status.json" 2>/dev/null)"
+(
+    export HA_VAR_DIR="$WORK/var-status" HA_STATUS_FILE="$WORK/var-status/status.json"
+    export FAKE_IP=10.0.0.99
+    ha_cli --write-status
+) > "$WORK/out.log" 2>&1; _rc=$?
+[ "$_rc" != "0" ] \
+  && [ "$(cat "$WORK/var-status/status.json" 2>/dev/null)" = "$_cp_before" ] \
+  && ! [ -e "$WORK/var-status/status.json.new" ]
+report "--write-status: a dead collector -> rc 1, the previous snapshot intact" "$?"
+
 # ---------------------------------------------------------------------------
 echo "== --doctor =="
 ha_cli --doctor > "$WORK/out.log" 2>&1; _rc=$?
@@ -979,6 +1061,8 @@ ha_init_web() {
         export HA_PGDATA_DEFAULT="$WORK/pgdata"
         export HA_WEB_DIR="$WORK/www" HA_CRON_FILE="$WORK/crond/fusionpbx-ha-status"
         export HA_VAR_DIR="$WORK/var-ha" HA_STATUS_FILE="$WORK/var-ha/status.json"
+        export HA_STATUS_LOCK="$WORK/var-ha/status.lock"
+        export HA_WEB_SUDOERS_FILE="$WORK/sudoersd/fusionpbx-ha-status"
         export HA_SYSTEMD_DIR="$WORK/systemd"
         export HA_HAPROXY_CONF_D="$WORK/haproxy.d" HA_LSYNCD_CONF="$WORK/lsyncd.conf.lua"
         export HA_SYNC_SSH_DIR="$WORK/sshdir" HA_RRSYNC_INSTALL_DIR="$WORK/bin"
@@ -1012,10 +1096,26 @@ grep -q "INSERT INTO v_menu_items" "$WORK/webapp-sql.log" \
   && grep -q "INSERT INTO v_dashboard_widget_groups" "$WORK/webapp-sql.log"
 report "registration SQL: menu + languages + permission + widget (idempotent)" "$?"
 
-grep -q -- "--status --json --no-color" "$WORK/crond/fusionpbx-ha-status" \
-  && grep -q "flock -n /run/fusionpbx-ha-status.lock" "$WORK/crond/fusionpbx-ha-status" \
-  && grep -q "status.json.new" "$WORK/crond/fusionpbx-ha-status"
-report "status cron installed (atomic tmp+mv, flock guard)" "$?"
+grep -qE '^\*/1 \* \* \* \* root' "$WORK/crond/fusionpbx-ha-status" \
+  && grep -q -- "--write-status" "$WORK/crond/fusionpbx-ha-status" \
+  && ! grep -q -- "--status --json" "$WORK/crond/fusionpbx-ha-status" \
+  && grep -q "status cron installed: .* (every 1 min)" "$WORK/out.log"
+report "status cron: every MINUTE, the --write-status verb (lock inside)" "$?"
+
+# 0.3.41: the pinned sudoers verb for the web refresh button (the sandbox
+# id stub answers for both angie and postgres; HA_WEB_USER is the runner)
+[ -f "$WORK/sudoersd/fusionpbx-ha-status" ] \
+  && grep -q "NOPASSWD: $SCRIPT --write-status" "$WORK/sudoersd/fusionpbx-ha-status" \
+  && [ "$(grep -c 'NOPASSWD: .* --write-status' "$WORK/sudoersd/fusionpbx-ha-status")" -ge 2 ]
+report "status sudoers: the pinned --write-status verb for the web user + postgres" "$?"
+
+# 0.3.41: the stale threshold is a MANAGED default_setting (upsert - a
+# repair factory-refreshes 600 -> 180 on upgraded clusters)
+grep -q "INSERT INTO v_default_settings" "$WORK/webapp-sql.log" \
+  && grep -q "status_stale_seconds" "$WORK/webapp-sql.log" \
+  && grep -q "ON CONFLICT (default_setting_uuid) DO UPDATE" "$WORK/webapp-sql.log" \
+  && grep -q "'180'" "$WORK/webapp-sql.log"
+report "stale threshold upserted: cluster.status_stale_seconds = 180 (DO UPDATE)" "$?"
 
 [ -s "$WORK/var-ha/status.json" ] \
   && python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert d['node']['name']=='fpbx-ha-1'" "$WORK/var-ha/status.json" 2>/dev/null
@@ -1068,6 +1168,8 @@ JOINW_TOKEN="$(gzip -c "$WORK/etc-joinw/cluster.conf" | base64 -w0 | tr -d '\n')
     export HA_PGDATA_DEFAULT="$WORK/pgdata"
     export HA_WEB_DIR="$WORK/www" HA_CRON_FILE="$WORK/crond2/fusionpbx-ha-status"
     export HA_VAR_DIR="$WORK/var-ha" HA_STATUS_FILE="$WORK/var-ha/status.json"
+    export HA_STATUS_LOCK="$WORK/var-ha/status.lock"
+    export HA_WEB_SUDOERS_FILE="$WORK/sudoersd/fusionpbx-ha-status"
     export HA_SYSTEMD_DIR="$WORK/systemd"
     export HA_HAPROXY_CONF_D="$WORK/haproxy.d" HA_LSYNCD_CONF="$WORK/lsyncd.conf.lua"
     export HA_SYNC_SSH_DIR="$WORK/sshdir" HA_RRSYNC_INSTALL_DIR="$WORK/bin"
@@ -1102,6 +1204,8 @@ rm -f "$WORK/etc-joinw/.installer-state"
     export HA_PGDATA_DEFAULT="$WORK/pgdata"
     export HA_WEB_DIR="$WORK/www" HA_CRON_FILE="$WORK/crond2/fusionpbx-ha-status"
     export HA_VAR_DIR="$WORK/var-ha" HA_STATUS_FILE="$WORK/var-ha/status.json"
+    export HA_STATUS_LOCK="$WORK/var-ha/status.lock"
+    export HA_WEB_SUDOERS_FILE="$WORK/sudoersd/fusionpbx-ha-status"
     export HA_SYSTEMD_DIR="$WORK/systemd"
     export HA_HAPROXY_CONF_D="$WORK/haproxy.d" HA_LSYNCD_CONF="$WORK/lsyncd.conf.lua"
     export HA_SYNC_SSH_DIR="$WORK/sshdir" HA_RRSYNC_INSTALL_DIR="$WORK/bin"
@@ -1120,6 +1224,8 @@ rm -f "$WORK/etc-joinw/.installer-state"
     export HA_RES_DIR="$REPO/Alt/ha/resources" HA_PGDATA_DEFAULT="$WORK/pgdata"
     export HA_WEB_DIR="$WORK/www" HA_CRON_FILE="$WORK/crond2/fusionpbx-ha-status"
     export HA_VAR_DIR="$WORK/var-ha" HA_STATUS_FILE="$WORK/var-ha/status.json"
+    export HA_STATUS_LOCK="$WORK/var-ha/status.lock"
+    export HA_WEB_SUDOERS_FILE="$WORK/sudoersd/fusionpbx-ha-status"
     export HA_WEB_USER="$(id -un)" HA_WEB_GROUP="$(id -gn)"
     export HA_STATUS_SCRIPT="$SCRIPT"
     export PSQL_SQL_LOG="$WORK/webapp-sql2.log" PSQL_MENU_ROWS=0
