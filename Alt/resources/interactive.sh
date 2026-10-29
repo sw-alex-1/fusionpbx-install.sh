@@ -125,15 +125,15 @@ interactive_collect_answers() {
     # --- 2. FusionPBX domain (only when config.sh still carries the sentinel;
     #       a custom value there is an intentional choice - never re-asked) ---
     if [ "$domain_name" = "ip_address" ] || [ "$domain_name" = "hostname" ]; then
+        verbose "  NOTE (if you installing HA cluster): answer the SAME domain on every node."
+        verbose "  Node 2's local database is replaced by the clone from node 1 at"
+        verbose "  join, so only node 1's answer survives - a real domain name here"
+        verbose "  (one DNS name for the whole cluster) is the operationally right way."
         _ica_ip="$(ip -4 addr show scope global 2>/dev/null | grep inet | head -1 | awk '{print $2}' | cut -d'/' -f1)"
         _ica_d="$(ask_value "FusionPBX domain (web UI / SIP realm / provisioning name)" "${_ica_ip:-ip_address}")"
         # only a DIFFERENT answer overrides - the default (this node's IP)
         # stays as the 'ip_address' sentinel so finish.sh keeps its own
         # fallback chain; answering 'hostname' keeps that sentinel too
-        verbose "  NOTE (if you installing HA cluster): answer the SAME domain on every node."
-        verbose "  Node 2's local database is replaced by the clone from node 1 at"
-        verbose "  join, so only node 1's answer survives - a real domain name here"
-        verbose "  (one DNS name for the whole cluster) is the operationally right way."
         if [ -n "$_ica_d" ] && [ "$_ica_d" != "$_ica_ip" ]; then
             domain_name="$_ica_d"
             # export: the step scripts run as child processes and re-source
