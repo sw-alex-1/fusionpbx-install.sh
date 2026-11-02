@@ -2,6 +2,8 @@
 
 Automated installation script for [FusionPBX](https://www.fusionpbx.com) on [Alt Linux](https://www.basealt.ru/en) (ALT Server). Uses native RPM packages from the Alt Linux repository — no source builds except `mod_pgsql`, which is compiled from FreeSWITCH source because the Alt Linux RPM packages do not include it.
 
+The repository contains two layers: **`Alt/install.sh`** — the base installer for a standalone node, and **`Alt/fusionpbx-ha.sh`** — an optional HA cluster add-on (repmgr + witness) that connects three already installed nodes into a cluster. The full script map is in [Repository Layout](#repository-layout) below.
+
 ## Requirements
 
 - Alt Linux Server (p10+ or Sisyphus), minimal install recommended
@@ -65,6 +67,92 @@ The installer runs 11 steps and **stops on any error** with a clear message:
 10. Finalization (database schema, admin user, upgrade.php)
 11. FreeSWITCH DSN (switch from SQLite to PostgreSQL)
 
+## Repository Layout
+
+Two independent entry points, one shared resource tree:
+
+- **`Alt/install.sh`** (layer 1) — installs a standalone FusionPBX node.
+- **`Alt/fusionpbx-ha.sh`** (layer 2) — the HA add-on: turns three prepared nodes into a repmgr + witness cluster. Usage: [Alt/ha/README.md](Alt/ha/README.md).
+
+### Top level (`Alt/`)
+
+| Script | Purpose |
+|--------|---------|
+| `pre-install.sh` | Bootstrap on a fresh system: `dist-upgrade`, installs git, clones this repo |
+| `install.sh` | The installer itself: 11 steps, stops on the first error, resumable after a failure |
+| `fusionpbx-ha.sh` | HA cluster CLI: `--init` / `--join TOKEN` / `--status` / `--doctor` / `--repair`; without flags — interactive mode |
+| `plan.md` | Historical porting plan (the nginx → Angie transition notes) |
+
+### Layer 1 libraries (`Alt/resources/`, sourced by `install.sh`)
+
+| Script | Purpose |
+|--------|---------|
+| `config.sh` | Central configuration: versions, paths, passwords, feature flags — edit before running |
+| `arguments.sh` | CLI argument parsing |
+| `environment.sh` | OS / architecture detection (ALT check) |
+| `colors.sh` | `verbose` / `warn` / `error` output helpers |
+| `util.sh` | Shared helpers: `die`, idempotent package install, systemd wrappers, wait loops |
+| `guard.sh` | Installed-system protection: `.installed` marker + `.installer-state` progress |
+| `interactive.sh` | Terminal questions (proxy, domain, admin password); asks nothing when non-interactive |
+| `proxy.sh` | Configures the HTTP proxy for apt / git / wget / curl (sourced before any network operation) |
+| `random.sh` | Random string generator |
+
+### Layer 1 steps (executed by `install.sh` in order)
+
+| Script | Step | Purpose |
+|--------|------|---------|
+| `pre-install.sh` | 1 | System preparation (update, base packages) |
+| `php.sh` | 2 | PHP 8.2 (FCGI + FPM) |
+| `angie.sh` | 3 | Angie web server: vhost, self-signed SSL |
+| `postgresql.sh` | 4 | PostgreSQL 16: role, database, `pg_hba` |
+| `fusionpbx.sh` | 5a | FusionPBX: git clone, composer, `/etc/fusionpbx/config.conf` |
+| `applications.sh` | 5b | Optional apps (transcribe, speech, edit, sip_trunks, …) |
+| `switch.sh` | 6 | FreeSWITCH dispatcher (calls the `switch/` scripts below) |
+| `iptables.sh` | 7 | Firewall (SIP, RTP, HTTP, SSH) |
+| `fail2ban.sh` | 8 | Fail2ban with FusionPBX / FreeSWITCH / Angie jails |
+| `sngrep.sh` | 9a | sngrep (SIP capture) |
+| `monit.sh` | 9b | Monit process monitor |
+| `finish.sh` | 10 | DB schema, admin user, `upgrade.php`, domain, websocket port, backup cron, hardened websockets unit |
+| `switch/dsn.sh` | 11 | FreeSWITCH: SQLite → PostgreSQL for all switch databases |
+
+### FreeSWITCH sub-scripts (`Alt/resources/switch/`)
+
+| Script | Purpose |
+|--------|---------|
+| `package-release.sh` | FreeSWITCH RPM installation |
+| `conf-copy.sh` | Deploys the FusionPBX FreeSWITCH config to `/etc/freeswitch` |
+| `source-mod-pgsql.sh` | Builds `mod_pgsql` from matching FreeSWITCH source (absent from ALT RPMs) |
+| `disable-missing-modules.sh` | Comments out modules missing from the RPM set |
+| `package-permissions.sh` | FreeSWITCH directory ownership (`angie`) |
+| `package-systemd.sh` | FreeSWITCH systemd service setup |
+| `music-on-hold.sh` | Verifies `v_music_on_hold` was populated and inserts fallback defaults via SQL (called from `finish.sh`) |
+
+### Standalone utilities (`Alt/resources/`)
+
+| Script | Purpose |
+|--------|---------|
+| `websockets.sh` | Installs the hardened `websockets.service`: waits for PostgreSQL before start, so the websocket router cannot silently fall back to port 8080 (the 502 fix). Called by `finish.sh`; safe to re-run |
+| `fix-services.sh` | Post-update repair: replaces `www-data` with `angie` in service templates / units / cron **and** re-installs the hardened websockets unit. Run it after every FusionPBX upgrade |
+| `letsencrypt.sh` | Optional: Let's Encrypt certificates via dehydrated (interactive) |
+
+### Supporting assets (not scripts)
+
+`resources/angie/fusionpbx` (vhost), `resources/fusionpbx/config.conf` (template), `resources/fail2ban/*` (jails + filters), `resources/monit/*` (monit config + `shell.sh` — the FreeSWITCH start wrapper), `resources/backup/*` (daily cron scripts installed by `finish.sh`: database backup + maintenance), `resources/switch/source/*` (stock systemd unit + the `mod_pgsql` patch), `resources/websockets/websockets.service` (the hardened unit).
+
+### Layer 2 — HA add-on (`Alt/ha/`)
+
+Documentation: [README](Alt/ha/README.md) (usage) · [RUNBOOK](Alt/ha/RUNBOOK.md) (operations, failover drills) · [DESIGN](Alt/ha/DESIGN.md) (architecture). Short map:
+
+| Path | Purpose |
+|------|---------|
+| `resources/ha-lib.sh` | The shared function library (steps, probes, config rendering) |
+| `resources/role-agent.py` | Tiny HTTP service on :8008 answering "am I the primary" for haproxy |
+| `resources/pg-boot-guard.sh` | Boot guard: holds PostgreSQL until the cluster role is certain (no competing primary) |
+| `resources/pg-auto-rejoin.sh` | Automatic rejoin of a stale primary at boot |
+| `resources/*.tpl`, `*.service` | Rendered configs: haproxy frontend `127.0.0.1:5433`, repmgr, lsyncd, the promote wrapper, unit files |
+| `web/cluster/` | Web status add-on: the Status → Cluster page + dashboard widget |
+| `tests/` | Sandbox test suite: `run-all.sh` + `test_lib.sh`, `test_cli.sh`, `test_layer1.sh`, `test_render.sh`, `test_agent.sh` (520 checks) |
+
 ## Alt Linux Specifics
 
 - **APT-RPM**: Package names differ from Debian (e.g., `php8.2-fpm-fcgi` instead of `php8.2-fpm`)
@@ -116,6 +204,8 @@ Fail2ban is installed and pre-configured. Review `/etc/fail2ban/jail.local` to a
 # Установщик FusionPBX для Альт Линукс
 
 Автоматизированный скрипт установки [FusionPBX](https://www.fusionpbx.com) на [Альт Линукс](https://www.basealt.ru) (ALT Server). Используются штатные RPM-пакеты из репозитория Альт Линукс — сборка из исходников применяется только для `mod_pgsql`, который отсутствует в RPM-пакетах FreeSWITCH.
+
+Репозиторий содержит два слоя: **`Alt/install.sh`** — базовый установщик одиночного узла и **`Alt/fusionpbx-ha.sh`** — опциональное HA-расширение (repmgr + witness), собирающее три установленных узла в кластер. Полная карта скриптов — в разделе [«Структура репозитория»](#структура-репозитория) ниже.
 
 ## Требования
 
@@ -179,6 +269,92 @@ cd /usr/src/fusionpbx-install.sh/Alt && ./install.sh
 9. Дополнительные инструменты (sngrep, monit)
 10. Завершение (схема БД, пользователь-администратор, upgrade.php)
 11. DSN FreeSWITCH (переключение с SQLite на PostgreSQL)
+
+## Структура репозитория
+
+Два независимых входа, одно общее дерево ресурсов:
+
+- **`Alt/install.sh`** (слой 1) — устанавливает одиночный узел FusionPBX.
+- **`Alt/fusionpbx-ha.sh`** (слой 2) — HA-расширение: собирает три подготовленных узла в кластер repmgr + witness. Использование — [Alt/ha/README.md](Alt/ha/README.md).
+
+### Верхний уровень (`Alt/`)
+
+| Скрипт | Назначение |
+|--------|------------|
+| `pre-install.sh` | Загрузочный скрипт на чистой системе: `dist-upgrade`, установка git, клонирование репозитория |
+| `install.sh` | Сам установщик: 11 шагов, остановка на первой ошибке, возобновление после сбоя |
+| `fusionpbx-ha.sh` | CLI HA-кластера: `--init` / `--join ТОКЕН` / `--status` / `--doctor` / `--repair`; без флагов — интерактивный режим |
+| `plan.md` | Исторический план портирования (заметки перехода nginx → Angie) |
+
+### Библиотеки слоя 1 (`Alt/resources/`, подключаются `install.sh`)
+
+| Скрипт | Назначение |
+|--------|------------|
+| `config.sh` | Центральная конфигурация: версии, пути, пароли, флаги — правится перед запуском |
+| `arguments.sh` | Разбор аргументов командной строки |
+| `environment.sh` | Определение ОС и архитектуры (проверка ALT) |
+| `colors.sh` | Функции вывода `verbose` / `warn` / `error` |
+| `util.sh` | Общие помощники: `die`, идемпотентная установка пакетов, обёртки systemd, циклы ожидания |
+| `guard.sh` | Защита установленной системы: маркер `.installed` + прогресс `.installer-state` |
+| `interactive.sh` | Вопросы в терминале (прокси, домен, пароль администратора); без терминала вопросов нет |
+| `proxy.sh` | Настройка HTTP-прокси для apt / git / wget / curl (подключается до сетевых операций) |
+| `random.sh` | Генератор случайных строк |
+
+### Шаги слоя 1 (выполняются `install.sh` по порядку)
+
+| Скрипт | Шаг | Назначение |
+|--------|-----|------------|
+| `pre-install.sh` | 1 | Подготовка системы (обновление, базовые пакеты) |
+| `php.sh` | 2 | PHP 8.2 (FCGI + FPM) |
+| `angie.sh` | 3 | Веб-сервер Angie: vhost, самоподписанный SSL |
+| `postgresql.sh` | 4 | PostgreSQL 16: роль, база, `pg_hba` |
+| `fusionpbx.sh` | 5a | FusionPBX: клонирование из Git, composer, `/etc/fusionpbx/config.conf` |
+| `applications.sh` | 5b | Необязательные приложения (transcribe, speech, edit, sip_trunks, …) |
+| `switch.sh` | 6 | Диспетчер FreeSWITCH (вызывает скрипты из `switch/`) |
+| `iptables.sh` | 7 | Межсетевой экран (SIP, RTP, HTTP, SSH) |
+| `fail2ban.sh` | 8 | Fail2ban с джейлами FusionPBX / FreeSWITCH / Angie |
+| `sngrep.sh` | 9a | sngrep (просмотр SIP-диалогов) |
+| `monit.sh` | 9b | Монитор процессов Monit |
+| `finish.sh` | 10 | Схема БД, администратор, `upgrade.php`, домен, порт вебсокетов, cron резервного копирования, закалённый websockets-юнит |
+| `switch/dsn.sh` | 11 | FreeSWITCH: переход с SQLite на PostgreSQL во всех БД коммутатора |
+
+### Подскрипты FreeSWITCH (`Alt/resources/switch/`)
+
+| Скрипт | Назначение |
+|--------|------------|
+| `package-release.sh` | Установка FreeSWITCH из RPM |
+| `conf-copy.sh` | Развёртывание конфигурации FusionPBX для FreeSWITCH в `/etc/freeswitch` |
+| `source-mod-pgsql.sh` | Сборка `mod_pgsql` из исходников FreeSWITCH (отсутствует в RPM Альт) |
+| `disable-missing-modules.sh` | Отключение модулей, отсутствующих в RPM-наборе |
+| `package-permissions.sh` | Права на каталоги FreeSWITCH (`angie`) |
+| `package-systemd.sh` | Настройка systemd-сервиса FreeSWITCH |
+| `music-on-hold.sh` | Проверяет заполненность `v_music_on_hold` и вставляет запасные записи через SQL (вызывается из `finish.sh`) |
+
+### Автономные утилиты (`Alt/resources/`)
+
+| Скрипт | Назначение |
+|--------|------------|
+| `websockets.sh` | Устанавливает закалённый `websockets.service`: ждёт готовности PostgreSQL перед стартом, чтобы роутер вебсокетов не откатывался молча на порт 8080 (фикс 502). Вызывается из `finish.sh`; безопасен при повторном запуске |
+| `fix-services.sh` | Починка после обновлений: заменяет `www-data` на `angie` в шаблонах сервисов / юнитах / cron **и** переустанавливает закалённый websockets-юнит. Запускать после каждого обновления FusionPBX |
+| `letsencrypt.sh` | Необязательно: сертификаты Let's Encrypt через dehydrated (интерактивно) |
+
+### Вспомогательные файлы (не скрипты)
+
+`resources/angie/fusionpbx` (vhost), `resources/fusionpbx/config.conf` (шаблон), `resources/fail2ban/*` (джейлы и фильтры), `resources/monit/*` (конфиг monit + `shell.sh` — обёртка запуска FreeSWITCH), `resources/backup/*` (ежедневные cron-скрипты, ставятся `finish.sh`: резервное копирование и обслуживание БД), `resources/switch/source/*` (штатный systemd-юнит + патч `mod_pgsql`), `resources/websockets/websockets.service` (закалённый юнит).
+
+### Слой 2 — HA-расширение (`Alt/ha/`)
+
+Документация: [README](Alt/ha/README.md) (использование) · [RUNBOOK](Alt/ha/RUNBOOK.md) (эксплуатация, тренировка failover) · [DESIGN](Alt/ha/DESIGN.md) (архитектура). Кратко:
+
+| Путь | Назначение |
+|------|------------|
+| `resources/ha-lib.sh` | Общая библиотека функций (шаги, пробы, рендеринг конфигов) |
+| `resources/role-agent.py` | Мини-HTTP-сервис на :8008, отвечающий haproxy «я — primary?» |
+| `resources/pg-boot-guard.sh` | Бут-гард: не даёт PostgreSQL стартовать до выяснения роли (защита от второй primary) |
+| `resources/pg-auto-rejoin.sh` | Автоматический возврат устаревшей primary при загрузке |
+| `resources/*.tpl`, `*.service` | Рендерящиеся конфиги: haproxy-фронтенд `127.0.0.1:5433`, repmgr, lsyncd, обёртка promote, юниты |
+| `web/cluster/` | Веб-статус: страница Status → Cluster + виджет дашборда |
+| `tests/` | Песочница тестов: `run-all.sh` + `test_lib.sh`, `test_cli.sh`, `test_layer1.sh`, `test_render.sh`, `test_agent.sh` (520 проверок) |
 
 ## Особенности Альт Линукс
 
