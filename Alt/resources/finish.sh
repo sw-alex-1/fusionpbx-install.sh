@@ -396,15 +396,32 @@ chown -R ${web_user}:${web_group} /var/lib/freeswitch/recordings
 verbose "  Recordings directory created and ownership set"
 
 # --- WebSocket port (v_default_settings) ---
-# Alt Linux: port 8080 is occupied by Alterator (system configuration tool)
+# Alt Linux: port 8080 is occupied by Alterator (system configuration tool).
+# IMPORTANT: core/websockets/resources/classes/websocket_service.php binds to
+# websocket_server/bind_port from v_default_settings and SILENTLY FALLS BACK TO
+# 8080 when the row is missing. A failed insert here = service on the wrong
+# port = 502 from angie. So this block must fail loudly, never silently.
 _ws_uuid=$(/usr/bin/php /var/www/fusionpbx/resources/uuid.php) || die "Failed to generate UUID for websocket setting"
+# Remove any existing rows for this key first: upgrade.php --defaults or a
+# previous run may have created duplicates (the uuid ON CONFLICT clause cannot
+# detect them because each run generates a new uuid).
+psql --host=$database_host --port=$database_port --username=$database_username -c \
+    "DELETE FROM v_default_settings
+     WHERE default_setting_category = 'websocket_server' AND default_setting_subcategory = 'bind_port';" \
+    || die "WebSocket port setting: failed to clean up old rows"
 psql --host=$database_host --port=$database_port --username=$database_username -c \
     "INSERT INTO v_default_settings (default_setting_uuid, default_setting_category, default_setting_subcategory, default_setting_name, default_setting_value, default_setting_enabled, default_setting_description)
-     VALUES ('$_ws_uuid', 'websocket_server', 'bind_port', 'numeric', '${websocket_port}', 'true', 'Alt Linux: use ${websocket_port} instead of 8080 (Alterator)')
-     ON CONFLICT (default_setting_uuid) DO UPDATE SET default_setting_value = EXCLUDED.default_setting_value;" 2>/dev/null \
-    || warn "WebSocket port setting could not be inserted (table may not exist yet — will use config.conf value)"
+     VALUES ('$_ws_uuid', 'websocket_server', 'bind_port', 'numeric', '${websocket_port}', 'true', 'Alt Linux: use ${websocket_port} instead of 8080 (Alterator)');" \
+    || die "WebSocket port setting could not be inserted into v_default_settings"
+# Verify the row is really there and enabled — never trust a silent insert
+psql --host=$database_host --port=$database_port --username=$database_username -t -c \
+    "SELECT default_setting_value FROM v_default_settings
+     WHERE default_setting_category = 'websocket_server' AND default_setting_subcategory = 'bind_port'
+       AND default_setting_enabled = 'true';" \
+    | grep -qw "$websocket_port" \
+    || die "WebSocket port setting verification failed (expected ${websocket_port} in v_default_settings)"
 
-verbose "  WebSocket bind port = $websocket_port"
+verbose "  WebSocket bind port = $websocket_port (verified in v_default_settings)"
 
 # =============================================================================
 # Verify v_music_on_hold was populated
@@ -584,6 +601,27 @@ for _svc_file in /etc/systemd/system/xml_cdr.service \
 done
 if [ "$_fpbx_svc_enabled" -eq 0 ]; then
     verbose "  No FusionPBX service files found to enable"
+fi
+
+# =============================================================================
+# Websocket Router service (hardened unit)
+# =============================================================================
+# upgrade.php --services just installed the vanilla websockets.service
+# (correct user after patching, but no ordering and no readiness gate).
+# Replace it with the hardened unit: After=postgresql.service plus an
+# ExecStartPre pg_isready gate. Without the gate the router wins the boot
+# race against PostgreSQL and silently binds the fallback port 8080
+# (database.php swallows the PDO connect error, settings load empty and
+# get() applies its default) - angie then answers 502 on /websockets/.
+# websockets.sh also overwrites the source template so a later
+# `upgrade.php --services` cannot regress the unit.
+# =============================================================================
+
+verbose "Installing hardened Websocket Router service..."
+if [ -x "$SCRIPT_DIR/websockets.sh" ]; then
+    "$SCRIPT_DIR/websockets.sh" || warn "websockets.sh reported a problem (see above)"
+else
+    warn "$SCRIPT_DIR/websockets.sh not found or not executable - install the hardened unit manually (see resources/websockets/websockets.service)"
 fi
 
 # =============================================================================

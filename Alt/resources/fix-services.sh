@@ -7,11 +7,17 @@
 #      (so future module activations generate correct services)
 #   2. Installed systemd service files in /etc/systemd/system/
 #   3. Cron files in /etc/cron.d/
+# and:
+#   4. Re-installs the hardened websockets.service. The vanilla unit has no
+#      PostgreSQL ordering and no readiness gate: at boot the router cannot
+#      read bind_port from the DB, silently binds its fallback 127.0.0.1:8080
+#      and angie answers 502 on /websockets/.
 #
 # Run this after:
 #   - Enabling additional FusionPBX modules that may have added
 #     new service template files with www-data
-#   - Updating FusionPBX (git pull may restore www-data in templates)
+#   - Updating FusionPBX (git pull may restore www-data in templates, and
+#     upgrade.php --services may regenerate the vanilla websockets.service)
 #
 # Usage:
 #   ./fix-services.sh
@@ -22,6 +28,7 @@
 _web_user="angie"
 _web_group="angie"
 _fpbx_dir="/var/www/fusionpbx"
+_script_dir="$(cd "$(dirname "$0")" && pwd)"
 
 echo "Fixing www-data -> ${_web_user} in FusionPBX service files..."
 _patched=0
@@ -66,6 +73,23 @@ for _cron_file in /etc/cron.d/*; do
         _patched=$((_patched + 1))
     fi
 done
+
+# 4. Re-install the hardened websockets unit
+# A FusionPBX update (git pull + upgrade.php --services) regenerates the
+# vanilla websockets.service: no PostgreSQL ordering, no readiness gate (see
+# resources/websockets/websockets.service for the full story). websockets.sh
+# installs the hardened unit AND re-hardens the source tree template, so a
+# later upgrade.php --services cannot regress it. It is idempotent.
+echo ""
+echo "4. Re-installing the hardened websockets unit..."
+if [ -x "$_script_dir/websockets.sh" ]; then
+    "$_script_dir/websockets.sh" \
+        || echo "  WARNING: websockets.sh reported a problem (see above)"
+else
+    echo "  NOTE: websockets.sh not found next to fix-services.sh - skipped"
+    echo "  (run Alt/resources/websockets.sh manually to install the"
+    echo "   PostgreSQL-ready websockets unit)"
+fi
 
 if [ "$_patched" -eq 0 ]; then
     echo ""

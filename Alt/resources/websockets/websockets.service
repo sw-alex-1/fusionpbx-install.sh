@@ -1,0 +1,69 @@
+# FusionPBX Websocket Router Service - Alt Linux hardened unit
+#
+# Origin: core/websockets/resources/service/debian/websockets.service
+# (upstream master), User/Group adapted for Alt (angie), plus three changes
+# required by the Alt/HA environment:
+#
+# 1. Ordering: After=postgresql.service. The upstream unit has NO ordering
+#    at all, so on boot the router races PostgreSQL - and on HA nodes it
+#    always loses: postgresql.service is delayed by the boot-guard drop-in
+#    (peer probing / auto-rejoin) and may accept connections minutes into
+#    the boot.
+#
+# 2. ExecStartPre gate: do not start the PHP router until PostgreSQL
+#    (host/port taken from /etc/fusionpbx/config.conf) accepts connections.
+#    Root cause of the 502s on /websockets/: when the DB is unreachable at
+#    bind time, resources/classes/database.php CATCHES the PDOException and
+#    just returns false - no exception ever reaches the service. The settings
+#    object stays empty and websocket_service::reload_settings() silently
+#    applies its fallbacks: bind 127.0.0.1:8080 (upstream default; on full
+#    Alt installations that port belongs to Alterator). The router looks
+#    healthy while angie proxies /websockets/ to the wrong port.
+#    Failing the start (and retrying until PG is up) is fail-closed and
+#    visible instead.
+#
+# 3. Never give up: StartLimitIntervalSec=0 + Restart=always, so a node
+#    whose PostgreSQL is held down by the boot guard keeps retrying and
+#    brings the router up by itself after --repair / auto-rejoin.
+#
+# Note: the router binds its listening socket exactly once, inside run().
+# SIGUSR1/SIGHUP re-read the settings but never re-bind, so a wrong port
+# can only be fixed by a restart - which is what installs/repairs do here.
+#
+# Installed by: resources/websockets.sh (which also overwrites the template
+# inside the FusionPBX source tree so a later `upgrade.php --services`
+# cannot regress this unit back to vanilla).
+
+[Unit]
+Description=Websocket Router Service
+StartLimitIntervalSec=0
+Wants=network-online.target
+After=network-online.target postgresql.service
+
+[Service]
+WorkingDirectory=/var/www/fusionpbx
+RuntimeDirectory=fusionpbx
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+User=angie
+Group=angie
+# Wait for the database: 30 tries x (3s connect timeout + 2s sleep) = up to
+# ~150s worst case (typically ~60s when connections are refused instantly);
+# TimeoutStartSec=180 above leaves headroom for exactly that.
+# NB 1: systemd expands $VAR even inside single quotes - every dollar below is
+# written as $$ so the shell receives a single literal $.
+# NB 2: the defaults are applied with `: "$${h:=...}"`, NOT with a bare
+# `$${h:=...}`. POSIX ${var:=word} does not only assign the default - it also
+# EXPANDS TO THE VALUE of the variable, so a bare `$${h:=...}` makes /bin/sh
+# try to EXECUTE "127.0.0.1" / "5433" as a command name ("command not found"
+# spam in the journal; the start still succeeds because `;` ignores the 127).
+# The `:` builtin evaluates its arguments (assignment happens) and discards
+# the result.
+ExecStartPre=/bin/sh -c 'h=$$(sed -n "s/^[[:space:]]*database\.0\.host[[:space:]]*=[[:space:]]*//p" /etc/fusionpbx/config.conf | head -n1 | tr -d "[:space:]"); p=$$(sed -n "s/^[[:space:]]*database\.0\.port[[:space:]]*=[[:space:]]*//p" /etc/fusionpbx/config.conf | head -n1 | tr -d "[:space:]"); : "$${h:=127.0.0.1}"; : "$${p:=5432}"; for _ in $$(seq 1 30); do pg_isready -q -t 3 -h "$$h" -p "$$p" && exit 0; sleep 2; done; echo "websockets: PostgreSQL at $$h:$$p is not accepting connections after 30 attempts" >&2; exit 1'
+ExecStart=/usr/bin/php /var/www/fusionpbx/core/websockets/resources/service/websockets.php
+Restart=always
+RestartSec=5
+TimeoutStartSec=180
+
+[Install]
+WantedBy=multi-user.target
